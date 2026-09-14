@@ -97,4 +97,10 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertTrue(model.sameThreadRepeatEnabled)
         XCTAssertNil(defaults.object(forKey: "sameThreadRepeatEnabled"))
     }
+
+    func testSameThreadRepeatUsesShortTimingProfileWithoutChangingRegularDelay() {
+        XCTAssertEqual(BrowserViewModel.sameThreadRepeatMinimumDelayNanoseconds,
+                       250_000_000)
+        XCTAssertEqual(BrowserViewModel.sameThreadRepeatSubmitDelayNanoseconds, 0)
+    }
 }

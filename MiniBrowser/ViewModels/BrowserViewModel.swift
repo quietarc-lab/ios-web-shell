@@ -6,7 +6,8 @@ import WebKit
 @MainActor
 final class BrowserViewModel: ObservableObject {
     private static let standardSubmitDelayNanoseconds: UInt64 = 2_000_000_000
-    private static let sameThreadRepeatMinimumDelayNanoseconds: UInt64 = 1_000_000_000
+    static let sameThreadRepeatMinimumDelayNanoseconds: UInt64 = 250_000_000
+    static let sameThreadRepeatSubmitDelayNanoseconds: UInt64 = 0
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
 
     private enum Keys {
@@ -1757,7 +1758,10 @@ final class BrowserViewModel: ObservableObject {
                     ]
                 )
             }
-            setAutomaticPostStatus(.checkingCookie, generationID: generationID)
+            setAutomaticPostStatus(
+                reason == .sameThreadRepeat ? .waitingForRepeat : .checkingCookie,
+                generationID: generationID
+            )
             startAutomaticSubmitReadiness(generationID: generationID,
                                           attempt: attempt,
                                           reason: reason)
@@ -2379,17 +2383,24 @@ final class BrowserViewModel: ObservableObject {
         automaticPostPreparationTimer?.cancel()
         let readinessReason = automaticSubmitReadinessReason
         let delayNanoseconds = submitDelayNanoseconds(for: readinessReason)
-        if readinessReason == .continuousAPRetry {
+        if let readinessReason,
+           readinessReason == .continuousAPRetry || readinessReason == .sameThreadRepeat {
+            var fields = [
+                ("DELAY_MS", String(delayNanoseconds / 1_000_000)),
+                ("REASON", readinessReason.rawValue)
+            ]
+            if readinessReason == .continuousAPRetry {
+                fields.append((
+                    "MIN_INTERVAL_MS",
+                    String(Self.continuousAPMinimumIntervalNanoseconds / 1_000_000)
+                ))
+            }
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "READINESS",
                 event: "SUBMIT_DELAY_SCHEDULED",
                 result: "SCHEDULED",
-                fields: [
-                    ("DELAY_MS", String(delayNanoseconds / 1_000_000)),
-                    ("MIN_INTERVAL_MS",
-                     String(Self.continuousAPMinimumIntervalNanoseconds / 1_000_000))
-                ]
+                fields: fields
             )
         }
         automaticSubmitReadinessReason = nil
@@ -2409,6 +2420,9 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private func submitDelayNanoseconds(for reason: AutomaticPostReadinessReason?) -> UInt64 {
+        if reason == .sameThreadRepeat {
+            return Self.sameThreadRepeatSubmitDelayNanoseconds
+        }
         guard reason == .continuousAPRetry,
               let completedAt = automaticContinuousAPCompletedUptimeNanoseconds else {
             return Self.standardSubmitDelayNanoseconds
