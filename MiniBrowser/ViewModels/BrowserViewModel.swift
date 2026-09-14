@@ -9,6 +9,7 @@ final class BrowserViewModel: ObservableObject {
     static let sameThreadRepeatMinimumDelayNanoseconds: UInt64 = 250_000_000
     static let sameThreadRepeatSubmitDelayNanoseconds: UInt64 = 0
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
+    private static let automaticSubmitResponseTimeoutNanoseconds: UInt64 = 15_000_000_000
 
     private enum Keys {
         static let lastURL = "lastURL"
@@ -54,6 +55,7 @@ final class BrowserViewModel: ObservableObject {
     private var automaticReloadGeneration: UInt64?
     private var automaticPostPreparationTimer: Task<Void, Never>?
     private var automaticSubmitReadinessTask: Task<Void, Never>?
+    private var automaticSubmitResponseTimer: Task<Void, Never>?
     private var automaticPostStatusTask: Task<Void, Never>?
     private var latestCompactReady: (pageToken: String, hasComment: Bool, canSubmit: Bool)?
     private var automaticSubmitReadinessStableSince: Date?
@@ -451,6 +453,7 @@ final class BrowserViewModel: ObservableObject {
 
         automaticPostPreparationTimer?.cancel()
         automaticSubmitReadinessTask?.cancel()
+        cancelAutomaticSubmitResponseTimer()
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
         automaticSubmitReadinessTask = nil
@@ -718,6 +721,92 @@ final class BrowserViewModel: ObservableObject {
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
 
+    func handleSubmitObserved(pageToken: String,
+                              submissionID: UInt64) {
+        guard automaticPostMachine.isActive,
+              let generationID = automaticPostMachine.generationID else {
+            return
+        }
+        guard automaticPostMachine.pageToken == pageToken else {
+            recordAutomaticBridgeIgnored(type: "submitObserved",
+                                          reason: "STALE_OR_MISMATCH")
+            return
+        }
+        let wasAwaitingResponseRetry = automaticPostMachine.awaitingSubmitResponseRetry
+        let canObserveSubmission: Bool
+        switch automaticPostMachine.state {
+        case .submitting:
+            canObserveSubmission = true
+        case .waitingForSubmitReadiness(_, _, .submitResponseRetry),
+             .waitingToSubmit:
+            canObserveSubmission = wasAwaitingResponseRetry
+        default:
+            canObserveSubmission = false
+        }
+        guard canObserveSubmission,
+              let attempt = automaticPostMachine.currentAttempt else {
+            recordAutomaticBridgeIgnored(type: "submitObserved",
+                                          reason: "STATE_NOT_SUBMITTING")
+            return
+        }
+        guard automaticPostMachine.currentSubmissionID == submissionID else {
+            recordAutomaticBridgeIgnored(type: "submitObserved",
+                                          reason: "STALE_SUBMISSION_ID")
+            return
+        }
+        guard !automaticPostMachine.submitEventObserved else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "SUBMIT",
+                event: "SUBMIT_EVENT_DUPLICATE",
+                result: "IGNORED",
+                fields: [
+                    ("ATTEMPT", String(attempt)),
+                    ("PAGE_TOKEN_STATE", "MATCH")
+                ]
+            )
+            return
+        }
+        if wasAwaitingResponseRetry {
+            // A delayed form event (or a manual fallback click) arrived while
+            // the one allowed automatic retry was being prepared. Treat it as
+            // the active submission and wait for its completion instead of
+            // issuing another click.
+            automaticSubmitReadinessTask?.cancel()
+            automaticSubmitReadinessTask = nil
+            automaticSubmitReadinessDeadline = nil
+            automaticSubmitReadinessStableSince = nil
+            automaticSubmitReadinessLastReason = nil
+            automaticSubmitReadinessFalseLogged = false
+            automaticSubmitReadinessReason = nil
+            automaticPostPreparationTimer?.cancel()
+            automaticPostPreparationTimer = nil
+        }
+        _ = automaticPostMachine.handle(.submitObserved(
+            generationID: generationID,
+            submissionID: submissionID
+        ))
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "SUBMIT",
+            event: "SUBMIT_EVENT_OBSERVED",
+            result: "OBSERVED",
+            fields: [
+                ("ATTEMPT", String(attempt)),
+                ("PAGE_TOKEN_STATE", "MATCH"),
+                ("SOURCE", wasAwaitingResponseRetry ? "LATE_FORM_SUBMIT" : "FORM_SUBMIT")
+            ]
+        )
+        if wasAwaitingResponseRetry {
+            startAutomaticSubmitResponseTimeout(
+                generationID: generationID,
+                attempt: attempt,
+                submissionID: submissionID,
+                pageToken: pageToken
+            )
+        }
+    }
+
     func handleHandwritingReady(pageToken: String,
                                 ready: Bool,
                                 generationID incomingGenerationID: UInt64? = nil) {
@@ -778,7 +867,9 @@ final class BrowserViewModel: ObservableObject {
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
 
-    func handlePostStatus(_ rawStatus: String?, pageToken: String?) {
+    func handlePostStatus(_ rawStatus: String?,
+                          pageToken: String?,
+                          submissionID: UInt64? = nil) {
         if automaticPostMachine.isActive {
             guard let pageToken else {
                 recordAutomaticBridgeIgnored(type: "postStatus",
@@ -788,6 +879,12 @@ final class BrowserViewModel: ObservableObject {
             guard automaticPostMachine.pageToken == pageToken else {
                 recordAutomaticBridgeIgnored(type: "postStatus",
                                               reason: "STALE_OR_MISMATCH")
+                return
+            }
+            if let submissionID,
+               automaticPostMachine.currentSubmissionID != submissionID {
+                recordAutomaticBridgeIgnored(type: "postStatus",
+                                              reason: "STALE_SUBMISSION_ID")
                 return
             }
         }
@@ -833,6 +930,7 @@ final class BrowserViewModel: ObservableObject {
         if rawStatus == SitePostStatus.sending.rawValue {
             setAutomaticPostStatus(.sending, generationID: generationID)
         } else if rawStatus == SitePostStatus.completed.rawValue {
+            cancelAutomaticSubmitResponseTimer()
             recordAutomaticPostAccepted(generationID: generationID,
                                          pageToken: pageToken,
                                          source: "POST_STATUS")
@@ -841,7 +939,8 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
-    func handlePostCompleted(pageToken: String?) {
+    func handlePostCompleted(pageToken: String?,
+                             submissionID: UInt64? = nil) {
         guard let generationID = automaticPostMachine.generationID else { return }
         guard automaticPostMachine.isActive else {
             let tokenState: String
@@ -873,6 +972,12 @@ final class BrowserViewModel: ObservableObject {
                                           reason: "STALE_OR_MISMATCH")
             return
         }
+        if let submissionID,
+           automaticPostMachine.currentSubmissionID != submissionID {
+            recordAutomaticBridgeIgnored(type: "postCompleted",
+                                          reason: "STALE_SUBMISSION_ID")
+            return
+        }
         appendAutomaticEvent(
             generationID: generationID,
             phase: "BRIDGE",
@@ -880,6 +985,7 @@ final class BrowserViewModel: ObservableObject {
             result: "RECEIVED",
             fields: [("PAGE_TOKEN_STATE", "MATCH")]
         )
+        cancelAutomaticSubmitResponseTimer()
         recordAutomaticPostAccepted(generationID: generationID,
                                     pageToken: pageToken,
                                     source: "POST_COMPLETED")
@@ -1110,6 +1216,8 @@ final class BrowserViewModel: ObservableObject {
             return .showNormally
         }
 
+        cancelAutomaticSubmitResponseTimer()
+
         if category == .accessRestricted {
             if runtimeUserAgent == nil {
                 userAgentRestrictionStore.restrict(currentUserAgent.id)
@@ -1214,6 +1322,7 @@ final class BrowserViewModel: ObservableObject {
             : "[NOT_CAPTURED_NON_TARGET_HOST]"
         if let generationID = automaticPostMachine.generationID,
            automaticPostMachine.isActive {
+            cancelAutomaticSubmitResponseTimer()
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "ALERT",
@@ -1793,7 +1902,9 @@ final class BrowserViewModel: ObservableObject {
                 )
             }
             setAutomaticPostStatus(
-                reason == .sameThreadRepeat ? .waitingForRepeat : .checkingCookie,
+                reason == .sameThreadRepeat
+                    ? .waitingForRepeat
+                    : reason == .submitResponseRetry ? .sending : .checkingCookie,
                 generationID: generationID
             )
             startAutomaticSubmitReadiness(generationID: generationID,
@@ -1865,7 +1976,7 @@ final class BrowserViewModel: ObservableObject {
             automaticPostVerificationTask?.cancel()
             automaticPostVerificationTask = nil
             finishAutomaticPost(generationID: generationID,
-                                result: "STOPPED_\(String(describing: reason).uppercased())")
+                                result: Self.automaticStopResult(for: reason))
         }
     }
 
@@ -2418,7 +2529,9 @@ final class BrowserViewModel: ObservableObject {
         let readinessReason = automaticSubmitReadinessReason
         let delayNanoseconds = submitDelayNanoseconds(for: readinessReason)
         if let readinessReason,
-           readinessReason == .continuousAPRetry || readinessReason == .sameThreadRepeat {
+           readinessReason == .continuousAPRetry ||
+           readinessReason == .sameThreadRepeat ||
+           readinessReason == .submitResponseRetry {
             var fields = [
                 ("DELAY_MS", String(delayNanoseconds / 1_000_000)),
                 ("REASON", readinessReason.rawValue)
@@ -2471,7 +2584,9 @@ final class BrowserViewModel: ObservableObject {
 
     private func submitAutomatically(attempt: Int, generationID: UInt64) {
         guard automaticPostMachine.generationID == generationID,
-              let webView else {
+              let webView,
+              let pageToken = automaticPostMachine.pageToken,
+              let submissionID = automaticPostMachine.currentSubmissionID else {
             stopAutomaticPost(.communicationFailure, generationID: generationID)
             return
         }
@@ -2518,11 +2633,18 @@ final class BrowserViewModel: ObservableObject {
             ), at: 0)
         }
         logStore.append(action: "Automatic Post", fields: submitFields)
-        webView.evaluateJavaScript(CompactPageModeService.autoSubmitScript) {
+        startAutomaticSubmitResponseTimeout(generationID: generationID,
+                                            attempt: attempt,
+                                            submissionID: submissionID,
+                                            pageToken: pageToken)
+        webView.evaluateJavaScript(CompactPageModeService.autoSubmitScript(
+            for: submissionID
+        )) {
             [weak self] result, error in
             guard let self else { return }
             guard self.automaticPostMachine.generationID == generationID,
-                  self.automaticPostMachine.currentAttempt == attempt else {
+                  self.automaticPostMachine.currentAttempt == attempt,
+                  self.automaticPostMachine.pageToken == pageToken else {
                 if let currentGenerationID = self.automaticPostMachine.generationID {
                     self.appendAutomaticEvent(
                         generationID: currentGenerationID,
@@ -2565,6 +2687,7 @@ final class BrowserViewModel: ObservableObject {
                 fields: callbackFields
             )
             guard error == nil, didClick else {
+                self.cancelAutomaticSubmitResponseTimer()
                 let effect = self.automaticPostMachine.handle(
                     .fail(generationID: generationID, reason: .communicationFailure)
                 )
@@ -2572,6 +2695,87 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
         }
+    }
+
+    private func startAutomaticSubmitResponseTimeout(generationID: UInt64,
+                                                     attempt: Int,
+                                                     submissionID: UInt64,
+                                                     pageToken: String) {
+        automaticSubmitResponseTimer?.cancel()
+        automaticSubmitResponseTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                nanoseconds: Self.automaticSubmitResponseTimeoutNanoseconds
+            )
+            guard let self,
+                  !Task.isCancelled,
+                  self.automaticPostMachine.generationID == generationID,
+                  self.automaticPostMachine.pageToken == pageToken,
+                  self.automaticPostMachine.currentSubmissionID == submissionID,
+                  case let .submitting(_, currentAttempt) = self.automaticPostMachine.state,
+                  currentAttempt == attempt else {
+                return
+            }
+
+            let submissionEvidence: String
+            if self.automaticPostMachine.submitEventObserved {
+                submissionEvidence = "FORM_SUBMIT"
+            } else if self.automaticOwnResponseConfirmed {
+                submissionEvidence = "DOM_MATCHED"
+            } else {
+                submissionEvidence = "NONE"
+            }
+            let effect = self.automaticPostMachine.handle(
+                .submitResponseTimedOut(
+                    generationID: generationID,
+                    submissionID: submissionID
+                )
+            )
+            let willRetry: Bool
+            if case .startSubmitReadiness = effect {
+                willRetry = true
+            } else {
+                willRetry = false
+            }
+            self.appendAutomaticEvent(
+                generationID: generationID,
+                phase: "SUBMIT",
+                event: "SUBMIT_RESPONSE_TIMEOUT",
+                result: willRetry ? "RETRYING" : "STOPPED",
+                fields: [
+                    ("ATTEMPT", String(attempt)),
+                    ("BRANCH", self.automaticSubmitBranch(attempt: attempt)),
+                    ("PAGE_TOKEN_STATE", "MATCH"),
+                    ("EVIDENCE", submissionEvidence),
+                    ("TIMEOUT_MS", String(
+                        Self.automaticSubmitResponseTimeoutNanoseconds / 1_000_000
+                    ))
+                ]
+            )
+            self.automaticSubmitResponseTimer = nil
+            self.handleAutomaticPostEffect(effect, generationID: generationID)
+        }
+    }
+
+    private func cancelAutomaticSubmitResponseTimer() {
+        automaticSubmitResponseTimer?.cancel()
+        automaticSubmitResponseTimer = nil
+    }
+
+    private func automaticSubmitBranch(attempt: Int) -> String {
+        let isFinalIPAttempt = attempt == AutomaticPostFlowMachine.regularAttemptLimit &&
+            automaticPostMachine.ipRetryIsTerminal
+        let isContinuousAPAttempt = attempt == AutomaticPostFlowMachine.maximumAttempts &&
+            automaticPostMachine.continuousRetryUsed
+        if isContinuousAPAttempt {
+            return "CONTINUOUS_AP_RETRY"
+        }
+        if automaticPostMachine.continuousRetryUsed {
+            return "CONTINUOUS_RETRY"
+        }
+        if isFinalIPAttempt || automaticPostMachine.ipRetryIsTerminal {
+            return "IP_RETRY"
+        }
+        return attempt == 1 ? "INITIAL" : "COOKIE_RETRY"
     }
 
     private func startAutomaticPostPreparationTimeout(generationID: UInt64) {
@@ -2610,6 +2814,7 @@ final class BrowserViewModel: ObservableObject {
     private func finishAutomaticPost(generationID: UInt64, result: String) {
         guard automaticPostMachine.generationID == generationID else { return }
         automaticPostPreparationTimer?.cancel()
+        cancelAutomaticSubmitResponseTimer()
         automaticSubmitReadinessTask?.cancel()
         automaticSubmitReadinessTask = nil
         automaticSubmitReadinessStableSince = nil
@@ -2790,7 +2995,7 @@ final class BrowserViewModel: ObservableObject {
                                           reason: "STALE_OR_MISMATCH")
             return
         }
-        guard case .submitting = automaticPostMachine.state else {
+        guard automaticPostMachine.canAcceptPostCompletion else {
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "SUBMIT",
@@ -2804,6 +3009,31 @@ final class BrowserViewModel: ObservableObject {
             )
             return
         }
+        if automaticPostMachine.awaitingSubmitResponseRetry {
+            // A delayed completion marker won the race with the one allowed
+            // response retry. Cancel the readiness/submit-delay work before
+            // transitioning to success so it cannot dispatch a second click.
+            automaticSubmitReadinessTask?.cancel()
+            automaticSubmitReadinessTask = nil
+            automaticSubmitReadinessDeadline = nil
+            automaticSubmitReadinessStableSince = nil
+            automaticSubmitReadinessLastReason = nil
+            automaticSubmitReadinessFalseLogged = false
+            automaticSubmitReadinessReason = nil
+            automaticPostPreparationTimer?.cancel()
+            automaticPostPreparationTimer = nil
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "SUBMIT",
+                event: "LATE_COMPLETION_ACCEPTED",
+                result: "RETRY_SUPPRESSED",
+                fields: [
+                    ("PAGE_TOKEN_STATE", "MATCH"),
+                    ("SOURCE", Self.safePostAcceptanceSource(source))
+                ]
+            )
+        }
+        cancelAutomaticSubmitResponseTimer()
         if automaticPostAccepted {
             appendAutomaticEvent(
                 generationID: generationID,
@@ -2875,6 +3105,7 @@ final class BrowserViewModel: ObservableObject {
         case "postStatus": return "POST_STATUS"
         case "postCompleted": return "POST_COMPLETED"
         case "submitReadiness": return "SUBMIT_READINESS"
+        case "submitObserved": return "SUBMIT_OBSERVED"
         case "ownPostVisible": return "OWN_POST_VISIBLE"
         case "ownPostObservation": return "OWN_POST_OBSERVATION"
         default: return "OTHER_BRIDGE_EVENT"
@@ -2892,6 +3123,7 @@ final class BrowserViewModel: ObservableObject {
         case "CAN_SUBMIT_MISSING": return "CAN_SUBMIT_MISSING"
         case "COUNTS_MISSING": return "COUNTS_MISSING"
         case "RESTORE_SCRIPT_UNAVAILABLE": return "RESTORE_SCRIPT_UNAVAILABLE"
+        case "SUBMISSION_ID_MISSING": return "SUBMISSION_ID_MISSING"
         default: return "OTHER"
         }
     }
@@ -2906,6 +3138,7 @@ final class BrowserViewModel: ObservableObject {
         case "SUBMIT_BUTTON_DISABLED": return "SUBMIT_BUTTON_DISABLED"
         case "POST_IN_FLIGHT": return "POST_IN_FLIGHT"
         case "OUTSIDE_TARGET_PAGE": return "OUTSIDE_TARGET_PAGE"
+        case "SUBMIT_RESPONSE_RETRY": return "SUBMIT_RESPONSE_RETRY"
         default: return "OTHER"
         }
     }
@@ -2916,6 +3149,13 @@ final class BrowserViewModel: ObservableObject {
         case "POST_COMPLETED": return "POST_COMPLETED"
         default: return "OTHER"
         }
+    }
+
+    private static func automaticStopResult(for reason: AutomaticPostStopReason) -> String {
+        if reason == .submitResponseTimeout {
+            return "STOPPED_SUBMIT_RESPONSE_TIMEOUT"
+        }
+        return "STOPPED_\(String(describing: reason).uppercased())"
     }
 
     private static func safePostStatusName(_ rawStatus: String?) -> String? {

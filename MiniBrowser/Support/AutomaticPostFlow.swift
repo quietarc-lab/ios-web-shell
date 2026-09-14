@@ -26,6 +26,7 @@ enum AutomaticPostStopReason: Equatable {
     case retryLimit
     case repeatDisabled
     case imageCountRestricted
+    case submitResponseTimeout
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {
@@ -35,6 +36,7 @@ enum AutomaticPostReadinessReason: String, Equatable {
     case continuousRetry = "CONTINUOUS_RETRY"
     case continuousAPRetry = "CONTINUOUS_AP_RETRY"
     case sameThreadRepeat = "SAME_THREAD_REPEAT"
+    case submitResponseRetry = "SUBMIT_RESPONSE_RETRY"
 }
 
 enum AutomaticPostFlowState: Equatable {
@@ -86,6 +88,8 @@ enum AutomaticPostFlowEvent: Equatable {
     case continuousAlertDismissed(generationID: UInt64)
     case ipReconnectCompleted(generationID: UInt64, success: Bool)
     case continuousAPReconnectCompleted(generationID: UInt64, success: Bool)
+    case submitObserved(generationID: UInt64, submissionID: UInt64)
+    case submitResponseTimedOut(generationID: UInt64, submissionID: UInt64)
     case ipSubmitDelayElapsed(generationID: UInt64)
     case postCompleted(generationID: UInt64)
     case fail(generationID: UInt64, reason: AutomaticPostStopReason)
@@ -107,6 +111,14 @@ struct AutomaticPostFlowMachine {
     private(set) var requiresHandwriting = false
     private(set) var lastAttempt = 0
     private(set) var isSameThreadRepeat = false
+    private(set) var currentSubmissionID: UInt64? = nil
+    private(set) var submitEventObserved = false
+    private(set) var submitResponseRetryUsed = false
+    /// A response timeout may race with a site's delayed completion marker.
+    /// Keep the timed-out submission identifiable while the one allowed retry
+    /// is being prepared so that a late completion can finish the flow without
+    /// dispatching a duplicate click.
+    private(set) var awaitingSubmitResponseRetry = false
 
     private var stalePageToken: String?
     private var apCompleted = false
@@ -139,6 +151,23 @@ struct AutomaticPostFlowMachine {
             return attempt
         case .idle, .preparing, .succeeded, .stopped:
             return nil
+        }
+    }
+
+    /// Whether a completion marker may be accepted for the current
+    /// generation. Normally this is only true while the submitted click is
+    /// active. During the single response-retry window, a site may deliver a
+    /// delayed completion marker after the watchdog moved into readiness; in
+    /// that narrow case the marker is accepted and the retry click is skipped.
+    var canAcceptPostCompletion: Bool {
+        switch state {
+        case .submitting:
+            return true
+        case .waitingForSubmitReadiness(_, _, .submitResponseRetry),
+             .waitingToSubmit:
+            return awaitingSubmitResponseRetry
+        default:
+            return false
         }
     }
 
@@ -187,6 +216,10 @@ struct AutomaticPostFlowMachine {
         ipRetryIsTerminal = false
         continuousRetryUsed = false
         lastAttempt = 0
+        currentSubmissionID = nil
+        submitEventObserved = false
+        submitResponseRetryUsed = false
+        awaitingSubmitResponseRetry = false
         apCompleted = false
         reloadCompleted = false
         cookieObserved = false
@@ -218,6 +251,10 @@ struct AutomaticPostFlowMachine {
         ipRetryIsTerminal = false
         continuousRetryUsed = false
         lastAttempt = 0
+        currentSubmissionID = nil
+        submitEventObserved = false
+        submitResponseRetryUsed = false
+        awaitingSubmitResponseRetry = false
         // The page, AP state, and Cookie observation are already valid for a
         // same-page repeat. Compact-form and handwriting readiness are still
         // re-established through the bridge before the next click.
@@ -339,8 +376,57 @@ struct AutomaticPostFlowMachine {
             return beginSubmitReadiness(attempt: attempt + 1,
                                         reason: .continuousAPRetry)
 
+        case let .submitObserved(_, submissionID):
+            guard currentSubmissionID == submissionID else {
+                return .none
+            }
+            let canAcceptLateSubmit: Bool
+            switch state {
+            case .submitting:
+                canAcceptLateSubmit = true
+            case .waitingForSubmitReadiness(_, _, .submitResponseRetry),
+                 .waitingToSubmit:
+                canAcceptLateSubmit = awaitingSubmitResponseRetry
+            default:
+                canAcceptLateSubmit = false
+            }
+            guard canAcceptLateSubmit else { return .none }
+            if awaitingSubmitResponseRetry {
+                guard let generationID else { return .none }
+                state = .submitting(generationID: generationID,
+                                    attempt: lastAttempt)
+                awaitingSubmitResponseRetry = false
+            }
+            submitEventObserved = true
+            return .none
+
+        case let .submitResponseTimedOut(_, submissionID):
+            guard case let .submitting(_, attempt) = state,
+                  currentSubmissionID == submissionID else {
+                return .none
+            }
+            guard !submitEventObserved,
+                  !submitResponseRetryUsed else {
+                return stop(.submitResponseTimeout)
+            }
+            submitResponseRetryUsed = true
+            awaitingSubmitResponseRetry = true
+            return beginSubmitReadiness(attempt: attempt,
+                                        reason: .submitResponseRetry)
+
         case .postCompleted:
-            guard case .submitting = state else { return .none }
+            let canAcceptLateCompletion: Bool
+            switch state {
+            case .submitting:
+                canAcceptLateCompletion = true
+            case .waitingForSubmitReadiness(_, _, .submitResponseRetry),
+                 .waitingToSubmit:
+                canAcceptLateCompletion = awaitingSubmitResponseRetry
+            default:
+                canAcceptLateCompletion = false
+            }
+            guard canAcceptLateCompletion else { return .none }
+            awaitingSubmitResponseRetry = false
             state = .succeeded(generationID: eventGenerationID)
             return .succeeded
 
@@ -414,6 +500,7 @@ struct AutomaticPostFlowMachine {
 
     mutating func stop(_ reason: AutomaticPostStopReason) -> AutomaticPostFlowEffect {
         guard let generationID else { return .none }
+        awaitingSubmitResponseRetry = false
         state = .stopped(generationID: generationID, reason: reason)
         return .stopped(reason)
     }
@@ -429,6 +516,10 @@ struct AutomaticPostFlowMachine {
         continuousRetryUsed = false
         requiresHandwriting = false
         lastAttempt = 0
+        currentSubmissionID = nil
+        submitEventObserved = false
+        submitResponseRetryUsed = false
+        awaitingSubmitResponseRetry = false
         isSameThreadRepeat = false
         apCompleted = false
         reloadCompleted = false
@@ -475,6 +566,10 @@ struct AutomaticPostFlowMachine {
         }
         state = .submitting(generationID: generationID, attempt: attempt)
         lastAttempt = attempt
+        awaitingSubmitResponseRetry = false
+        let nextSubmissionID = (currentSubmissionID ?? 0) &+ 1
+        currentSubmissionID = nextSubmissionID == 0 ? 1 : nextSubmissionID
+        submitEventObserved = false
         return .submit(attempt: attempt)
     }
 
@@ -504,6 +599,8 @@ private extension AutomaticPostFlowEvent {
              let .initialSubmitDelayElapsed(id),
              let .cookieAlertDismissed(id),
              let .continuousAlertDismissed(id),
+             let .submitObserved(id, _),
+             let .submitResponseTimedOut(id, _),
              let .ipSubmitDelayElapsed(id),
              let .postCompleted(id),
              let .fail(id, _):

@@ -367,13 +367,30 @@ enum CompactPageModeService {
       let postCompletionReported = false;
       let lastNativePostStatus = null;
 
+      function automaticSubmissionID() {
+        const value = window.__pageSessionActiveSubmissionID;
+        if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+          return null;
+        }
+        return value;
+      }
+
+      function withAutomaticSubmissionID(payload) {
+        const submissionID = automaticSubmissionID();
+        return submissionID === null ? payload :
+          Object.assign({ submissionID }, payload);
+      }
+
       function notifyNativePostStatus() {
         const status = doc.getElementById("retmestip");
         const text = status ? String(status.textContent || "").trim() : "";
         const normalized = text === "…" || text === "完了" ? text : "";
         if (normalized === lastNativePostStatus) return;
         lastNativePostStatus = normalized;
-        sendNative({ type: "postStatus", status: normalized });
+        sendNative(withAutomaticSubmissionID({
+          type: "postStatus",
+          status: normalized
+        }));
       }
 
       function notifyCompactReady() {
@@ -404,10 +421,26 @@ enum CompactPageModeService {
         const status = doc.getElementById("retmestip");
         if (!status || String(status.textContent || "").trim() !== "完了") return;
         postCompletionReported = true;
-        sendNative({
+        sendNative(withAutomaticSubmissionID({
           type: "postCompleted",
           canvasWasOpen: canvasWasOpenAtSubmission
-        });
+        }));
+      }
+
+      function consumeAutomaticSubmissionID() {
+        const value = window.__pageSessionPendingSubmissionID;
+        window.__pageSessionPendingSubmissionID = null;
+        if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+          return null;
+        }
+        window.__pageSessionActiveSubmissionID = value;
+        return value;
+      }
+
+      function notifyNativeSubmitObserved() {
+        const submissionID = consumeAutomaticSubmissionID();
+        if (submissionID === null) return;
+        sendNative({ type: "submitObserved", submissionID });
       }
 
       function capturePostState() {
@@ -458,6 +491,7 @@ enum CompactPageModeService {
       updateDraftToggle();
 
       form.addEventListener("submit", capturePostState, true);
+      form.addEventListener("submit", notifyNativeSubmitObserved, true);
 
       if (submitButton && !submitButton.dataset.minibrowserPostCapture) {
         submitButton.dataset.minibrowserPostCapture = "true";
@@ -1048,6 +1082,36 @@ enum CompactPageModeService {
       return true;
     })();
     """#)
+
+    static func autoSubmitScript(for submissionID: UInt64) -> String {
+        makeAutoSubmitScript(submissionID: submissionID)
+    }
+
+    private static func makeAutoSubmitScript(submissionID: UInt64?) -> String {
+        let submissionAssignment = submissionID.map {
+            "window.__pageSessionPendingSubmissionID = \($0); window.__pageSessionActiveSubmissionID = \($0);"
+        } ?? ""
+        return PageMarkerNamespace.neutralize(#"""
+        (() => {
+          "use strict";
+          if (location.hostname !== "img.2chan.net" ||
+              !/^\/[^/]+\/res\/\d+\.htm$/.test(location.pathname)) {
+            return false;
+          }
+          const form = Array.from(document.forms).find(candidate =>
+            candidate.querySelector('textarea[name="com"]')
+          );
+          if (!form) return false;
+          const submitButton = Array.from(form.querySelectorAll(
+            'input[type="submit"], button[type="submit"]'
+          )).find(button => /返信|送信/.test(button.value || button.textContent || ""));
+          if (!(submitButton instanceof HTMLElement)) return false;
+          \#(submissionAssignment)
+          submitButton.click();
+          return true;
+        })();
+        """#)
+    }
 
     private static func javaScriptStringLiteral(_ value: String) -> String? {
         guard let data = try? JSONEncoder().encode(value) else { return nil }

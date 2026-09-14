@@ -66,6 +66,12 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("userEditedAfterSubmission"))
         XCTAssertTrue(script.contains("type: \"postCompleted\""))
         XCTAssertTrue(script.contains("type: \"postStatus\""))
+        XCTAssertTrue(script.contains("type: \"submitObserved\""))
+        XCTAssertTrue(script.contains("notifyNativeSubmitObserved"))
+        XCTAssertTrue(script.contains("consumeAutomaticSubmissionID"))
+        XCTAssertTrue(script.contains("__pageSessionActiveSubmissionID"))
+        XCTAssertTrue(script.contains("withAutomaticSubmissionID"))
+        XCTAssertTrue(script.contains("form.addEventListener(\"submit\", notifyNativeSubmitObserved, true)"))
         XCTAssertTrue(script.contains("type: \"ownPostVisible\""))
         XCTAssertTrue(script.contains("type: \"ownPostObservation\""))
         XCTAssertTrue(script.contains("notifyOwnPostObservation"))
@@ -118,6 +124,13 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(submitScript.contains("submitButton.click()"))
         XCTAssertFalse(submitScript.contains("form.submit"))
         XCTAssertFalse(submitScript.contains("itgkfile"))
+
+        let identifiedSubmitScript = CompactPageModeService.autoSubmitScript(for: 17)
+        XCTAssertTrue(identifiedSubmitScript.contains(
+            "window.__pageSessionPendingSubmissionID = 17; window.__pageSessionActiveSubmissionID = 17;"
+        ))
+        XCTAssertTrue(identifiedSubmitScript.contains("submitButton.click()"))
+        XCTAssertFalse(identifiedSubmitScript.contains("form.submit"))
     }
 
     func testSubmitReadinessScriptReportsStablePageConditions() {

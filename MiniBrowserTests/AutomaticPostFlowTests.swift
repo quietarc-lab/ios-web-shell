@@ -98,6 +98,135 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .none)
     }
 
+    func testSubmitResponseTimeoutRetriesOnceWhenNoFormSubmitWasObserved() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let firstSubmissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: firstSubmissionID
+        )), .startSubmitReadiness(attempt: 1, reason: .submitResponseRetry))
+        XCTAssertTrue(machine.submitResponseRetryUsed)
+        XCTAssertTrue(machine.awaitingSubmitResponseRetry)
+        XCTAssertEqual(machine.state,
+                       .waitingForSubmitReadiness(generationID: generation,
+                                                  attempt: 1,
+                                                  reason: .submitResponseRetry))
+
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: firstSubmissionID
+        )), .none)
+
+        XCTAssertEqual(machine.handle(.submitReadinessObserved(
+            generationID: generation,
+            pageToken: "page",
+            ready: true,
+            stableForMilliseconds: AutomaticPostFlowMachine.readinessStableMilliseconds
+        )), .scheduleSubmitDelay)
+        XCTAssertEqual(machine.handle(.initialSubmitDelayElapsed(generationID: generation)),
+                       .submit(attempt: 1))
+        let retrySubmissionID = try XCTUnwrap(machine.currentSubmissionID)
+        XCTAssertNotEqual(retrySubmissionID, firstSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: retrySubmissionID
+        )), .stopped(.submitResponseTimeout))
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .submitResponseTimeout))
+    }
+
+    func testLateCompletionDuringResponseRetrySuppressesSecondClick() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let submissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: submissionID
+        )), .startSubmitReadiness(attempt: 1, reason: .submitResponseRetry))
+        XCTAssertTrue(machine.canAcceptPostCompletion)
+        XCTAssertEqual(machine.handle(.postCompleted(generationID: generation)), .succeeded)
+        XCTAssertEqual(machine.state, .succeeded(generationID: generation))
+        XCTAssertFalse(machine.awaitingSubmitResponseRetry)
+        XCTAssertEqual(machine.handle(.initialSubmitDelayElapsed(generationID: generation)),
+                       .none)
+    }
+
+    func testLateFormSubmitDuringResponseRetryRestoresResponseWaitWithoutClick() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let submissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        _ = machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: submissionID
+        ))
+        XCTAssertTrue(machine.awaitingSubmitResponseRetry)
+        XCTAssertEqual(machine.handle(.submitObserved(
+            generationID: generation,
+            submissionID: submissionID
+        )), .none)
+        XCTAssertEqual(machine.state,
+                       .submitting(generationID: generation, attempt: 1))
+        XCTAssertTrue(machine.submitEventObserved)
+        XCTAssertFalse(machine.awaitingSubmitResponseRetry)
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: submissionID
+        )), .stopped(.submitResponseTimeout))
+    }
+
+    func testResponseRetryClearsLateCompletionWindowWhenRetryClickStarts() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let firstSubmissionID = try XCTUnwrap(machine.currentSubmissionID)
+        _ = machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: firstSubmissionID
+        ))
+        _ = submitAfterReadiness(&machine)
+        XCTAssertFalse(machine.awaitingSubmitResponseRetry)
+        XCTAssertTrue(machine.canAcceptPostCompletion)
+        XCTAssertEqual(machine.handle(.postCompleted(generationID: generation)), .succeeded)
+    }
+
+    func testSubmitResponseTimeoutStopsWhenFormSubmitWasObserved() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let submissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitObserved(
+            generationID: generation,
+            submissionID: submissionID
+        )), .none)
+        XCTAssertTrue(machine.submitEventObserved)
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: submissionID
+        )), .stopped(.submitResponseTimeout))
+    }
+
+    func testStaleSubmitObservationAndTimeoutAreIgnored() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let submissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitObserved(
+            generationID: generation + 1,
+            submissionID: submissionID
+        )), .none)
+        XCTAssertFalse(machine.submitEventObserved)
+        XCTAssertEqual(machine.handle(.submitObserved(
+            generationID: generation,
+            submissionID: submissionID + 1
+        )), .none)
+        XCTAssertFalse(machine.submitEventObserved)
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: submissionID + 1
+        )), .none)
+        XCTAssertEqual(machine.state,
+                       .submitting(generationID: generation, attempt: 1))
+    }
+
     func testCookieAlertRetriesOnceWithoutConsumingIPBranch() {
         var machine = readyMachine(hasComment: true, hasImage: false)
         XCTAssertEqual(machine.handleAlert(.cookieRetryRequired, generationID: generation).autoDismiss,

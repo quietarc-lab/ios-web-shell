@@ -19,6 +19,7 @@ const sources = [
 const generatedSources = [
   ["MiniBrowser/Services/CompactPageModeService.swift", "restoreAutomaticDraftScript"],
   ["MiniBrowser/Services/CompactPageModeService.swift", "repeatCanvasUpdateScript"],
+  ["MiniBrowser/Services/CompactPageModeService.swift", "makeAutoSubmitScript"],
   ["MiniBrowser/Services/CanvasImageSessionService.swift", "restorationScript"]
 ];
 

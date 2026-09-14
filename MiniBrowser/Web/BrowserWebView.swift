@@ -242,14 +242,39 @@ struct BrowserWebView: UIViewRepresentable {
                                             ready: ready,
                                             reason: reason)
 
+            case "submitObserved":
+                guard let pageToken else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "PAGE_TOKEN_MISSING"
+                    )
+                    return
+                }
+                guard let submissionID = uint64Value(body["submissionID"]) else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "SUBMISSION_ID_MISSING"
+                    )
+                    return
+                }
+                model.handleSubmitObserved(pageToken: pageToken,
+                                           submissionID: submissionID)
+
             case "postCompleted":
-                model.handlePostCompleted(pageToken: pageToken)
+                model.handlePostCompleted(
+                    pageToken: pageToken,
+                    submissionID: uint64Value(body["submissionID"])
+                )
                 let canvasWasOpen = body["canvasWasOpen"] as? Bool ?? false
                 guard canvasWasOpen || handwritingImageStore.hasImage else { return }
                 attachedWebView?.evaluateJavaScript(CanvasImageSessionService.openExistingCanvasScript)
 
             case "postStatus":
-                model.handlePostStatus(body["status"] as? String, pageToken: pageToken)
+                model.handlePostStatus(
+                    body["status"] as? String,
+                    pageToken: pageToken,
+                    submissionID: uint64Value(body["submissionID"])
+                )
 
             case "ownPostVisible":
                 guard let pageToken else {
