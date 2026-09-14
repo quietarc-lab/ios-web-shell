@@ -24,6 +24,7 @@ struct ThreadListView: View {
                 }
                 .font(.caption2.weight(model.selectedSort == sort ? .bold : .regular))
                 .foregroundStyle(model.selectedSort == sort ? .white : .primary)
+                .accessibilityLabel(sort.accessibilityTitle)
                 .padding(.horizontal, 6)
                 .frame(height: 26)
                 .background(model.selectedSort == sort ? Color.blue : Color.clear)

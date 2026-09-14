@@ -8,7 +8,8 @@ final class ThreadListServiceTests: XCTestCase {
                        "https://img.2chan.net/b/futaba.php?mode=cat&sort=6")
         XCTAssertEqual(ThreadListSort.list.url.absoluteString,
                        "https://img.2chan.net/b/futaba.php?mode=cat")
-        XCTAssertEqual(ThreadListSort.allCases.map(\.title), ["勢い順", "カタログ順"])
+        XCTAssertEqual(ThreadListSort.allCases.map(\.title), ["勢順", "カ順"])
+        XCTAssertEqual(ThreadListSort.allCases.map(\.accessibilityTitle), ["勢い順", "カタログ順"])
         XCTAssertEqual(ThreadListSort.allCases.count, 2)
     }
 

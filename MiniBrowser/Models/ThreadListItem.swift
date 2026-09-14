@@ -8,6 +8,13 @@ enum ThreadListSort: String, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
+        case .momentum: "勢順"
+        case .list: "カ順"
+        }
+    }
+
+    var accessibilityTitle: String {
+        switch self {
         case .momentum: "勢い順"
         case .list: "カタログ順"
         }
