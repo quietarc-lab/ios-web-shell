@@ -23,7 +23,9 @@ actor ThreadListService {
         userAgent = value
     }
 
-    func fetchList(sort: ThreadListSort, limit: Int = 60) async throws -> [ThreadListItem] {
+    func fetchList(sort: ThreadListSort,
+                   limit: Int = 60,
+                   excludingIDs: Set<String> = []) async throws -> [ThreadListItem] {
         let request = Self.makeListRequest(for: sort.url, userAgent: userAgent)
 
         let (data, response) = try await session.data(for: request)
@@ -34,8 +36,15 @@ actor ThreadListService {
         guard let html = Self.decodeShiftJIS(data) else {
             throw ThreadListError.decodingFailed
         }
-        let items = Self.parseListHTML(html, baseURL: sort.url, limit: limit)
-        guard !items.isEmpty else {
+        let items = Self.parseListHTML(html,
+                                       baseURL: sort.url,
+                                       limit: limit,
+                                       excludingIDs: excludingIDs)
+        let hasCatalogTable = html.range(
+            of: #"<table\b[^>]*\bid\s*=\s*['\"]cattable['\"]"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+        guard !items.isEmpty || hasCatalogTable else {
             throw ThreadListError.listParseFailed
         }
         return items
@@ -144,7 +153,8 @@ actor ThreadListService {
 
     nonisolated static func parseListHTML(_ html: String,
                                              baseURL: URL,
-                                             limit: Int = 60) -> [ThreadListItem] {
+                                             limit: Int = 60,
+                                             excludingIDs: Set<String> = []) -> [ThreadListItem] {
         guard limit > 0,
               let tableRange = html.range(
                 of: #"<table\b[^>]*\bid\s*=\s*['\"]cattable['\"][^>]*>([\s\S]*?)</table>"#,
@@ -172,6 +182,7 @@ actor ThreadListService {
                   let id = firstCapture(in: cell,
                                         pattern: #"href\s*=\s*['\"][^'\"]*res/(\d+)\.htm['\"]"#,
                                         index: 1),
+                  !excludingIDs.contains(id),
                   let source = firstCapture(in: cell,
                                             pattern: #"<img\b[^>]*\bsrc\s*=\s*['\"]([^'\"]+)['\"]"#,
                                             index: 1),

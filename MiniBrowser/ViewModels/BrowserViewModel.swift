@@ -963,6 +963,8 @@ final class BrowserViewModel: ObservableObject {
             alert = .accessRestricted
         case .continuousPosting:
             alert = .continuousPosting
+        case .threadPostingUnavailable:
+            alert = .threadPostingUnavailable
         }
         let result = automaticPostMachine.handleAlert(alert, generationID: generationID)
         handleAutomaticPostEffect(result.effect, generationID: generationID)
@@ -1021,6 +1023,8 @@ final class BrowserViewModel: ObservableObject {
             case .accessRestricted:
                 // The state machine has already invalidated the current
                 // generation and started the next eligible-UA handoff.
+                break
+            case .threadPostingUnavailable:
                 break
             }
             return .autoDismiss

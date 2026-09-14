@@ -50,6 +50,13 @@ final class WebDialogPolicyTests: XCTestCase {
             ),
             .continuousPosting
         )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "このスレッドには\n書けません"
+            ),
+            .threadPostingUnavailable
+        )
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
             message: "cookieを有効にしてもう一度送信してください"
@@ -77,6 +84,14 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
             message: "連続投稿はもうしばらく時間を置いてからお願い致します。"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "img.2chan.net",
+            message: "このスレッドには書けません。"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "example.com",
+            message: "このスレッドには書けません"
         ))
     }
 }

@@ -5,6 +5,7 @@ enum TargetPageAlertCategory: String, Equatable {
     case imagePostingRestricted = "IMAGE_POSTING_RESTRICTED"
     case accessRestricted = "ACCESS_RESTRICTED"
     case continuousPosting = "CONTINUOUS_POSTING"
+    case threadPostingUnavailable = "THREAD_POSTING_UNAVAILABLE"
 }
 
 enum TargetPageAlertClassifier {
@@ -32,6 +33,9 @@ enum TargetPageAlertClassifier {
         }
         if normalized == "連続投稿はもうしばらく時間を置いてからお願い致します。" {
             return .continuousPosting
+        }
+        if normalized == "このスレッドには書けません" {
+            return .threadPostingUnavailable
         }
         return nil
     }

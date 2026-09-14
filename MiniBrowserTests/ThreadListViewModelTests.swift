@@ -90,4 +90,64 @@ final class ThreadListViewModelTests: XCTestCase {
         XCTAssertNil(refreshed.first?.thumbnailData)
         XCTAssertEqual(refreshed.first?.openerText, "以前の本文")
     }
+
+    func testThreadIDOnlyAcceptsTargetPageThreadURLs() {
+        XCTAssertEqual(
+            ThreadListViewModel.threadID(
+                from: URL(string: "https://img.2chan.net/b/res/1234567890.htm")!
+            ),
+            "1234567890"
+        )
+        XCTAssertNil(ThreadListViewModel.threadID(
+            from: URL(string: "https://example.com/b/res/1234567890.htm")!
+        ))
+        XCTAssertNil(ThreadListViewModel.threadID(
+            from: URL(string: "http://img.2chan.net/b/res/1234567890.htm")!
+        ))
+        XCTAssertNil(ThreadListViewModel.threadID(
+            from: URL(string: "https://img.2chan.net/b/futaba.htm")!
+        ))
+    }
+
+    func testUnavailableThreadExclusionPersistsForSixHours() {
+        let suiteName = "ThreadListViewModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = ThreadListViewModel(defaults: defaults)
+        model.excludeThread(id: "123")
+
+        XCTAssertTrue(model.excludedThreadIDs.contains("123"))
+        let stored = defaults.dictionary(forKey: "ThreadListExcludedThreadExpirations")
+        let timestamp = (stored?["123"] as? NSNumber)?.doubleValue
+        XCTAssertNotNil(timestamp)
+        XCTAssertGreaterThan(
+            timestamp!,
+            Date().addingTimeInterval(5.9 * 60 * 60).timeIntervalSince1970
+        )
+
+        let restored = ThreadListViewModel(defaults: defaults)
+        XCTAssertTrue(restored.excludedThreadIDs.contains("123"))
+    }
+
+    func testExpiredUnavailableThreadExclusionsArePurgedOnLoad() {
+        let suiteName = "ThreadListViewModelTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set([
+            "old": Date().addingTimeInterval(
+                -ThreadListViewModel.excludedThreadRetention - 1
+            ).timeIntervalSince1970,
+            "new": Date().addingTimeInterval(60 * 60).timeIntervalSince1970
+        ], forKey: "ThreadListExcludedThreadExpirations")
+
+        let model = ThreadListViewModel(defaults: defaults)
+
+        XCTAssertFalse(model.excludedThreadIDs.contains("old"))
+        XCTAssertTrue(model.excludedThreadIDs.contains("new"))
+        let stored = defaults.dictionary(forKey: "ThreadListExcludedThreadExpirations")
+        XCTAssertNil(stored?["old"])
+        XCTAssertNotNil(stored?["new"])
+    }
 }

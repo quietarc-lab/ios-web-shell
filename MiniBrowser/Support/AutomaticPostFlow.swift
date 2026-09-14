@@ -5,6 +5,7 @@ enum AutomaticPostAlert: Equatable {
     case imagePostingRestricted
     case accessRestricted
     case continuousPosting
+    case threadPostingUnavailable
 }
 
 enum TargetPageAlertDisposition: Equatable {
@@ -296,6 +297,9 @@ struct AutomaticPostFlowMachine {
         }
 
         switch alert {
+        case .threadPostingUnavailable:
+            return (false, stop(.unknownAlert))
+
         case .accessRestricted:
             state = .stopped(generationID: generationID, reason: .accessRestricted)
             return (true, .startNextAutomaticFlow)

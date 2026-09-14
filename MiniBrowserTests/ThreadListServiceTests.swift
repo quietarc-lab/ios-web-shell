@@ -71,6 +71,25 @@ final class ThreadListServiceTests: XCTestCase {
         XCTAssertEqual(items.last?.id, "2061")
     }
 
+    func testListParserExcludesTemporarilyUnavailableThreads() {
+        let cells = (1...3).map { number in
+            """
+            <td><a href='res/\(3000 + number).htm'>
+            <img src='/b/cat/\(number)s.jpg'></a><font>\(number)</font></td>
+            """
+        }.joined(separator: "\n")
+        let html = "<table id='cattable'><tr>\(cells)</tr></table>"
+
+        let items = ThreadListService.parseListHTML(
+            html,
+            baseURL: ThreadListSort.list.url,
+            limit: 3,
+            excludingIDs: ["3002"]
+        )
+
+        XCTAssertEqual(items.map(\.id), ["3001", "3003"])
+    }
+
     func testOpenerParserConvertsBreaksLinksAndEntities() {
         let html = """
         <html><div class="thre" data-res="123">

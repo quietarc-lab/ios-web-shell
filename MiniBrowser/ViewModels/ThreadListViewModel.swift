@@ -4,10 +4,12 @@ import Foundation
 @MainActor
 final class ThreadListViewModel: ObservableObject {
     private static let listItemLimit = 60
+    static let excludedThreadRetention: TimeInterval = 6 * 60 * 60
     private enum Keys {
         static let sort = "ThreadListSort"
         static let expanded = "ThreadListExpanded"
         static let openCounts = "ThreadListOpenCounts"
+        static let excludedThreadExpirations = "ThreadListExcludedThreadExpirations"
     }
 
     @Published private(set) var items: [ThreadListItem] = []
@@ -16,9 +18,11 @@ final class ThreadListViewModel: ObservableObject {
     @Published private(set) var isRefreshing = false
     @Published private(set) var errorMessage: String?
     @Published private(set) var openCounts: [String: Int]
+    @Published private(set) var excludedThreadIDs: Set<String>
 
     private let service: ThreadListService
     private let defaults: UserDefaults
+    private var excludedThreadExpirations: [String: Date]
     private var isSceneActive = true
     private var isNetworkActivityAllowed = true
     private var userAgent = BrowserUserAgent.all[0].value
@@ -41,6 +45,29 @@ final class ThreadListViewModel: ObservableObject {
             : defaults.bool(forKey: Keys.expanded)
         self.openCounts = defaults.dictionary(forKey: Keys.openCounts)?
             .compactMapValues { ($0 as? NSNumber)?.intValue } ?? [:]
+        let now = Date()
+        let stored = defaults.dictionary(forKey: Keys.excludedThreadExpirations) ?? [:]
+        var validExpirations: [String: Date] = [:]
+        for (id, value) in stored {
+            let timestamp: TimeInterval?
+            if let number = value as? NSNumber {
+                timestamp = number.doubleValue
+            } else if let date = value as? Date {
+                timestamp = date.timeIntervalSince1970
+            } else {
+                timestamp = nil
+            }
+            guard let timestamp else { continue }
+            let expiration = Date(timeIntervalSince1970: timestamp)
+            if expiration > now {
+                validExpirations[id] = expiration
+            }
+        }
+        self.excludedThreadExpirations = validExpirations
+        self.excludedThreadIDs = Set(validExpirations.keys)
+        if validExpirations.count != stored.count {
+            persistExcludedThreadExpirations()
+        }
     }
 
     deinit {
@@ -101,6 +128,7 @@ final class ThreadListViewModel: ObservableObject {
 
     func refresh() {
         guard isExpanded, isSceneActive, isNetworkActivityAllowed else { return }
+        purgeExpiredThreadExclusions()
         loadTask?.cancel()
         let sort = selectedSort
         isRefreshing = true
@@ -110,8 +138,11 @@ final class ThreadListViewModel: ObservableObject {
             guard let self else { return }
             do {
                 await service.updateUserAgent(userAgent)
-                let loaded = try await service.fetchList(sort: sort,
-                                                            limit: Self.listItemLimit)
+                let loaded = try await service.fetchList(
+                    sort: sort,
+                    limit: Self.listItemLimit,
+                    excludingIDs: excludedThreadIDs
+                )
                 try Task.checkCancellation()
                 guard selectedSort == sort, isNetworkActivityAllowed else { return }
                 items = Self.mergingDisplayState(of: loaded, with: items)
@@ -148,6 +179,55 @@ final class ThreadListViewModel: ObservableObject {
     func resetOpenHistory() {
         openCounts = [:]
         defaults.removeObject(forKey: Keys.openCounts)
+    }
+
+    func excludeThread(_ url: URL) {
+        guard let id = Self.threadID(from: url) else { return }
+        excludeThread(id: id)
+    }
+
+    func excludeThread(id: String) {
+        guard !id.isEmpty else { return }
+        purgeExpiredThreadExclusions()
+        let expiration = Date().addingTimeInterval(Self.excludedThreadRetention)
+        excludedThreadExpirations[id] = expiration
+        excludedThreadIDs.insert(id)
+        persistExcludedThreadExpirations()
+        loadTask?.cancel()
+        loadTask = nil
+        isRefreshing = false
+        nextThumbnailRetryID = nextThumbnailRetryID == id ? nil : nextThumbnailRetryID
+        items.removeAll { $0.id == id }
+    }
+
+    nonisolated static func threadID(from url: URL) -> String? {
+        guard url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == "img.2chan.net",
+              let match = url.path.range(of: #"^/[^/]+/res/(\d+)\.htm$"#,
+                                         options: .regularExpression) else {
+            return nil
+        }
+        let path = String(url.path[match])
+        return path.split(separator: "/").last?
+            .split(separator: ".").first
+            .map(String.init)
+    }
+
+    private func purgeExpiredThreadExclusions(now: Date = Date()) {
+        let valid = excludedThreadExpirations.filter { $0.value > now }
+        guard valid.count != excludedThreadExpirations.count else { return }
+        excludedThreadExpirations = valid
+        excludedThreadIDs = Set(valid.keys)
+        persistExcludedThreadExpirations()
+    }
+
+    private func persistExcludedThreadExpirations() {
+        let values = excludedThreadExpirations.mapValues { $0.timeIntervalSince1970 }
+        if values.isEmpty {
+            defaults.removeObject(forKey: Keys.excludedThreadExpirations)
+        } else {
+            defaults.set(values, forKey: Keys.excludedThreadExpirations)
+        }
     }
 
     private func loadThumbnails(for loaded: [ThreadListItem],

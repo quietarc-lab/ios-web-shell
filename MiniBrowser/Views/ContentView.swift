@@ -53,7 +53,10 @@ struct ContentView: View {
     private var browserContent: some View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
-                BrowserWebView(model: model)
+                BrowserWebView(model: model,
+                               onThreadPostingUnavailable: { url in
+                                   listModel.excludeThread(url)
+                               })
                     .frame(height: listModel.isExpanded
                         ? geometry.size.height * 0.65
                         : max(0, geometry.size.height - 29))

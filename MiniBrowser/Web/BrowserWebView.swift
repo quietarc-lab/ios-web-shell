@@ -5,9 +5,17 @@ import WebKit
 
 struct BrowserWebView: UIViewRepresentable {
     @ObservedObject var model: BrowserViewModel
+    private let onThreadPostingUnavailable: (URL) -> Void
+
+    init(model: BrowserViewModel,
+         onThreadPostingUnavailable: @escaping (URL) -> Void = { _ in }) {
+        self.model = model
+        self.onThreadPostingUnavailable = onThreadPostingUnavailable
+    }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(model: model)
+        Coordinator(model: model,
+                    onThreadPostingUnavailable: onThreadPostingUnavailable)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -51,13 +59,16 @@ struct BrowserWebView: UIViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         private let model: BrowserViewModel
+        private let onThreadPostingUnavailable: (URL) -> Void
         private var timeoutTimer: Timer?
         private weak var attachedWebView: WKWebView?
         private let handwritingImageStore = TargetPageHandwritingImageStore()
         private var currentPageToken: String?
 
-        init(model: BrowserViewModel) {
+        init(model: BrowserViewModel,
+             onThreadPostingUnavailable: @escaping (URL) -> Void) {
             self.model = model
+            self.onThreadPostingUnavailable = onThreadPostingUnavailable
         }
 
         deinit {
@@ -300,6 +311,12 @@ struct BrowserWebView: UIViewRepresentable {
             let host = frame.request.url?.host ?? webView.url?.host
             if let category = TargetPageAlertClassifier.category(host: host, message: message),
                let host {
+                if category == .threadPostingUnavailable,
+                   let url = [frame.request.url, webView.url]
+                    .compactMap({ $0 })
+                    .first(where: { ThreadListViewModel.threadID(from: $0) != nil }) {
+                    onThreadPostingUnavailable(url)
+                }
                 if model.handleTargetPageAlert(category, host: host) == .autoDismiss {
                     completeOnce()
                     return

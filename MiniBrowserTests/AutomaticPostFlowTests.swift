@@ -126,6 +126,17 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .stopped(generationID: generation, reason: .accessRestricted))
     }
 
+    func testThreadPostingUnavailableStopsAndKeepsAlertVisible() {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let result = machine.handleAlert(.threadPostingUnavailable,
+                                         generationID: generation)
+
+        XCTAssertFalse(result.autoDismiss)
+        XCTAssertEqual(result.effect, .stopped(.unknownAlert))
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation, reason: .unknownAlert))
+    }
+
     func testFinalContinuousPostingUsesAPOnlyAndFourthAttempt() {
         var machine = readyMachine(hasComment: true, hasImage: false)
         _ = machine.handleAlert(.cookieRetryRequired, generationID: generation)
