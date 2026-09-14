@@ -74,6 +74,7 @@ final class BrowserViewModel: ObservableObject {
     private var automaticOwnResponseConfirmed = false
     private var automaticAcceptedPageToken: String?
     private var automaticPostVerificationTask: Task<Void, Never>?
+    private var appSceneIsActive = false
 
     private struct AutomaticPostDraft {
         let hasComment: Bool
@@ -454,6 +455,8 @@ final class BrowserViewModel: ObservableObject {
         automaticPostPreparationTimer?.cancel()
         automaticSubmitReadinessTask?.cancel()
         cancelAutomaticSubmitResponseTimer()
+        automaticPostVerificationTask?.cancel()
+        automaticPostVerificationTask = nil
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
         automaticSubmitReadinessTask = nil
@@ -479,6 +482,7 @@ final class BrowserViewModel: ObservableObject {
             setAutomaticPostStatus(.preparingUA, generationID: generationID)
             startAutomaticPostPreparationTimeout(generationID: generationID)
         }
+        updateIdleTimerState()
 
         showToast("UA変更後にCookie更新とAP再接続を開始します", kind: .success)
         var userAgentFields = [
@@ -604,6 +608,15 @@ final class BrowserViewModel: ObservableObject {
         sitePostStatus = nil
         latestCompactReady = nil
         refreshNavigationState()
+    }
+
+    /// Keeps the foreground device awake only while an automatic posting
+    /// operation still has work to do. Background scenes always release the
+    /// idle timer so this does not attempt to turn an iOS app into a
+    /// background execution service.
+    func setAppSceneActive(_ isActive: Bool) {
+        appSceneIsActive = isActive
+        updateIdleTimerState()
     }
 
     func updateSitePostStatus(_ rawStatus: String?) {
@@ -1881,7 +1894,11 @@ final class BrowserViewModel: ObservableObject {
 
     private func handleAutomaticPostEffect(_ effect: AutomaticPostFlowEffect,
                                            generationID: UInt64) {
-        guard automaticPostMachine.generationID == generationID else { return }
+        guard automaticPostMachine.generationID == generationID else {
+            updateIdleTimerState()
+            return
+        }
+        defer { updateIdleTimerState() }
         switch effect {
         case .none:
             break
@@ -2244,6 +2261,7 @@ final class BrowserViewModel: ObservableObject {
         automaticContinuousAPCompletedUptimeNanoseconds = nil
         setAutomaticPostStatus(.waitingForRepeat, generationID: generationID)
         startAutomaticPostPreparationTimeout(generationID: generationID)
+        updateIdleTimerState()
 
         if case let .stopped(reason) = beginEffect {
             handleAutomaticPostEffect(.stopped(reason), generationID: generationID)
@@ -2813,6 +2831,7 @@ final class BrowserViewModel: ObservableObject {
 
     private func finishAutomaticPost(generationID: UInt64, result: String) {
         guard automaticPostMachine.generationID == generationID else { return }
+        defer { updateIdleTimerState() }
         automaticPostPreparationTimer?.cancel()
         cancelAutomaticSubmitResponseTimer()
         automaticSubmitReadinessTask?.cancel()
@@ -2877,6 +2896,20 @@ final class BrowserViewModel: ObservableObject {
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
         automaticPostRepeatSession = nil
+        updateIdleTimerState()
+    }
+
+    private func updateIdleTimerState() {
+        let shouldDisable = IdleTimerPolicy.shouldDisableIdleTimer(
+            appIsActive: appSceneIsActive,
+            automaticFlowIsActive: automaticPostMachine.isActive,
+            repeatSessionIsActive: automaticPostRepeatSession != nil,
+            responseVerificationIsActive: automaticPostVerificationTask != nil
+        )
+        guard UIApplication.shared.isIdleTimerDisabled != shouldDisable else {
+            return
+        }
+        UIApplication.shared.isIdleTimerDisabled = shouldDisable
     }
 
     private func setAutomaticPostStatus(_ status: AutomaticPostStatus,

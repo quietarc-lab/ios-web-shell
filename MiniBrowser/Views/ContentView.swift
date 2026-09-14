@@ -36,7 +36,12 @@ struct ContentView: View {
             listModel.start()
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
-            listModel.setSceneActive(phase == .active)
+            let isActive = phase == .active
+            listModel.setSceneActive(isActive)
+            model.setAppSceneActive(isActive)
+        }
+        .onDisappear {
+            model.setAppSceneActive(false)
         }
         .onChange(of: model.isIdentityRefreshInProgress) { _, isInProgress in
             listModel.setUserAgent(model.effectiveUserAgent)
