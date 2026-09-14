@@ -281,7 +281,8 @@ final class BrowserViewModel: ObservableObject {
               !isAPRunning,
               !isLoading,
               let webView,
-              webView.url?.host != nil else {
+              let pageURL = webView.url,
+              pageURL.host != nil else {
             showToast("UA更新を開始できません", kind: .warning)
             return
         }
@@ -292,7 +293,6 @@ final class BrowserViewModel: ObservableObject {
         pendingUAChangeGeneration = generationID
         let oldPageToken = latestCompactReady?.pageToken
         let imageAvailable = handwritingImageAvailable
-        let pageURL = webView.url
 
         let multiBootstrap: PendingMultiThreadBootstrap?
         if multiThreadEnabled,
