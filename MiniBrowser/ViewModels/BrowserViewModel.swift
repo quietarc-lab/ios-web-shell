@@ -296,7 +296,6 @@ final class BrowserViewModel: ObservableObject {
 
         let multiBootstrap: PendingMultiThreadBootstrap?
         if multiThreadEnabled,
-           let pageURL,
            let provider = automaticCatalogProvider {
             let snapshot = provider.currentPostSnapshot(limit: 60)
             multiBootstrap = snapshot.targets.isEmpty
