@@ -63,7 +63,9 @@ struct ContentView: View {
                 Divider()
                 if listModel.isExpanded {
                     ThreadListView(model: listModel,
-                                      onOpenThread: model.openThreadListThread)
+                                      onOpenThread: model.openThreadListThread,
+                                      sameThreadRepeatEnabled: model.sameThreadRepeatEnabled,
+                                      onToggleSameThreadRepeat: model.toggleSameThreadRepeat)
                         .frame(height: max(0, geometry.size.height * 0.35 - 1))
                 } else {
                     ThreadListCollapsedBar(model: listModel)

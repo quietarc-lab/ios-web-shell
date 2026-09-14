@@ -1,3 +1,4 @@
+import Foundation
 import WebKit
 
 enum CompactPageModeService {
@@ -852,7 +853,7 @@ enum CompactPageModeService {
       "use strict";
       if (location.hostname !== "img.2chan.net" ||
           !/^\/[^/]+\/res\/\d+\.htm$/.test(location.pathname)) {
-        return { eligible: false, hasComment: false, canSubmit: false };
+        return { eligible: false, hasComment: false, comment: "", canSubmit: false };
       }
       const form = Array.from(document.forms).find(candidate =>
         candidate.querySelector('textarea[name="com"]')
@@ -864,10 +865,106 @@ enum CompactPageModeService {
       return {
         eligible: true,
         hasComment: Boolean(textarea && String(textarea.value || "").trim()),
+        comment: String(textarea && textarea.value || ""),
         canSubmit: Boolean(submitButton)
       };
     })();
     """#)
+
+    static func restoreAutomaticDraftScript(comment: String) -> String? {
+        guard let literal = javaScriptStringLiteral(comment) else { return nil }
+        return PageMarkerNamespace.neutralize(#"""
+        (() => {
+          "use strict";
+          if (location.hostname !== "img.2chan.net" ||
+              !/^\/[^/]+\/res\/\d+\.htm$/.test(location.pathname)) return false;
+          const pageToken = typeof window.__miniBrowserPageToken === "string" ?
+            window.__miniBrowserPageToken : "";
+          const form = Array.from(document.forms).find(candidate =>
+            candidate.querySelector('textarea[name="com"]')
+          );
+          const textarea = form && form.querySelector('textarea[name="com"]');
+          if (!textarea || !textarea.isConnected) return false;
+          textarea.value = \#(literal);
+          textarea.dispatchEvent(new Event("input", { bubbles: true }));
+          textarea.dispatchEvent(new Event("change", { bubbles: true }));
+          const handler = window.webkit && window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.miniBrowserHandwriting;
+          const submitButton = form && Array.from(form.querySelectorAll(
+            'input[type="submit"], button[type="submit"]'
+          )).find(button => /返信|送信/.test(button.value || button.textContent || ""));
+          if (handler && pageToken) {
+            handler.postMessage({
+              type: "compactReady",
+              pageToken,
+              hasComment: Boolean(String(textarea.value || "").trim()),
+              canSubmit: Boolean(submitButton && submitButton.isConnected)
+            });
+          }
+          return true;
+        })();
+        """#)
+    }
+
+    static func repeatCanvasUpdateScript(generationID: UInt64) -> String {
+        PageMarkerNamespace.neutralize(#"""
+        (() => {
+          "use strict";
+          const isTargetPage = location.hostname === "img.2chan.net" &&
+            /^\/[^/]+\/res\/\d+\.htm$/.test(location.pathname);
+          const pageToken = typeof window.__miniBrowserPageToken === "string" ?
+            window.__miniBrowserPageToken : "";
+          const handler = window.webkit && window.webkit.messageHandlers &&
+            window.webkit.messageHandlers.miniBrowserHandwriting;
+          const generationID = \#(generationID);
+          const notify = ready => {
+            if (!handler || !pageToken) return;
+            handler.postMessage({ type: "handwritingReady", pageToken,
+                                  generationID, ready: Boolean(ready) });
+          };
+          if (!isTargetPage || !pageToken) { notify(false); return false; }
+          const canvas = document.querySelector("canvas#oejs");
+          if (!canvas || !canvas.isConnected || canvas.width < 1 || canvas.height < 1) {
+            notify(false);
+            return false;
+          }
+          const context = canvas.getContext("2d");
+          if (!context) { notify(false); return false; }
+          const x = Math.floor(Math.random() * canvas.width);
+          const y = Math.floor(Math.random() * canvas.height);
+          context.fillStyle = "rgba(" + Math.floor(Math.random() * 256) + "," +
+            Math.floor(Math.random() * 256) + "," +
+            Math.floor(Math.random() * 256) + ",1)";
+          context.fillRect(x, y, 1, 1);
+          const updateBaseForm = () => {
+            const baseForm = document.getElementById("baseform");
+            if (!baseForm) return false;
+            let dataURL;
+            try { dataURL = canvas.toDataURL(); } catch (_) { return false; }
+            if ("value" in baseForm) {
+              baseForm.value = dataURL;
+              if ("defaultValue" in baseForm) baseForm.defaultValue = dataURL;
+            } else {
+              baseForm.setAttribute("value", dataURL);
+            }
+            baseForm.dispatchEvent(new Event("input", { bubbles: true }));
+            baseForm.dispatchEvent(new Event("change", { bubbles: true }));
+            return true;
+          };
+          const updatePayload = async () => {
+            if (window.tegakiJs && typeof window.tegakiJs.oeUpdate === "function") {
+              try {
+                await window.tegakiJs.oeUpdate();
+                return true;
+              } catch (_) {}
+            }
+            return updateBaseForm();
+          };
+          updatePayload().then(notify).catch(() => notify(false));
+          return true;
+        })();
+        """#)
+    }
 
     static let submitReadinessScript = PageMarkerNamespace.neutralize(#"""
     (() => {
@@ -951,4 +1048,9 @@ enum CompactPageModeService {
       return true;
     })();
     """#)
+
+    private static func javaScriptStringLiteral(_ value: String) -> String? {
+        guard let data = try? JSONEncoder().encode(value) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
 }

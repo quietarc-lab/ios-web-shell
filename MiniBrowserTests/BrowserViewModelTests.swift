@@ -82,4 +82,19 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(model.userAgentButtonTitle, "UA 1/100")
         XCTAssertEqual(model.effectiveUserAgent, BrowserUserAgent.all[0].value)
     }
+
+    func testSameThreadRepeatStartsOffAndIsNotPersisted() {
+        let suiteName = "BrowserViewModelTests.sameThreadRepeat.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = BrowserViewModel(
+            defaults: defaults,
+            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
+        )
+        XCTAssertFalse(model.sameThreadRepeatEnabled)
+        model.toggleSameThreadRepeat()
+        XCTAssertTrue(model.sameThreadRepeatEnabled)
+        XCTAssertNil(defaults.object(forKey: "sameThreadRepeatEnabled"))
+    }
 }

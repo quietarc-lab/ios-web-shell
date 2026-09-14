@@ -130,10 +130,19 @@ struct BrowserWebView: UIViewRepresentable {
                                                         reason: "CURRENT_PAGE_TOKEN_MISMATCH")
                     return
                 }
-                guard let script = handwritingImageStore.restorationScript() else { return }
+                let preparationGenerationID = model.handwritingPreparationGenerationID(
+                    pageToken: pageToken
+                )
+                guard let script = handwritingImageStore.restorationScript(
+                    generationID: preparationGenerationID
+                ) else { return }
                 attachedWebView?.evaluateJavaScript(script) { [weak self] _, error in
                     guard let self, error != nil else { return }
-                    self.model.handleHandwritingReady(pageToken: pageToken, ready: false)
+                    self.model.handleHandwritingReady(
+                        pageToken: pageToken,
+                        ready: false,
+                        generationID: preparationGenerationID
+                    )
                 }
 
             case "handwritingReady":
@@ -148,7 +157,11 @@ struct BrowserWebView: UIViewRepresentable {
                     return
                 }
                 guard let ready = body["ready"] as? Bool else { return }
-                model.handleHandwritingReady(pageToken: pageToken, ready: ready)
+                model.handleHandwritingReady(
+                    pageToken: pageToken,
+                    ready: ready,
+                    generationID: uint64Value(body["generationID"])
+                )
 
             case "compactReady":
                 guard let pageToken else {
@@ -445,6 +458,19 @@ struct BrowserWebView: UIViewRepresentable {
             }
             if let value = value as? NSNumber {
                 return value.intValue
+            }
+            return nil
+        }
+
+        private func uint64Value(_ value: Any?) -> UInt64? {
+            if let value = value as? UInt64 {
+                return value
+            }
+            if let value = value as? NSNumber, value.int64Value >= 0 {
+                return UInt64(value.int64Value)
+            }
+            if let value = value as? String {
+                return UInt64(value)
             }
             return nil
         }

@@ -16,6 +16,12 @@ const sources = [
   ["MiniBrowser/Services/InputAutoZoomPreventionService.swift", "scriptSource"]
 ];
 
+const generatedSources = [
+  ["MiniBrowser/Services/CompactPageModeService.swift", "restoreAutomaticDraftScript"],
+  ["MiniBrowser/Services/CompactPageModeService.swift", "repeatCanvasUpdateScript"],
+  ["MiniBrowser/Services/CanvasImageSessionService.swift", "restorationScript"]
+];
+
 function rawSwiftScript(filePath, property) {
   const source = fs.readFileSync(filePath, "utf8");
   const declaration = source.indexOf(`static let ${property}`);
@@ -36,6 +42,30 @@ function rawSwiftScript(filePath, property) {
   return source.slice(scriptContentStart, scriptEnd);
 }
 
+function rawSwiftGeneratedScript(filePath, functionName) {
+  const source = fs.readFileSync(filePath, "utf8");
+  const declaration = source.indexOf(`static func ${functionName}`) >= 0
+    ? source.indexOf(`static func ${functionName}`)
+    : source.indexOf(`func ${functionName}`);
+  if (declaration < 0) {
+    throw new Error(`Generated JavaScript function not found: ${filePath} (${functionName})`);
+  }
+  const scriptStartMarker = '#"""';
+  const scriptStart = source.indexOf(scriptStartMarker, declaration);
+  if (scriptStart < 0) {
+    throw new Error(`Generated JavaScript literal not found: ${filePath} (${functionName})`);
+  }
+  const scriptContentStart = scriptStart + scriptStartMarker.length;
+  const scriptEnd = source.indexOf('\"\"\"#', scriptContentStart);
+  if (scriptEnd < 0) {
+    throw new Error(`Generated JavaScript terminator not found: ${filePath} (${functionName})`);
+  }
+  // Replace Swift extended-string interpolation with harmless JavaScript
+  // literals before parsing. Runtime values are covered by the Swift tests.
+  return source.slice(scriptContentStart, scriptEnd)
+    .replace(/\\#\([^)]*\)/g, '"placeholder"');
+}
+
 for (const [relativePath, property] of sources) {
   const filePath = path.join(projectRoot, relativePath);
   const script = rawSwiftScript(filePath, property);
@@ -46,4 +76,14 @@ for (const [relativePath, property] of sources) {
   }
 }
 
-console.log(`Injected JavaScript syntax checks passed (${sources.length} scripts).`);
+for (const [relativePath, functionName] of generatedSources) {
+  const filePath = path.join(projectRoot, relativePath);
+  const script = rawSwiftGeneratedScript(filePath, functionName);
+  try {
+    new Function(script);
+  } catch (error) {
+    throw new Error(`${relativePath} (${functionName}) has invalid JavaScript: ${error.message}`);
+  }
+}
+
+console.log(`Injected JavaScript syntax checks passed (${sources.length + generatedSources.length} scripts).`);

@@ -24,6 +24,7 @@ final class SitePostStatusTests: XCTestCase {
                        "連続制限 → AP再接続中")
         XCTAssertEqual(AutomaticPostStatus.finalSendAfterContinuousLimit.rawValue,
                        "AP後に最終送信")
+        XCTAssertEqual(AutomaticPostStatus.waitingForRepeat.rawValue, "同スレ次回待機")
         XCTAssertEqual(AutomaticPostStatus.acceptedPendingVerification.rawValue,
                        "受付済み・反映確認中")
         XCTAssertEqual(AutomaticPostStatus.completed.rawValue, "完了")
@@ -35,6 +36,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertTrue(AutomaticPostStatus.stopped.isFinal)
         XCTAssertFalse(AutomaticPostStatus.sending.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterAccessRestriction.isFinal)
+        XCTAssertFalse(AutomaticPostStatus.waitingForRepeat.isFinal)
         XCTAssertFalse(AutomaticPostStatus.acceptedPendingVerification.isFinal)
     }
 

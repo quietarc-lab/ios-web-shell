@@ -80,7 +80,7 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("completionDiscoveryObserver.observe(doc.body"))
     }
 
-    func testAutomaticBridgeUsesPageTokenAndExistingButtonClick() {
+    func testAutomaticBridgeUsesPageTokenAndExistingButtonClick() throws {
         let script = CompactPageModeService.scriptSource
         XCTAssertTrue(script.contains("__pageSessionToken"))
         XCTAssertTrue(script.contains("contentBridge"))
@@ -91,7 +91,28 @@ final class CompactPageModeServiceTests: XCTestCase {
 
         let stateScript = CompactPageModeService.currentPostStateScript
         XCTAssertTrue(stateScript.contains("hasComment"))
+        XCTAssertTrue(stateScript.contains("comment:"))
         XCTAssertTrue(stateScript.contains("canSubmit"))
+
+        let restoreScript = try XCTUnwrap(
+            CompactPageModeService.restoreAutomaticDraftScript(comment: "保存本文")
+        )
+        XCTAssertTrue(restoreScript.contains("textarea.value"))
+        XCTAssertTrue(restoreScript.contains("dispatchEvent(new Event(\"input\""))
+        XCTAssertTrue(restoreScript.contains("dispatchEvent(new Event(\"change\""))
+        XCTAssertFalse(restoreScript.contains("form.submit"))
+        XCTAssertFalse(restoreScript.contains("localStorage"))
+
+        let repeatImageScript = CompactPageModeService.repeatCanvasUpdateScript(generationID: 7)
+        XCTAssertTrue(repeatImageScript.contains("generationID"))
+        XCTAssertTrue(repeatImageScript.contains("fillRect(x, y, 1, 1)"))
+        XCTAssertTrue(repeatImageScript.contains("tegakiJs.oeUpdate"))
+        XCTAssertTrue(repeatImageScript.contains("canvas.toDataURL"))
+        XCTAssertTrue(repeatImageScript.contains("baseform"))
+        XCTAssertTrue(repeatImageScript.contains("handwritingReady"))
+        XCTAssertFalse(repeatImageScript.contains("form.submit"))
+        XCTAssertFalse(repeatImageScript.contains("itgkfile"))
+        XCTAssertFalse(repeatImageScript.contains("javascript:"))
 
         let submitScript = CompactPageModeService.autoSubmitScript
         XCTAssertTrue(submitScript.contains("submitButton.click()"))

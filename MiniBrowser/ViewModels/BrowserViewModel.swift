@@ -6,6 +6,7 @@ import WebKit
 @MainActor
 final class BrowserViewModel: ObservableObject {
     private static let standardSubmitDelayNanoseconds: UInt64 = 2_000_000_000
+    private static let sameThreadRepeatMinimumDelayNanoseconds: UInt64 = 1_000_000_000
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
 
     private enum Keys {
@@ -27,6 +28,7 @@ final class BrowserViewModel: ObservableObject {
     @Published private(set) var toasts: [ToastMessage] = []
     @Published private(set) var sitePostStatus: SitePostStatus? = nil
     @Published private(set) var automaticPostStatus: AutomaticPostStatus? = nil
+    @Published private(set) var sameThreadRepeatEnabled = false
 
     let bookmarkStore: BookmarkStore
 
@@ -39,6 +41,9 @@ final class BrowserViewModel: ObservableObject {
     private var runtimeUserAgent: RuntimeUserAgent?
     private var automaticTriedUAIDs: Set<Int> = []
     private var automaticPostDraft: AutomaticPostDraft?
+    private var automaticPostRepeatSession: AutomaticPostRepeatSession?
+    private var automaticPostRepeatSessionID: UInt64 = 0
+    private var automaticPostRepeatDelayTask: Task<Void, Never>?
     private var pendingCookieRefresh: PendingCookieRefresh?
     private var pendingAP: PendingAP?
     private var lastRelatedCookieCountByHost: [String: Int] = [:]
@@ -68,7 +73,18 @@ final class BrowserViewModel: ObservableObject {
 
     private struct AutomaticPostDraft {
         let hasComment: Bool
+        let comment: String?
         let hasImage: Bool
+    }
+
+    private struct AutomaticPostRepeatSession {
+        let sessionID: UInt64
+        var cycle: Int
+        let pageURL: URL
+        var pageToken: String?
+        let comment: String?
+        let hasImage: Bool
+        var stopRequested: Bool
     }
 
     private struct AutomaticLogContext {
@@ -235,6 +251,7 @@ final class BrowserViewModel: ObservableObject {
             showToast("UA更新を開始できません", kind: .warning)
             return
         }
+        cancelAutomaticRepeatSession()
         isUAChanging = true
         automaticPostGeneration &+= 1
         let generationID = automaticPostGeneration
@@ -251,6 +268,7 @@ final class BrowserViewModel: ObservableObject {
                   self.pendingUAChangeGeneration == generationID else { return }
             let state = Self.postState(from: result)
             let hasComment = state?.hasComment ?? false
+            let comment = state?.comment
             let canSubmit = state?.canSubmit ?? false
             let isTarget = Self.isTargetThreadURL(pageURL)
             let shouldStartAutomatic = isTarget && canSubmit && (hasComment || imageAvailable)
@@ -259,6 +277,7 @@ final class BrowserViewModel: ObservableObject {
                 generationID: generationID,
                 oldPageToken: oldPageToken,
                 hasComment: hasComment,
+                comment: comment,
                 hasImage: imageAvailable,
                 automatic: shouldStartAutomatic,
                 readError: error != nil,
@@ -311,6 +330,7 @@ final class BrowserViewModel: ObservableObject {
             generationID: nextGenerationID,
             oldPageToken: oldPageToken,
             hasComment: draft.hasComment,
+            comment: draft.comment,
             hasImage: draft.hasImage,
             automatic: true,
             readError: false,
@@ -318,6 +338,23 @@ final class BrowserViewModel: ObservableObject {
             excludedUAIDs: automaticTriedUAIDs,
             newAutomaticSession: false
         )
+    }
+
+    func toggleSameThreadRepeat() {
+        sameThreadRepeatEnabled.toggle()
+        guard var session = automaticPostRepeatSession else { return }
+        session.stopRequested = !sameThreadRepeatEnabled
+        automaticPostRepeatSession = session
+
+        guard !sameThreadRepeatEnabled,
+              case .succeeded = automaticPostMachine.state,
+              let generationID = automaticPostMachine.generationID else {
+            return
+        }
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = nil
+        setAutomaticPostStatus(.completed, generationID: generationID)
+        finishAutomaticPost(generationID: generationID, result: "SUCCEEDED")
     }
 
     func refreshCookies() {
@@ -340,6 +377,7 @@ final class BrowserViewModel: ObservableObject {
                                       generationID: UInt64,
                                       oldPageToken: String?,
                                       hasComment: Bool,
+                                      comment: String?,
                                       hasImage: Bool,
                                       automatic: Bool,
                                       readError: Bool,
@@ -372,16 +410,35 @@ final class BrowserViewModel: ObservableObject {
         if automatic {
             automaticTriedUAIDs.insert(currentUserAgent.id)
             automaticPostDraft = AutomaticPostDraft(hasComment: hasComment,
+                                                     comment: comment,
                                                      hasImage: hasImage)
+            if newAutomaticSession,
+               sameThreadRepeatEnabled,
+               let pageURL,
+               Self.isTargetThreadURL(pageURL) {
+                automaticPostRepeatSessionID &+= 1
+                automaticPostRepeatSession = AutomaticPostRepeatSession(
+                    sessionID: automaticPostRepeatSessionID,
+                    cycle: 1,
+                    pageURL: pageURL,
+                    pageToken: nil,
+                    comment: comment?.isEmpty == false ? comment : nil,
+                    hasImage: hasImage,
+                    stopRequested: false
+                )
+            }
         } else {
             automaticTriedUAIDs.removeAll()
             automaticPostDraft = nil
+            cancelAutomaticRepeatSession()
         }
         webView.customUserAgent = effectiveUserAgent
         isIdentityRefreshInProgress = true
 
         automaticPostPreparationTimer?.cancel()
         automaticSubmitReadinessTask?.cancel()
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = nil
         automaticSubmitReadinessTask = nil
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessDeadline = nil
@@ -516,6 +573,14 @@ final class BrowserViewModel: ObservableObject {
            automaticReloadGeneration != generationID {
             stopAutomaticPost(.preparationFailed, generationID: generationID)
         }
+        if automaticPostRepeatSession != nil,
+           automaticReloadGeneration == nil,
+           case .succeeded = automaticPostMachine.state,
+           let generationID = automaticPostMachine.generationID {
+            setAutomaticPostStatus(.stopped, generationID: generationID)
+            finishAutomaticPost(generationID: generationID,
+                                result: "STOPPED_PAGE_NAVIGATION")
+        }
         automaticReloadGeneration = nil
         isLoading = true
         sitePostStatus = nil
@@ -535,6 +600,14 @@ final class BrowserViewModel: ObservableObject {
         automaticPostMachine.isStalePageToken(pageToken)
     }
 
+    func handwritingPreparationGenerationID(pageToken: String) -> UInt64? {
+        guard automaticPostMachine.isActive,
+              !automaticPostMachine.isStalePageToken(pageToken) else {
+            return nil
+        }
+        return automaticPostMachine.generationID
+    }
+
     func handleCompactReady(pageToken: String,
                             hasComment: Bool,
                             canSubmit: Bool) {
@@ -549,7 +622,10 @@ final class BrowserViewModel: ObservableObject {
             hasComment: hasComment,
             canSubmit: canSubmit
         ))
-        guard automaticPostMachine.pageToken == pageToken else {
+        let compactTokenAccepted = automaticPostMachine.pageToken == pageToken ||
+            (automaticPostMachine.pageToken == nil &&
+             !automaticPostMachine.isStalePageToken(pageToken))
+        guard compactTokenAccepted else {
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "BRIDGE",
@@ -582,7 +658,10 @@ final class BrowserViewModel: ObservableObject {
               case let .waitingForSubmitReadiness(_, attempt, _) = automaticPostMachine.state else {
             return
         }
-        guard automaticPostMachine.pageToken == pageToken else {
+        let handwritingTokenAccepted = automaticPostMachine.pageToken == pageToken ||
+            (automaticPostMachine.pageToken == nil &&
+             !automaticPostMachine.isStalePageToken(pageToken))
+        guard handwritingTokenAccepted else {
             recordAutomaticBridgeIgnored(type: "submitReadiness",
                                           reason: "STALE_OR_MISMATCH")
             return
@@ -624,9 +703,37 @@ final class BrowserViewModel: ObservableObject {
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
 
-    func handleHandwritingReady(pageToken: String, ready: Bool) {
+    func handleHandwritingReady(pageToken: String,
+                                ready: Bool,
+                                generationID incomingGenerationID: UInt64? = nil) {
         guard automaticPostMachine.isActive,
               let generationID = automaticPostMachine.generationID else { return }
+        let handwritingTokenAccepted = automaticPostMachine.pageToken == pageToken ||
+            (automaticPostMachine.pageToken == nil &&
+             !automaticPostMachine.isStalePageToken(pageToken))
+        guard handwritingTokenAccepted else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "BRIDGE",
+                event: "HANDWRITING_READY",
+                result: "IGNORED",
+                fields: [("PAGE_TOKEN_STATE", "STALE_OR_MISMATCH")]
+            )
+            return
+        }
+        guard incomingGenerationID == generationID else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "BRIDGE",
+                event: "HANDWRITING_READY",
+                result: "IGNORED",
+                fields: [
+                    ("PAGE_TOKEN_STATE", "MATCH"),
+                    ("GENERATION_ID_STATE", "STALE_OR_MISMATCH")
+                ]
+            )
+            return
+        }
         let effect = automaticPostMachine.handle(.markHandwritingReady(
             generationID: generationID,
             pageToken: pageToken,
@@ -1563,11 +1670,13 @@ final class BrowserViewModel: ObservableObject {
         case .none:
             break
         case let .startSubmitReadiness(attempt, reason):
-            if reason == .initial {
+            if reason == .initial || reason == .sameThreadRepeat {
                 appendAutomaticEvent(
                     generationID: generationID,
                     phase: "PREPARATION",
-                    event: "PREPARATION_READY",
+                    event: reason == .sameThreadRepeat
+                        ? "REPEAT_PREPARATION_READY"
+                        : "PREPARATION_READY",
                     result: "READY",
                     fields: [
                         ("AP_RESULT", automaticAPResult),
@@ -1622,6 +1731,14 @@ final class BrowserViewModel: ObservableObject {
                                    generationID: generationID)
             startNextAutomaticFlow(previousGenerationID: generationID)
         case .succeeded:
+            if let session = automaticPostRepeatSession,
+               sameThreadRepeatEnabled,
+               !session.stopRequested {
+                automaticPostVerificationTask?.cancel()
+                automaticPostVerificationTask = nil
+                scheduleAutomaticPostRepeat(generationID: generationID)
+                return
+            }
             clearAutomaticPostDraft()
             if automaticPostAccepted && !automaticOwnResponseConfirmed {
                 setAutomaticPostStatus(.acceptedPendingVerification,
@@ -1773,6 +1890,234 @@ final class BrowserViewModel: ObservableObject {
             .submitReadinessTimedOut(generationID: generationID)
         )
         handleAutomaticPostEffect(effect, generationID: generationID)
+    }
+
+    private func scheduleAutomaticPostRepeat(generationID: UInt64) {
+        guard automaticPostMachine.generationID == generationID,
+              case .succeeded = automaticPostMachine.state,
+              sameThreadRepeatEnabled,
+              var session = automaticPostRepeatSession,
+              !session.stopRequested,
+              let pageURL = webView?.url,
+              Self.isTargetThreadURL(pageURL),
+              let pageToken = automaticPostMachine.pageToken else {
+            return
+        }
+        guard pageURL.path == session.pageURL.path,
+              pageURL.host?.lowercased() == session.pageURL.host?.lowercased() else {
+            setAutomaticPostStatus(.stopped, generationID: generationID)
+            finishAutomaticPost(generationID: generationID,
+                                result: "STOPPED_PAGE_NAVIGATION")
+            return
+        }
+
+        session.cycle += 1
+        session.pageToken = pageToken
+        automaticPostRepeatSession = session
+        setAutomaticPostStatus(.waitingForRepeat, generationID: generationID)
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "REPEAT",
+            event: "REPEAT_SCHEDULED",
+            result: "SCHEDULED",
+            fields: [
+                ("SESSION_ID", String(session.sessionID)),
+                ("CYCLE", String(session.cycle)),
+                ("DELAY_MS", String(Self.sameThreadRepeatMinimumDelayNanoseconds / 1_000_000))
+            ]
+        )
+
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.sameThreadRepeatMinimumDelayNanoseconds)
+            guard let self,
+                  !Task.isCancelled,
+                  self.sameThreadRepeatEnabled,
+                  self.automaticPostMachine.generationID == generationID,
+                  case .succeeded = self.automaticPostMachine.state else {
+                return
+            }
+            self.automaticPostRepeatDelayTask = nil
+            self.beginAutomaticPostRepeat(previousGenerationID: generationID)
+        }
+    }
+
+    private func beginAutomaticPostRepeat(previousGenerationID: UInt64) {
+        guard automaticPostMachine.generationID == previousGenerationID,
+              case .succeeded = automaticPostMachine.state,
+              sameThreadRepeatEnabled,
+              let session = automaticPostRepeatSession,
+              !session.stopRequested,
+              let webView,
+              let pageURL = webView.url,
+              Self.isTargetThreadURL(pageURL),
+              pageURL.path == session.pageURL.path,
+              pageURL.host?.lowercased() == session.pageURL.host?.lowercased(),
+              let pageToken = session.pageToken,
+              automaticPostMachine.pageToken == pageToken else {
+            if automaticPostMachine.generationID == previousGenerationID {
+                setAutomaticPostStatus(.stopped, generationID: previousGenerationID)
+                finishAutomaticPost(generationID: previousGenerationID,
+                                    result: "STOPPED_PAGE_NAVIGATION")
+            }
+            return
+        }
+
+        automaticPostGeneration &+= 1
+        let generationID = automaticPostGeneration
+        automaticPostMachine.reset()
+        let beginEffect = automaticPostMachine.beginSameThreadRepeat(
+            generationID: generationID,
+            pageToken: pageToken,
+            hasComment: session.comment?.isEmpty == false,
+            hasImage: session.hasImage
+        )
+        automaticPostDraft = AutomaticPostDraft(
+            hasComment: session.comment?.isEmpty == false,
+            comment: session.comment,
+            hasImage: session.hasImage
+        )
+        beginAutomaticGenerationLogging(generationID: generationID)
+        latestCompactReady = nil
+        automaticCookieRelatedCount = nil
+        automaticCookieCountDelta = nil
+        automaticAPResult = "NOT_REQUESTED"
+        automaticSubmitReadinessTask?.cancel()
+        automaticSubmitReadinessTask = nil
+        automaticSubmitReadinessStableSince = nil
+        automaticSubmitReadinessDeadline = nil
+        automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessReason = nil
+        automaticContinuousAPCompletedUptimeNanoseconds = nil
+        setAutomaticPostStatus(.waitingForRepeat, generationID: generationID)
+        startAutomaticPostPreparationTimeout(generationID: generationID)
+
+        if case let .stopped(reason) = beginEffect {
+            handleAutomaticPostEffect(.stopped(reason), generationID: generationID)
+            return
+        }
+        guard let restoreScript = CompactPageModeService.restoreAutomaticDraftScript(
+            comment: session.comment ?? ""
+        ) else {
+            stopAutomaticPost(.communicationFailure, generationID: generationID)
+            return
+        }
+        webView.evaluateJavaScript(restoreScript) { [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.automaticPostMachine.generationID == generationID,
+                      case .preparing = self.automaticPostMachine.state else { return }
+                guard error == nil,
+                      (result as? Bool) ?? false else {
+                    self.stopAutomaticPost(.preparationFailed, generationID: generationID)
+                    return
+                }
+                guard session.hasImage else { return }
+                self.prepareRepeatImage(generationID: generationID,
+                                       webView: webView)
+            }
+        }
+    }
+
+    private func prepareRepeatImage(generationID: UInt64, webView: WKWebView) {
+        guard automaticPostMachine.generationID == generationID,
+              case .preparing = automaticPostMachine.state else { return }
+        webView.evaluateJavaScript(CanvasImageSessionService.canvasVisibilityScript) {
+            [weak self] result, error in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.automaticPostMachine.generationID == generationID,
+                      case .preparing = self.automaticPostMachine.state else { return }
+                guard error == nil else {
+                    self.stopAutomaticPost(.communicationFailure, generationID: generationID)
+                    return
+                }
+                let state = result as? [String: Any]
+                let exists = (state?["exists"] as? Bool) ?? false
+                let visible = (state?["visible"] as? Bool) ?? false
+                if visible {
+                    self.runRepeatCanvasUpdate(generationID: generationID,
+                                               webView: webView)
+                } else {
+                    webView.evaluateJavaScript(
+                        CanvasImageSessionService.openExistingCanvasScript
+                    ) { [weak self] _, error in
+                        Task { @MainActor [weak self] in
+                            guard let self,
+                                  self.automaticPostMachine.generationID == generationID,
+                                  case .preparing = self.automaticPostMachine.state else { return }
+                            if error != nil {
+                                self.stopAutomaticPost(.communicationFailure,
+                                                        generationID: generationID)
+                            } else if exists {
+                                self.waitForRepeatCanvasVisibility(
+                                    generationID: generationID,
+                                    webView: webView,
+                                    attempt: 0
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func waitForRepeatCanvasVisibility(generationID: UInt64,
+                                               webView: WKWebView,
+                                               attempt: Int) {
+        guard automaticPostMachine.generationID == generationID,
+              case .preparing = automaticPostMachine.state,
+              attempt < 50 else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard let self,
+                  !Task.isCancelled,
+                  self.automaticPostMachine.generationID == generationID,
+                  case .preparing = self.automaticPostMachine.state else { return }
+            webView.evaluateJavaScript(CanvasImageSessionService.canvasVisibilityScript) {
+                [weak self] result, error in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.automaticPostMachine.generationID == generationID,
+                          case .preparing = self.automaticPostMachine.state else { return }
+                    guard error == nil else {
+                        self.stopAutomaticPost(.communicationFailure,
+                                                generationID: generationID)
+                        return
+                    }
+                    let state = result as? [String: Any]
+                    if (state?["visible"] as? Bool) == true {
+                        self.runRepeatCanvasUpdate(generationID: generationID,
+                                                   webView: webView)
+                    } else {
+                        self.waitForRepeatCanvasVisibility(
+                            generationID: generationID,
+                            webView: webView,
+                            attempt: attempt + 1
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func runRepeatCanvasUpdate(generationID: UInt64, webView: WKWebView) {
+        guard automaticPostMachine.generationID == generationID,
+              case .preparing = automaticPostMachine.state else { return }
+        webView.evaluateJavaScript(
+            CompactPageModeService.repeatCanvasUpdateScript(generationID: generationID)
+        ) { [weak self] _, error in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.automaticPostMachine.generationID == generationID,
+                      case .preparing = self.automaticPostMachine.state else { return }
+                if error != nil {
+                    self.stopAutomaticPost(.communicationFailure,
+                                            generationID: generationID)
+                }
+            }
+        }
     }
 
     private func scheduleSubmitDelay(generationID: UInt64) {
@@ -1963,6 +2308,20 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessLastReason = nil
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
+        if let session = automaticPostRepeatSession,
+           result.hasPrefix("STOPPED") || !sameThreadRepeatEnabled {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "REPEAT",
+                event: "REPEAT_STOPPED",
+                result: "STOPPED",
+                fields: [
+                    ("SESSION_ID", String(session.sessionID)),
+                    ("CYCLE", String(session.cycle)),
+                    ("STOP_REASON", result)
+                ]
+            )
+        }
         var finalFields = [
             ("ATTEMPT", String(automaticPostMachine.lastAttempt)),
             ("BRANCH", "FINAL"),
@@ -1998,6 +2357,13 @@ final class BrowserViewModel: ObservableObject {
     private func clearAutomaticPostDraft() {
         automaticPostDraft = nil
         automaticTriedUAIDs.removeAll()
+        cancelAutomaticRepeatSession()
+    }
+
+    private func cancelAutomaticRepeatSession() {
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = nil
+        automaticPostRepeatSession = nil
     }
 
     private func setAutomaticPostStatus(_ status: AutomaticPostStatus,
@@ -2194,10 +2560,12 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private static func postState(from result: Any?) -> (hasComment: Bool,
+                                                          comment: String?,
                                                           canSubmit: Bool)? {
         guard let dictionary = result as? [String: Any] else { return nil }
         guard let eligible = dictionary["eligible"] as? Bool, eligible else { return nil }
         return (dictionary["hasComment"] as? Bool ?? false,
+                dictionary["comment"] as? String,
                 dictionary["canSubmit"] as? Bool ?? false)
     }
 

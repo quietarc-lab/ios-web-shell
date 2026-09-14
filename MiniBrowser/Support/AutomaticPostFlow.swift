@@ -23,6 +23,7 @@ enum AutomaticPostStopReason: Equatable {
     case unknownAlert
     case knownAlertAfterLimit
     case retryLimit
+    case repeatDisabled
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {
@@ -31,6 +32,7 @@ enum AutomaticPostReadinessReason: String, Equatable {
     case ipRetry = "IP_RETRY"
     case continuousRetry = "CONTINUOUS_RETRY"
     case continuousAPRetry = "CONTINUOUS_AP_RETRY"
+    case sameThreadRepeat = "SAME_THREAD_REPEAT"
 }
 
 enum AutomaticPostFlowState: Equatable {
@@ -109,6 +111,7 @@ struct AutomaticPostFlowMachine {
     private var cookieObserved = false
     private var compactReady = false
     private var handwritingReady = false
+    private var preparationReason: AutomaticPostReadinessReason = .initial
 
     var isActive: Bool {
         switch state {
@@ -166,6 +169,40 @@ struct AutomaticPostFlowMachine {
         cookieObserved = false
         compactReady = false
         handwritingReady = !hasImage
+        state = .preparing(generationID: generationID)
+        preparationReason = .initial
+        return .none
+    }
+
+    mutating func beginSameThreadRepeat(generationID: UInt64,
+                                        pageToken: String,
+                                        hasComment: Bool,
+                                        hasImage: Bool) -> AutomaticPostFlowEffect {
+        guard !pageToken.isEmpty,
+              hasComment || hasImage else {
+            state = .stopped(generationID: generationID, reason: .noContent)
+            self.generationID = generationID
+            return .stopped(.noContent)
+        }
+
+        self.generationID = generationID
+        stalePageToken = nil
+        self.pageToken = pageToken
+        requiresHandwriting = hasImage
+        cookieRetryUsed = false
+        ipRetryUsed = false
+        ipRetryIsTerminal = false
+        continuousRetryUsed = false
+        lastAttempt = 0
+        // The page, AP state, and Cookie observation are already valid for a
+        // same-page repeat. Compact-form and handwriting readiness are still
+        // re-established through the bridge before the next click.
+        apCompleted = true
+        reloadCompleted = true
+        cookieObserved = true
+        compactReady = false
+        handwritingReady = !hasImage
+        preparationReason = .sameThreadRepeat
         state = .preparing(generationID: generationID)
         return .none
     }
@@ -365,6 +402,7 @@ struct AutomaticPostFlowMachine {
         cookieObserved = false
         compactReady = false
         handwritingReady = false
+        preparationReason = .initial
     }
 
     private mutating func preparationEffectIfReady() -> AutomaticPostFlowEffect {
@@ -378,9 +416,9 @@ struct AutomaticPostFlowMachine {
         }
         state = .waitingForSubmitReadiness(generationID: generationID ?? 0,
                                            attempt: 1,
-                                           reason: .initial)
+                                           reason: preparationReason)
         lastAttempt = 1
-        return .startSubmitReadiness(attempt: 1, reason: .initial)
+        return .startSubmitReadiness(attempt: 1, reason: preparationReason)
     }
 
     private mutating func beginSubmitReadiness(attempt: Int,

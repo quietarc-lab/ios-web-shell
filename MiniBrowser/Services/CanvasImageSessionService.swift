@@ -91,6 +91,25 @@ enum CanvasImageSessionService {
                               options: .regularExpression) != nil
     }
 
+    static let canvasVisibilityScript = PageMarkerNamespace.neutralize(#"""
+    (() => {
+      "use strict";
+      const isVisible = element => {
+        if (!(element instanceof Element)) return false;
+        const style = window.getComputedStyle(element);
+        return style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          element.getClientRects().length > 0;
+      };
+      const canvas = document.querySelector("canvas#oejs");
+      const host = document.getElementById("oe3");
+      return {
+        exists: Boolean(canvas),
+        visible: Boolean(canvas && isVisible(host || canvas))
+      };
+    })();
+    """#)
+
     static let openExistingCanvasScript = PageMarkerNamespace.neutralize(#"""
     (() => {
       "use strict";
@@ -169,11 +188,12 @@ final class TargetPageHandwritingImageStore {
         return true
     }
 
-    func restorationScript() -> String? {
+    func restorationScript(generationID: UInt64? = nil) -> String? {
         guard let image,
               let dataURLLiteral = javaScriptStringLiteral(image.dataURL) else {
             return nil
         }
+        let generationLiteral = generationID.map(String.init) ?? "null"
 
         return PageMarkerNamespace.neutralize(#"""
         (() => {
@@ -186,6 +206,7 @@ final class TargetPageHandwritingImageStore {
             handler.postMessage({
               type: "handwritingReady",
               pageToken,
+              generationID: \#(generationLiteral),
               ready: Boolean(ready)
             });
           };

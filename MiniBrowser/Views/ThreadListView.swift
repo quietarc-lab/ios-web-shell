@@ -4,6 +4,8 @@ import UIKit
 struct ThreadListView: View {
     @ObservedObject var model: ThreadListViewModel
     let onOpenThread: (URL) -> Void
+    let sameThreadRepeatEnabled: Bool
+    let onToggleSameThreadRepeat: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +31,19 @@ struct ThreadListView: View {
             }
 
             Spacer(minLength: 2)
+
+            Button(action: onToggleSameThreadRepeat) {
+                Text("同スレ連続")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(sameThreadRepeatEnabled ? .white : .primary)
+                    .frame(width: 64, height: 26)
+                    .background(sameThreadRepeatEnabled ? Color.blue : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("同スレ連続")
+            .accessibilityValue(sameThreadRepeatEnabled ? "オン" : "オフ")
+            .accessibilityAddTraits(sameThreadRepeatEnabled ? .isSelected : [])
 
             if let error = model.errorMessage {
                 Text(error)

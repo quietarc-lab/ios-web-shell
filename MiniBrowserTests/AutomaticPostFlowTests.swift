@@ -260,6 +260,60 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .startSubmitReadiness(attempt: 1, reason: .initial))
     }
 
+    func testSameThreadRepeatUsesExistingPageAndRepeatReadinessReason() {
+        var machine = AutomaticPostFlowMachine()
+        let repeatGeneration = generation + 1
+        XCTAssertEqual(machine.beginSameThreadRepeat(
+            generationID: repeatGeneration,
+            pageToken: "page",
+            hasComment: true,
+            hasImage: false
+        ), .none)
+        XCTAssertEqual(machine.handle(.markCompactReady(
+            generationID: repeatGeneration,
+            pageToken: "page",
+            hasComment: true,
+            canSubmit: true
+        )), .startSubmitReadiness(attempt: 1, reason: .sameThreadRepeat))
+        XCTAssertEqual(machine.state,
+                       .waitingForSubmitReadiness(generationID: repeatGeneration,
+                                                  attempt: 1,
+                                                  reason: .sameThreadRepeat))
+    }
+
+    func testSameThreadRepeatRejectsStaleGenerationAndPageToken() {
+        var machine = AutomaticPostFlowMachine()
+        let repeatGeneration = generation + 1
+        _ = machine.beginSameThreadRepeat(generationID: repeatGeneration,
+                                          pageToken: "page",
+                                          hasComment: false,
+                                          hasImage: true)
+        XCTAssertEqual(machine.handle(.markCompactReady(
+            generationID: repeatGeneration + 1,
+            pageToken: "page",
+            hasComment: false,
+            canSubmit: true
+        )), .none)
+        XCTAssertEqual(machine.handle(.markCompactReady(
+            generationID: repeatGeneration,
+            pageToken: "old-page",
+            hasComment: false,
+            canSubmit: true
+        )), .none)
+        XCTAssertEqual(machine.state, .preparing(generationID: repeatGeneration))
+        XCTAssertEqual(machine.handle(.markCompactReady(
+            generationID: repeatGeneration,
+            pageToken: "page",
+            hasComment: false,
+            canSubmit: true
+        )), .none)
+        XCTAssertEqual(machine.handle(.markHandwritingReady(
+            generationID: repeatGeneration,
+            pageToken: "page",
+            ready: true
+        )), .startSubmitReadiness(attempt: 1, reason: .sameThreadRepeat))
+    }
+
     func testEmptyCandidateStopsWithoutSubmitting() {
         var machine = AutomaticPostFlowMachine()
         XCTAssertEqual(machine.begin(generationID: generation,

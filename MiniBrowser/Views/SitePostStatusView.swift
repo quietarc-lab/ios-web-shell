@@ -31,7 +31,8 @@ struct SitePostStatusView: View {
             case .preparingUA, .checkingCookie, .sending, .cookieRetry,
                  .reconnectingAfterIPLimit, .finalSendAfterIPChange,
                  .switchingAfterAccessRestriction, .reconnectingAfterContinuousLimit,
-                 .finalSendAfterContinuousLimit, .acceptedPendingVerification:
+                 .finalSendAfterContinuousLimit, .waitingForRepeat,
+                 .acceptedPendingVerification:
                 return .blue
             }
         }
