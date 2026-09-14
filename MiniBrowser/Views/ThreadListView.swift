@@ -10,6 +10,24 @@ struct ThreadListView: View {
     let multiThreadSessionActive: Bool = false
     let onToggleMultiThread: () -> Void = {}
 
+    init(
+        model: ThreadListViewModel,
+        onOpenThread: @escaping (URL) -> Void,
+        sameThreadRepeatEnabled: Bool,
+        onToggleSameThreadRepeat: @escaping () -> Void,
+        multiThreadEnabled: Bool = false,
+        multiThreadSessionActive: Bool = false,
+        onToggleMultiThread: @escaping () -> Void = {}
+    ) {
+        self.model = model
+        self.onOpenThread = onOpenThread
+        self.sameThreadRepeatEnabled = sameThreadRepeatEnabled
+        self.onToggleSameThreadRepeat = onToggleSameThreadRepeat
+        self.multiThreadEnabled = multiThreadEnabled
+        self.multiThreadSessionActive = multiThreadSessionActive
+        self.onToggleMultiThread = onToggleMultiThread
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
