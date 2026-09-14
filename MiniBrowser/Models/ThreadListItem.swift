@@ -3,7 +3,6 @@ import Foundation
 enum ThreadListSort: String, CaseIterable, Identifiable, Sendable {
     case momentum
     case list
-    case mostReplies
 
     var id: String { rawValue }
 
@@ -11,7 +10,6 @@ enum ThreadListSort: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .momentum: "勢い順"
         case .list: "カタログ順"
-        case .mostReplies: "多順"
         }
     }
 
@@ -21,8 +19,6 @@ enum ThreadListSort: String, CaseIterable, Identifiable, Sendable {
             URL(string: "https://img.2chan.net/b/futaba.php?mode=cat&sort=6")!
         case .list:
             URL(string: "https://img.2chan.net/b/futaba.php?mode=cat")!
-        case .mostReplies:
-            URL(string: "https://img.2chan.net/b/futaba.php?mode=cat&sort=3")!
         }
     }
 }
