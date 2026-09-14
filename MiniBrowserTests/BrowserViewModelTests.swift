@@ -103,4 +103,25 @@ final class BrowserViewModelTests: XCTestCase {
                        250_000_000)
         XCTAssertEqual(BrowserViewModel.sameThreadRepeatSubmitDelayNanoseconds, 0)
     }
+
+    func testMultiThreadToggleStartsOffIsNotPersistedAndIsExclusive() {
+        let suiteName = "BrowserViewModelTests.multiThreadToggle.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = BrowserViewModel(
+            defaults: defaults,
+            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
+        )
+        XCTAssertFalse(model.multiThreadEnabled)
+        XCTAssertFalse(model.multiThreadSessionActive)
+
+        model.toggleMultiThread()
+        XCTAssertTrue(model.multiThreadEnabled)
+        XCTAssertNil(defaults.object(forKey: "multiThreadEnabled"))
+
+        model.toggleSameThreadRepeat()
+        XCTAssertFalse(model.multiThreadEnabled)
+        XCTAssertTrue(model.sameThreadRepeatEnabled)
+    }
 }

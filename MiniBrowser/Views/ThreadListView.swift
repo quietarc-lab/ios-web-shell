@@ -6,6 +6,9 @@ struct ThreadListView: View {
     let onOpenThread: (URL) -> Void
     let sameThreadRepeatEnabled: Bool
     let onToggleSameThreadRepeat: () -> Void
+    let multiThreadEnabled: Bool = false
+    let multiThreadSessionActive: Bool = false
+    let onToggleMultiThread: () -> Void = {}
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,6 +32,7 @@ struct ThreadListView: View {
                 .frame(height: 26)
                 .background(model.selectedSort == sort ? Color.blue : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 5))
+                .disabled(multiThreadSessionActive)
             }
 
             Spacer(minLength: 2)
@@ -45,6 +49,21 @@ struct ThreadListView: View {
             .accessibilityLabel("同スレ連続")
             .accessibilityValue(sameThreadRepeatEnabled ? "オン" : "オフ")
             .accessibilityAddTraits(sameThreadRepeatEnabled ? .isSelected : [])
+            .disabled(multiThreadSessionActive)
+
+            Button(action: onToggleMultiThread) {
+                Text("複数スレ")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(multiThreadEnabled ? .white : .primary)
+                    .frame(width: 64, height: 26)
+                    .background(multiThreadEnabled ? Color.blue : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("複数スレ")
+            .accessibilityValue(multiThreadEnabled ? "オン" : "オフ")
+            .accessibilityAddTraits(multiThreadEnabled ? .isSelected : [])
+            .disabled(sameThreadRepeatEnabled && !multiThreadEnabled)
 
             if let error = model.errorMessage {
                 Text(error)
@@ -69,12 +88,14 @@ struct ThreadListView: View {
             }
             .frame(width: 28, height: 28)
             .accessibilityLabel("カタログを更新")
+            .disabled(multiThreadSessionActive)
 
             Button(action: model.toggleExpanded) {
                 Image(systemName: "chevron.down")
                     .frame(width: 28, height: 28)
             }
             .accessibilityLabel("スレ一覧を閉じる")
+            .disabled(multiThreadSessionActive)
         }
         .padding(.horizontal, 5)
         .frame(height: 32)
@@ -96,6 +117,7 @@ struct ThreadListView: View {
                         ThreadListCell(item: item, openCount: openCount)
                     }
                     .buttonStyle(.plain)
+                    .disabled(multiThreadSessionActive)
                     .accessibilityLabel(item.openerText ?? "本文取得中")
                 }
             }
@@ -173,6 +195,7 @@ private struct ThreadListThumbnail: View {
 
 struct ThreadListCollapsedBar: View {
     @ObservedObject var model: ThreadListViewModel
+    let interactionLocked: Bool = false
 
     var body: some View {
         Button(action: model.toggleExpanded) {
@@ -188,5 +211,6 @@ struct ThreadListCollapsedBar: View {
         .frame(height: 28)
         .background(.bar)
         .accessibilityLabel("スレ一覧を開く")
+        .disabled(interactionLocked)
     }
 }

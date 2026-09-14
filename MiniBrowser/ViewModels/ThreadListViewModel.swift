@@ -2,7 +2,7 @@ import Combine
 import Foundation
 
 @MainActor
-final class ThreadListViewModel: ObservableObject {
+final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
     private static let listItemLimit = 60
     static let excludedThreadRetention: TimeInterval = 6 * 60 * 60
     private enum Keys {
@@ -105,6 +105,57 @@ final class ThreadListViewModel: ObservableObject {
 
     func setUserAgent(_ value: String) {
         userAgent = value
+    }
+
+    func currentPostSnapshot(limit: Int = 60) -> CatalogPostSnapshot {
+        purgeExpiredThreadExclusions()
+        let boundedLimit = min(Self.listItemLimit, max(0, limit))
+        return CatalogPostSnapshot(
+            sort: selectedSort,
+            targets: items.filter { !excludedThreadIDs.contains($0.id) }
+                .prefix(boundedLimit)
+                .map {
+                CatalogPostTarget(id: $0.id, threadURL: $0.threadURL)
+            }
+        )
+    }
+
+    /// Fetches one fresh snapshot for a running multi-thread session. This is
+    /// deliberately separate from the normal refresh loop so the session can
+    /// request exactly one deterministic end-of-catalog refresh.
+    func refreshPostSnapshot(excludingIDs: Set<String>,
+                             limit: Int = 60) async throws -> CatalogPostSnapshot {
+        guard isSceneActive, isNetworkActivityAllowed else {
+            throw CancellationError()
+        }
+        purgeExpiredThreadExclusions()
+        loadTask?.cancel()
+        loadTask = nil
+        let sort = selectedSort
+        let currentUA = userAgent
+        let excluded = excludedThreadIDs.union(excludingIDs)
+        isRefreshing = true
+        errorMessage = nil
+        defer { isRefreshing = false }
+
+        await service.updateUserAgent(currentUA)
+        let loaded = try await service.fetchList(
+            sort: sort,
+            limit: min(Self.listItemLimit, max(0, limit)),
+            excludingIDs: excluded
+        )
+        try Task.checkCancellation()
+        guard selectedSort == sort else { throw CancellationError() }
+        items = Self.mergingDisplayState(of: loaded, with: items)
+        // Details are loaded by the normal refresh loop. Keeping this one-shot
+        // operation lightweight prevents catalog metadata from delaying the
+        // next target transition.
+        return CatalogPostSnapshot(
+            sort: sort,
+            targets: loaded.map {
+                CatalogPostTarget(id: $0.id, threadURL: $0.threadURL)
+            }
+        )
     }
 
     func toggleExpanded() {

@@ -28,6 +28,8 @@ enum AutomaticPostStopReason: Equatable {
     case repeatDisabled
     case imageCountRestricted
     case submitResponseTimeout
+    case threadPostingUnavailable
+    case catalogRefreshFailed
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {
@@ -64,6 +66,7 @@ enum AutomaticPostFlowEffect: Equatable {
     case startIPReconnect
     case startContinuousAPReconnect
     case startNextAutomaticFlow
+    case skipCurrentThread
     case succeeded
     case stopped(AutomaticPostStopReason)
 }
@@ -112,6 +115,7 @@ struct AutomaticPostFlowMachine {
     private(set) var requiresHandwriting = false
     private(set) var lastAttempt = 0
     private(set) var isSameThreadRepeat = false
+    private(set) var isMultiThread = false
     private(set) var currentSubmissionID: UInt64? = nil
     private(set) var submitEventObserved = false
     private(set) var submitResponseRetryUsed = false
@@ -200,7 +204,8 @@ struct AutomaticPostFlowMachine {
     mutating func begin(generationID: UInt64,
                         oldPageToken: String?,
                         hasComment: Bool,
-                        hasImage: Bool) -> AutomaticPostFlowEffect {
+                        hasImage: Bool,
+                        multiThread: Bool = false) -> AutomaticPostFlowEffect {
         guard hasComment || hasImage else {
             state = .stopped(generationID: generationID, reason: .noContent)
             self.generationID = generationID
@@ -209,6 +214,7 @@ struct AutomaticPostFlowMachine {
 
         self.generationID = generationID
         isSameThreadRepeat = false
+        isMultiThread = multiThread
         stalePageToken = oldPageToken
         pageToken = nil
         requiresHandwriting = hasImage
@@ -231,6 +237,45 @@ struct AutomaticPostFlowMachine {
         return .none
     }
 
+    /// Starts a generation for a new catalog target after navigation. AP and
+    /// Cookie state are intentionally carried over; only the page load and
+    /// compact-form/handwriting readiness must be observed again.
+    mutating func beginMultiThreadNavigation(generationID: UInt64,
+                                             oldPageToken: String?,
+                                             hasComment: Bool,
+                                             hasImage: Bool) -> AutomaticPostFlowEffect {
+        guard hasComment || hasImage else {
+            state = .stopped(generationID: generationID, reason: .noContent)
+            self.generationID = generationID
+            return .stopped(.noContent)
+        }
+        self.generationID = generationID
+        isSameThreadRepeat = false
+        isMultiThread = true
+        stalePageToken = oldPageToken
+        pageToken = nil
+        requiresHandwriting = hasImage
+        cookieRetryUsed = false
+        ipRetryUsed = false
+        ipRetryIsTerminal = false
+        continuousRetryUsed = false
+        lastAttempt = 0
+        currentSubmissionID = nil
+        submitEventObserved = false
+        submitResponseRetryUsed = false
+        awaitingSubmitResponseRetry = false
+        // A catalog transition does not delete Cookies or reconnect AP. The
+        // navigation itself is the only preparation stage still pending.
+        apCompleted = true
+        reloadCompleted = false
+        cookieObserved = true
+        compactReady = false
+        handwritingReady = !hasImage
+        preparationReason = .initial
+        state = .preparing(generationID: generationID)
+        return .none
+    }
+
     mutating func beginSameThreadRepeat(generationID: UInt64,
                                         pageToken: String,
                                         hasComment: Bool,
@@ -244,6 +289,7 @@ struct AutomaticPostFlowMachine {
 
         self.generationID = generationID
         isSameThreadRepeat = true
+        isMultiThread = false
         stalePageToken = nil
         self.pageToken = pageToken
         requiresHandwriting = hasImage
@@ -446,10 +492,15 @@ struct AutomaticPostFlowMachine {
 
         switch alert {
         case .threadPostingUnavailable:
-            return (false, stop(.unknownAlert))
+            guard isMultiThread else {
+                return (false, stop(.unknownAlert))
+            }
+            state = .stopped(generationID: generationID,
+                             reason: .threadPostingUnavailable)
+            return (true, .skipCurrentThread)
 
         case .imageCountRestricted, .imageContinuousPosting:
-            guard isSameThreadRepeat else {
+            guard isSameThreadRepeat || isMultiThread else {
                 return (false, stop(.unknownAlert))
             }
             state = .stopped(generationID: generationID,
@@ -522,6 +573,7 @@ struct AutomaticPostFlowMachine {
         submitResponseRetryUsed = false
         awaitingSubmitResponseRetry = false
         isSameThreadRepeat = false
+        isMultiThread = false
         apCompleted = false
         reloadCompleted = false
         cookieObserved = false

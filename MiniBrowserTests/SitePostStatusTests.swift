@@ -25,6 +25,9 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertEqual(AutomaticPostStatus.finalSendAfterContinuousLimit.rawValue,
                        "AP後に最終送信")
         XCTAssertEqual(AutomaticPostStatus.waitingForRepeat.rawValue, "同スレ次回待機")
+        XCTAssertEqual(AutomaticPostStatus.waitingForNextThread.rawValue, "次スレ待機")
+        XCTAssertEqual(AutomaticPostStatus.navigatingToNextThread.rawValue, "次スレへ移動中")
+        XCTAssertEqual(AutomaticPostStatus.refreshingCatalog.rawValue, "カタログ再取得中")
         XCTAssertEqual(AutomaticPostStatus.acceptedPendingVerification.rawValue,
                        "受付済み・反映確認中")
         XCTAssertEqual(AutomaticPostStatus.completed.rawValue, "完了")

@@ -33,6 +33,7 @@ struct ContentView: View {
         .ignoresSafeArea(.keyboard, edges: .bottom)
         .task {
             listModel.setUserAgent(model.effectiveUserAgent)
+            model.attachAutomaticCatalogProvider(listModel)
             listModel.start()
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
@@ -70,10 +71,14 @@ struct ContentView: View {
                     ThreadListView(model: listModel,
                                       onOpenThread: model.openThreadListThread,
                                       sameThreadRepeatEnabled: model.sameThreadRepeatEnabled,
-                                      onToggleSameThreadRepeat: model.toggleSameThreadRepeat)
+                                      onToggleSameThreadRepeat: model.toggleSameThreadRepeat,
+                                      multiThreadEnabled: model.multiThreadEnabled,
+                                      multiThreadSessionActive: model.multiThreadSessionActive,
+                                      onToggleMultiThread: model.toggleMultiThread)
                         .frame(height: max(0, geometry.size.height * 0.35 - 1))
                 } else {
-                    ThreadListCollapsedBar(model: listModel)
+                    ThreadListCollapsedBar(model: listModel,
+                                            interactionLocked: model.multiThreadSessionActive)
                 }
             }
         }
@@ -91,10 +96,12 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("ブックマーク")
+            .disabled(model.multiThreadSessionActive)
 
             URLTextField(text: $model.urlText, onGo: model.openURLFromField)
                 .frame(minWidth: 0, maxWidth: .infinity, minHeight: 36, maxHeight: 36)
                 .layoutPriority(1)
+                .disabled(model.multiThreadSessionActive)
 
             if model.isLoading {
                 ProgressView()
@@ -112,23 +119,29 @@ struct ContentView: View {
             let buttonWidth = geometry.size.width / 6
             HStack(spacing: 0) {
                 toolbarButton("chevron.backward", label: "戻る", width: buttonWidth,
-                              enabled: model.canGoBack, action: model.goBack)
+                              enabled: model.canGoBack && !model.multiThreadSessionActive,
+                              action: model.goBack)
                 toolbarButton("chevron.forward", label: "進む", width: buttonWidth,
-                              enabled: model.canGoForward, action: model.goForward)
+                              enabled: model.canGoForward && !model.multiThreadSessionActive,
+                              action: model.goForward)
                 toolbarButton("arrow.clockwise", label: "更新", width: buttonWidth,
+                              enabled: !model.multiThreadSessionActive,
                               action: model.reload)
                 toolbarTextButton(model.userAgentButtonTitle,
                                   width: buttonWidth,
-                                  enabled: !model.isUAChanging && !model.isLoading &&
+                                  enabled: !model.multiThreadSessionActive &&
+                                      !model.isUAChanging && !model.isLoading &&
                                       !model.isIdentityRefreshInProgress,
                                   action: model.cycleUserAgent)
                 toolbarTextButton("Cookie",
                                   width: buttonWidth,
-                                  enabled: !model.isCookieRefreshing && !model.isLoading,
+                                  enabled: !model.multiThreadSessionActive &&
+                                      !model.isCookieRefreshing && !model.isLoading,
                                   action: model.refreshCookies)
                 toolbarTextButton("AP",
                                   width: buttonWidth,
-                                  enabled: !model.isAPRunning && !model.isIdentityRefreshInProgress,
+                                  enabled: !model.multiThreadSessionActive &&
+                                      !model.isAPRunning && !model.isIdentityRefreshInProgress,
                                   action: model.startCellularReconnect)
             }
         }

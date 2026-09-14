@@ -184,7 +184,13 @@ final class AutomaticPostFlowTests: XCTestCase {
             generationID: generation,
             submissionID: firstSubmissionID
         ))
-        _ = submitAfterReadiness(&machine)
+        XCTAssertEqual(machine.handle(.submitReadinessObserved(
+            generationID: generation,
+            pageToken: "page",
+            ready: true,
+            stableForMilliseconds: AutomaticPostFlowMachine.readinessStableMilliseconds
+        )), .scheduleSubmitDelay)
+        _ = machine.handle(.initialSubmitDelayElapsed(generationID: generation))
         XCTAssertFalse(machine.awaitingSubmitResponseRetry)
         XCTAssertTrue(machine.canAcceptPostCompletion)
         XCTAssertEqual(machine.handle(.postCompleted(generationID: generation)), .succeeded)
@@ -532,6 +538,86 @@ final class AutomaticPostFlowTests: XCTestCase {
                                      hasImage: false),
                        .stopped(.noContent))
         XCTAssertFalse(machine.isActive)
+    }
+
+    func testMultiThreadNavigationCarriesPreparationAndSkipsUnavailableThread() {
+        var machine = AutomaticPostFlowMachine()
+        XCTAssertEqual(machine.beginMultiThreadNavigation(
+            generationID: generation,
+            oldPageToken: "old-page",
+            hasComment: true,
+            hasImage: false
+        ), .none)
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCompactReady(
+            generationID: generation,
+            pageToken: "new-page",
+            hasComment: true,
+            canSubmit: true
+        ))
+        XCTAssertEqual(machine.handle(.submitReadinessObserved(
+            generationID: generation,
+            pageToken: "new-page",
+            ready: true,
+            stableForMilliseconds: AutomaticPostFlowMachine.readinessStableMilliseconds
+        )), .scheduleSubmitDelay)
+        _ = machine.handle(.initialSubmitDelayElapsed(generationID: generation))
+
+        let result = machine.handleAlert(.threadPostingUnavailable,
+                                         generationID: generation)
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .skipCurrentThread)
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .threadPostingUnavailable))
+    }
+
+    func testMultiThreadImageRestrictionRequestsNextUA() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.begin(generationID: generation,
+                          oldPageToken: nil,
+                          hasComment: false,
+                          hasImage: true,
+                          multiThread: true)
+        _ = machine.handle(.markAPCompleted(generationID: generation))
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCookieObserved(generationID: generation))
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: false,
+                                              canSubmit: true))
+        _ = machine.handle(.markHandwritingReady(generationID: generation,
+                                                  pageToken: "page",
+                                                  ready: true))
+        _ = submitAfterReadiness(&machine)
+
+        let result = machine.handleAlert(.imageCountRestricted,
+                                         generationID: generation)
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .startNextAutomaticFlow)
+    }
+
+    func testMultiThreadContinuousPostingKeepsCurrentGenerationRetryRules() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.begin(generationID: generation,
+                          oldPageToken: nil,
+                          hasComment: true,
+                          hasImage: false,
+                          multiThread: true)
+        _ = machine.handle(.markAPCompleted(generationID: generation))
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCookieObserved(generationID: generation))
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: true,
+                                              canSubmit: true))
+        _ = submitAfterReadiness(&machine)
+
+        let first = machine.handleAlert(.continuousPosting, generationID: generation)
+        XCTAssertTrue(first.autoDismiss)
+        XCTAssertEqual(first.effect, .none)
+        XCTAssertEqual(machine.handle(.continuousAlertDismissed(generationID: generation)),
+                       .startSubmitReadiness(attempt: 2, reason: .continuousRetry))
     }
 
     private func readyForReadinessMachine() -> AutomaticPostFlowMachine {
