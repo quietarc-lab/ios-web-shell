@@ -205,7 +205,8 @@ struct AutomaticPostFlowMachine {
                         oldPageToken: String?,
                         hasComment: Bool,
                         hasImage: Bool,
-                        multiThread: Bool = false) -> AutomaticPostFlowEffect {
+                        multiThread: Bool = false,
+                        submissionIDSeed: UInt64? = nil) -> AutomaticPostFlowEffect {
         guard hasComment || hasImage else {
             state = .stopped(generationID: generationID, reason: .noContent)
             self.generationID = generationID
@@ -223,7 +224,7 @@ struct AutomaticPostFlowMachine {
         ipRetryIsTerminal = false
         continuousRetryUsed = false
         lastAttempt = 0
-        currentSubmissionID = nil
+        currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
         submitResponseRetryUsed = false
         awaitingSubmitResponseRetry = false
@@ -243,7 +244,8 @@ struct AutomaticPostFlowMachine {
     mutating func beginMultiThreadNavigation(generationID: UInt64,
                                              oldPageToken: String?,
                                              hasComment: Bool,
-                                             hasImage: Bool) -> AutomaticPostFlowEffect {
+                                             hasImage: Bool,
+                                             submissionIDSeed: UInt64? = nil) -> AutomaticPostFlowEffect {
         guard hasComment || hasImage else {
             state = .stopped(generationID: generationID, reason: .noContent)
             self.generationID = generationID
@@ -260,7 +262,7 @@ struct AutomaticPostFlowMachine {
         ipRetryIsTerminal = false
         continuousRetryUsed = false
         lastAttempt = 0
-        currentSubmissionID = nil
+        currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
         submitResponseRetryUsed = false
         awaitingSubmitResponseRetry = false
@@ -279,7 +281,8 @@ struct AutomaticPostFlowMachine {
     mutating func beginSameThreadRepeat(generationID: UInt64,
                                         pageToken: String,
                                         hasComment: Bool,
-                                        hasImage: Bool) -> AutomaticPostFlowEffect {
+                                        hasImage: Bool,
+                                        submissionIDSeed: UInt64? = nil) -> AutomaticPostFlowEffect {
         guard !pageToken.isEmpty,
               hasComment || hasImage else {
             state = .stopped(generationID: generationID, reason: .noContent)
@@ -298,7 +301,7 @@ struct AutomaticPostFlowMachine {
         ipRetryIsTerminal = false
         continuousRetryUsed = false
         lastAttempt = 0
-        currentSubmissionID = nil
+        currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
         submitResponseRetryUsed = false
         awaitingSubmitResponseRetry = false
@@ -555,6 +558,16 @@ struct AutomaticPostFlowMachine {
         awaitingSubmitResponseRetry = false
         state = .stopped(generationID: generationID, reason: reason)
         return .stopped(reason)
+    }
+
+    /// Forces an active generation into a terminal state without producing a
+    /// second effect. This is used by coordinator-level cancellation paths
+    /// that already own the final UI/log result and must only invalidate late
+    /// callbacks.
+    mutating func forceTerminate(generationID: UInt64) {
+        guard self.generationID == generationID, isActive else { return }
+        awaitingSubmitResponseRetry = false
+        state = .stopped(generationID: generationID, reason: .communicationFailure)
     }
 
     mutating func reset() {

@@ -71,6 +71,9 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("consumeAutomaticSubmissionID"))
         XCTAssertTrue(script.contains("__pageSessionActiveSubmissionID"))
         XCTAssertTrue(script.contains("withAutomaticSubmissionID"))
+        XCTAssertTrue(script.contains("capturedSubmissionID"))
+        XCTAssertTrue(script.contains("captureAwaitingSubmit"))
+        XCTAssertTrue(script.contains("comment: String(textarea && textarea.value || \"\")"))
         XCTAssertTrue(script.contains("form.addEventListener(\"submit\", notifyNativeSubmitObserved, true)"))
         XCTAssertTrue(script.contains("type: \"ownPostVisible\""))
         XCTAssertTrue(script.contains("type: \"ownPostObservation\""))
@@ -106,6 +109,8 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(restoreScript.contains("textarea.value"))
         XCTAssertTrue(restoreScript.contains("dispatchEvent(new Event(\"input\""))
         XCTAssertTrue(restoreScript.contains("dispatchEvent(new Event(\"change\""))
+        XCTAssertTrue(restoreScript.contains("textarea.value !=="))
+        XCTAssertTrue(restoreScript.contains("comment: String(textarea.value || \"\")"))
         XCTAssertFalse(restoreScript.contains("form.submit"))
         XCTAssertFalse(restoreScript.contains("localStorage"))
 

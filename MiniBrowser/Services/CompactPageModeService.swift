@@ -365,6 +365,11 @@ enum CompactPageModeService {
       let userEditedAfterSubmission = false;
       let canvasWasOpenAtSubmission = false;
       let postCompletionReported = false;
+      // Snapshot the operation identity at the click/submit boundary. A
+      // delayed DOM marker must not read a newer mutable global ID and be
+      // attributed to the wrong request.
+      let capturedSubmissionID = null;
+      let captureAwaitingSubmit = false;
       let lastNativePostStatus = null;
 
       function automaticSubmissionID() {
@@ -376,7 +381,7 @@ enum CompactPageModeService {
       }
 
       function withAutomaticSubmissionID(payload) {
-        const submissionID = automaticSubmissionID();
+        const submissionID = capturedSubmissionID;
         return submissionID === null ? payload :
           Object.assign({ submissionID }, payload);
       }
@@ -396,6 +401,7 @@ enum CompactPageModeService {
       function notifyCompactReady() {
         sendNative({
           type: "compactReady",
+          comment: String(textarea && textarea.value || ""),
           hasComment: Boolean(textarea && String(textarea.value || "").trim()),
           canSubmit: Boolean(submitButton && submitButton.isConnected)
         });
@@ -438,13 +444,24 @@ enum CompactPageModeService {
       }
 
       function notifyNativeSubmitObserved() {
-        const submissionID = consumeAutomaticSubmissionID();
+        const submissionID = capturedSubmissionID;
+        captureAwaitingSubmit = false;
         if (submissionID === null) return;
         sendNative({ type: "submitObserved", submissionID });
       }
 
-      function capturePostState() {
+      function capturePostState(event) {
         if (!textarea) return;
+        const pendingSubmissionID = consumeAutomaticSubmissionID();
+        if (pendingSubmissionID !== null) {
+          capturedSubmissionID = pendingSubmissionID;
+          captureAwaitingSubmit = true;
+        } else if (event && event.type === "click") {
+          capturedSubmissionID = null;
+          captureAwaitingSubmit = false;
+        } else if (!captureAwaitingSubmit) {
+          capturedSubmissionID = null;
+        }
         submittedDraft = draftEnabled ? textarea.value : null;
         userEditedAfterSubmission = false;
         canvasWasOpenAtSubmission = Boolean(doc.querySelector("canvas#oejs"));
@@ -922,6 +939,7 @@ enum CompactPageModeService {
           textarea.value = \#(literal);
           textarea.dispatchEvent(new Event("input", { bubbles: true }));
           textarea.dispatchEvent(new Event("change", { bubbles: true }));
+          if (textarea.value !== \#(literal)) return false;
           const handler = window.webkit && window.webkit.messageHandlers &&
             window.webkit.messageHandlers.miniBrowserHandwriting;
           const submitButton = form && Array.from(form.querySelectorAll(
@@ -931,6 +949,7 @@ enum CompactPageModeService {
             handler.postMessage({
               type: "compactReady",
               pageToken,
+              comment: String(textarea.value || ""),
               hasComment: Boolean(String(textarea.value || "").trim()),
               canSubmit: Boolean(submitButton && submitButton.isConnected)
             });

@@ -58,13 +58,26 @@ final class BrowserViewModel: ObservableObject {
     private var lastRelatedCookieCountByHost: [String: Int] = [:]
     private var automaticPostMachine = AutomaticPostFlowMachine()
     private var automaticPostGeneration: UInt64 = 0
+    /// Submission identities are monotonic for the lifetime of the WebView
+    /// model. They must not restart at one when a new page generation begins,
+    /// otherwise a delayed marker from an older generation can be accepted by
+    /// a newer request on the same document.
+    private var automaticSubmissionSequence: UInt64 = 0
     private var pendingUAChangeGeneration: UInt64?
     private var automaticReloadGeneration: UInt64?
     private var automaticPostPreparationTimer: Task<Void, Never>?
     private var automaticSubmitReadinessTask: Task<Void, Never>?
     private var automaticSubmitResponseTimer: Task<Void, Never>?
     private var automaticPostStatusTask: Task<Void, Never>?
-    private var latestCompactReady: (pageToken: String, hasComment: Bool, canSubmit: Bool)?
+    private var latestCompactReady: (pageURL: URL?, pageToken: String, hasComment: Bool, canSubmit: Bool)?
+    /// Bridge readiness can arrive before WKNavigationDelegate.didFinish for
+    /// a newly selected catalog target. Keep it associated with the frame URL
+    /// until the matching generation owns the page; never replay it globally.
+    private var pendingHandwritingReady: (pageURL: URL?, pageToken: String, ready: Bool)?
+    /// A multi-thread destination with a captured comment must not accept an
+    /// empty/different early compactReady signal while its draft restoration
+    /// script is still running.
+    private var automaticDraftRestorePendingGeneration: UInt64?
     private var automaticSubmitReadinessStableSince: Date?
     private var automaticSubmitReadinessDeadline: Date?
     private var automaticSubmitReadinessLastReason: String?
@@ -77,6 +90,7 @@ final class BrowserViewModel: ObservableObject {
     private var automaticAPResult = "NOT_REQUESTED"
     private var automaticEventSequence: UInt64 = 0
     private var automaticGenerationStartedAt: [UInt64: Date] = [:]
+    private var automaticFinishedGenerations: Set<UInt64> = []
     private var automaticPostAccepted = false
     private var automaticOwnResponseConfirmed = false
     private var automaticAcceptedPageToken: String?
@@ -319,7 +333,8 @@ final class BrowserViewModel: ObservableObject {
             let canSubmit = state?.canSubmit ?? false
             let isTarget = Self.isTargetThreadURL(pageURL)
             let hasContent = hasComment || imageAvailable
-            let shouldStartMulti = multiBootstrap != nil && isTarget && canSubmit && hasContent
+            let shouldStartMulti = self.multiThreadEnabled &&
+                multiBootstrap != nil && isTarget && canSubmit && hasContent
             if shouldStartMulti,
                let multiBootstrap {
                 self.beginMultiThreadSession(
@@ -357,21 +372,36 @@ final class BrowserViewModel: ObservableObject {
             guard var session = multiThreadSession else { return }
             session.stopRequested = true
             multiThreadSession = session
-            // An in-flight click is allowed to finish. If the generation is
-            // already complete, finish the session immediately instead of
-            // scheduling another target.
-            if case .succeeded = automaticPostMachine.state,
-               let generationID = automaticPostMachine.generationID {
-                finishMultiThreadSession(generationID: generationID,
-                                         result: "STOPPED_MULTI_THREAD_DISABLED")
-            } else if case .idle = automaticPostMachine.state {
+            // A click already dispatched to the site is allowed to finish,
+            // but OFF must revoke every unsent readiness/retry/transition
+            // effect. Otherwise a delayed bridge callback could authorize a
+            // new click after the user has disabled the mode.
+            switch automaticPostMachine.state {
+            case .submitting:
+                break
+            case .succeeded:
+                if let generationID = automaticPostMachine.generationID {
+                    finishMultiThreadSession(generationID: generationID,
+                                             result: "STOPPED_MULTI_THREAD_DISABLED")
+                }
+            case .idle:
                 finishMultiThreadSession(generationID: nil,
                                          result: "STOPPED_MULTI_THREAD_DISABLED")
-            } else if case .stopped = automaticPostMachine.state {
+            case .stopped:
                 finishMultiThreadSession(
                     generationID: automaticPostMachine.generationID,
                     result: "STOPPED_MULTI_THREAD_DISABLED"
                 )
+            case .preparing, .waitingForSubmitReadiness, .waitingToSubmit,
+                 .waitingForCookieRetry, .waitingForIPRetry,
+                 .waitingForContinuousRetry, .waitingForContinuousAPRetry:
+                let effect = automaticPostMachine.stop(.repeatDisabled)
+                if let generationID = automaticPostMachine.generationID {
+                    handleAutomaticPostEffect(effect, generationID: generationID)
+                } else {
+                    finishMultiThreadSession(generationID: nil,
+                                             result: "STOPPED_MULTI_THREAD_DISABLED")
+                }
             }
             return
         }
@@ -439,6 +469,14 @@ final class BrowserViewModel: ObservableObject {
             return candidateIndex
         }
         return nil
+    }
+
+    private func nextAutomaticSubmissionSeed() -> UInt64 {
+        automaticSubmissionSequence &+= 1
+        if automaticSubmissionSequence == 0 {
+            automaticSubmissionSequence = 1
+        }
+        return automaticSubmissionSequence
     }
 
     private func startNextAutomaticFlow(previousGenerationID: UInt64) {
@@ -555,6 +593,10 @@ final class BrowserViewModel: ObservableObject {
                                       multiThread: Bool = false) {
         guard let webView else {
             isUAChanging = false
+            if multiThreadSession != nil {
+                finishMultiThreadSession(generationID: nil,
+                                         result: "STOPPED_WEBVIEW_UNAVAILABLE")
+            }
             return
         }
         isUAChanging = true
@@ -569,7 +611,20 @@ final class BrowserViewModel: ObservableObject {
         ) else {
             isUAChanging = false
             automaticTriedUAIDs.removeAll()
-            showToast("利用可能なUAがありません", kind: .warning)
+            if multiThreadSession != nil {
+                appendAutomaticEvent(
+                    generationID: automaticPostMachine.generationID ?? automaticPostGeneration,
+                    phase: "FLOW",
+                    event: "NO_AVAILABLE_UA",
+                    result: "STOPPED"
+                )
+                finishMultiThreadSession(
+                    generationID: automaticPostMachine.generationID,
+                    result: "STOPPED_NO_AVAILABLE_UA"
+                )
+            } else {
+                showToast("利用可能なUAがありません", kind: .warning)
+            }
             return
         }
         selectedUAIndex = nextIndex
@@ -628,22 +683,27 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
         automaticPostStatusTask?.cancel()
+        automaticPostStatusTask = nil
         latestCompactReady = nil
+        pendingHandwritingReady = nil
+        automaticDraftRestorePendingGeneration = nil
         automaticCookieRelatedCount = nil
         automaticCookieCountDelta = nil
         automaticAPResult = automatic ? "PENDING" : "NOT_REQUESTED"
 
         automaticPostMachine.reset()
         if automatic && !readError {
+            let submissionIDSeed = nextAutomaticSubmissionSeed()
             _ = automaticPostMachine.begin(generationID: generationID,
-                                           oldPageToken: oldPageToken,
-                                           hasComment: multiThread
-                                               ? (multiThreadSession?.comment?.isEmpty == false)
-                                               : hasComment,
-                                           hasImage: multiThread
-                                               ? (multiThreadSession?.hasImage ?? hasImage)
-                                               : hasImage,
-                                           multiThread: multiThread)
+                                            oldPageToken: oldPageToken,
+                                            hasComment: multiThread
+                                                ? (multiThreadSession?.comment?.isEmpty == false)
+                                                : hasComment,
+                                            hasImage: multiThread
+                                                ? (multiThreadSession?.hasImage ?? hasImage)
+                                                : hasImage,
+                                            multiThread: multiThread,
+                                            submissionIDSeed: submissionIDSeed)
             if var session = multiThreadSession, multiThread {
                 session.currentGenerationID = generationID
                 session.currentTargetID = session.currentTarget?.id
@@ -789,6 +849,7 @@ final class BrowserViewModel: ObservableObject {
         isLoading = true
         sitePostStatus = nil
         latestCompactReady = nil
+        pendingHandwritingReady = nil
         refreshNavigationState()
     }
 
@@ -823,18 +884,23 @@ final class BrowserViewModel: ObservableObject {
 
     func handleCompactReady(pageToken: String,
                             hasComment: Bool,
-                            canSubmit: Bool) {
+                            canSubmit: Bool,
+                            comment: String? = nil,
+                            pageURL: URL? = nil) {
         guard automaticPostMachine.isActive,
               let generationID = automaticPostMachine.generationID else {
-            latestCompactReady = (pageToken, hasComment, canSubmit)
+            let candidateURL = pageURL ?? webView?.url
+            guard Self.isTargetThreadURL(candidateURL) else { return }
+            latestCompactReady = (candidateURL, pageToken, hasComment, canSubmit)
             return
         }
-        let effect = automaticPostMachine.handle(.markCompactReady(
-            generationID: generationID,
-            pageToken: pageToken,
-            hasComment: hasComment,
-            canSubmit: canSubmit
-        ))
+        if let pageURL,
+           let currentURL = webView?.url,
+           !Self.sameTargetThreadURL(pageURL, currentURL) {
+            recordAutomaticBridgeIgnored(type: "compactReady",
+                                         reason: "PAGE_URL_MISMATCH")
+            return
+        }
         let compactTokenAccepted = automaticPostMachine.pageToken == pageToken ||
             (automaticPostMachine.pageToken == nil &&
              !automaticPostMachine.isStalePageToken(pageToken))
@@ -848,6 +914,47 @@ final class BrowserViewModel: ObservableObject {
             )
             return
         }
+        if automaticPostMachine.isMultiThread,
+           let expectedComment = multiThreadSession?.comment,
+           !expectedComment.isEmpty {
+            guard let comment else {
+                recordAutomaticBridgeInvalidPayload(type: "compactReady",
+                                                    reason: "COMMENT_MISSING")
+                return
+            }
+            guard comment == expectedComment else {
+                if automaticDraftRestorePendingGeneration == generationID {
+                    latestCompactReady = (pageURL ?? webView?.url,
+                                          pageToken,
+                                          hasComment,
+                                          canSubmit)
+                    appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "PREPARATION",
+                        event: "DRAFT_CONTENT_PENDING",
+                        result: "WAITING",
+                        fields: [("REASON", "RESTORE_IN_PROGRESS")]
+                    )
+                    return
+                }
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "PREPARATION",
+                    event: "DRAFT_CONTENT_MISMATCH",
+                    result: "STOPPED",
+                    fields: [("REASON", "DESTINATION_COMMENT_MISMATCH")]
+                )
+                stopAutomaticPost(.preparationFailed, generationID: generationID)
+                return
+            }
+            automaticDraftRestorePendingGeneration = nil
+        }
+        let effect = automaticPostMachine.handle(.markCompactReady(
+            generationID: generationID,
+            pageToken: pageToken,
+            hasComment: hasComment,
+            canSubmit: canSubmit
+        ))
         appendAutomaticEvent(
             generationID: generationID,
             phase: "PREPARATION",
@@ -859,7 +966,10 @@ final class BrowserViewModel: ObservableObject {
                 ("CAN_SUBMIT", canSubmit ? "YES" : "NO")
             ]
         )
-        latestCompactReady = (pageToken, hasComment, canSubmit)
+        latestCompactReady = (pageURL ?? webView?.url,
+                              pageToken,
+                              hasComment,
+                              canSubmit)
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
 
@@ -1004,9 +1114,22 @@ final class BrowserViewModel: ObservableObject {
 
     func handleHandwritingReady(pageToken: String,
                                 ready: Bool,
-                                generationID incomingGenerationID: UInt64? = nil) {
+                                generationID incomingGenerationID: UInt64? = nil,
+                                pageURL: URL? = nil) {
         guard automaticPostMachine.isActive,
-              let generationID = automaticPostMachine.generationID else { return }
+              let generationID = automaticPostMachine.generationID else {
+            let candidateURL = pageURL ?? webView?.url
+            guard Self.isTargetThreadURL(candidateURL) else { return }
+            pendingHandwritingReady = (candidateURL, pageToken, ready)
+            return
+        }
+        if let pageURL,
+           let currentURL = webView?.url,
+           !Self.sameTargetThreadURL(pageURL, currentURL) {
+            recordAutomaticBridgeIgnored(type: "handwritingReady",
+                                         reason: "PAGE_URL_MISMATCH")
+            return
+        }
         let handwritingTokenAccepted = automaticPostMachine.pageToken == pageToken ||
             (automaticPostMachine.pageToken == nil &&
              !automaticPostMachine.isStalePageToken(pageToken))
@@ -1071,17 +1194,34 @@ final class BrowserViewModel: ObservableObject {
                                               reason: "MISSING_PAGE_TOKEN")
                 return
             }
+            guard let submissionID else {
+                recordAutomaticBridgeInvalidPayload(type: "postStatus",
+                                                    reason: "SUBMISSION_ID_MISSING")
+                return
+            }
             guard automaticPostMachine.pageToken == pageToken else {
                 recordAutomaticBridgeIgnored(type: "postStatus",
                                               reason: "STALE_OR_MISMATCH")
                 return
             }
-            if let submissionID,
-               automaticPostMachine.currentSubmissionID != submissionID {
+            if automaticPostMachine.currentSubmissionID != submissionID {
                 recordAutomaticBridgeIgnored(type: "postStatus",
                                               reason: "STALE_SUBMISSION_ID")
                 return
             }
+        } else if submissionID != nil {
+            // A late automatic marker must not overwrite the ordinary manual
+            // status slot after its generation has already finished.
+            if let generationID = automaticPostMachine.generationID {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "BRIDGE",
+                    event: "POST_STATUS_IGNORED",
+                    result: "IGNORED",
+                    fields: [("REASON", "FLOW_NOT_ACTIVE")]
+                )
+            }
+            return
         }
         updateSitePostStatus(rawStatus)
         guard automaticPostMachine.isActive,
@@ -1162,13 +1302,17 @@ final class BrowserViewModel: ObservableObject {
                                           reason: "MISSING_PAGE_TOKEN")
             return
         }
+        guard let submissionID else {
+            recordAutomaticBridgeInvalidPayload(type: "postCompleted",
+                                                reason: "SUBMISSION_ID_MISSING")
+            return
+        }
         guard automaticPostMachine.pageToken == pageToken else {
             recordAutomaticBridgeIgnored(type: "postCompleted",
                                           reason: "STALE_OR_MISMATCH")
             return
         }
-        if let submissionID,
-           automaticPostMachine.currentSubmissionID != submissionID {
+        if automaticPostMachine.currentSubmissionID != submissionID {
             recordAutomaticBridgeIgnored(type: "postCompleted",
                                           reason: "STALE_SUBMISSION_ID")
             return
@@ -1199,8 +1343,10 @@ final class BrowserViewModel: ObservableObject {
         case .submitting:
             canAcceptVisibleResponse = true
         case .succeeded:
-            canAcceptVisibleResponse = automaticPostAccepted &&
-                automaticPostVerificationTask != nil
+            // Multi-thread generations intentionally skip the 12-second
+            // visibility watchdog. DOM visibility remains diagnostic after
+            // the site's completion marker, regardless of timer ownership.
+            canAcceptVisibleResponse = automaticPostAccepted
         case .idle, .preparing, .waitingForSubmitReadiness, .waitingToSubmit,
              .waitingForCookieRetry, .waitingForIPRetry, .waitingForContinuousRetry,
              .waitingForContinuousAPRetry, .stopped:
@@ -1379,7 +1525,11 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
+        let preFinishCompactReady = latestCompactReady
+        let preFinishHandwritingReady = pendingHandwritingReady
         latestCompactReady = nil
+        pendingHandwritingReady = nil
+        automaticDraftRestorePendingGeneration = nil
         automaticCookieRelatedCount = nil
         automaticCookieCountDelta = nil
         automaticAPResult = "NOT_REQUESTED"
@@ -1391,7 +1541,8 @@ final class BrowserViewModel: ObservableObject {
             generationID: generationID,
             oldPageToken: oldPageToken,
             hasComment: session.comment?.isEmpty == false,
-            hasImage: session.hasImage
+            hasImage: session.hasImage,
+            submissionIDSeed: nextAutomaticSubmissionSeed()
         )
         automaticPostDraft = AutomaticPostDraft(
             hasComment: session.comment?.isEmpty == false,
@@ -1410,6 +1561,77 @@ final class BrowserViewModel: ObservableObject {
         )
         handleAutomaticPostEffect(beginEffect, generationID: generationID)
         handleAutomaticPostEffect(reloadEffect, generationID: generationID)
+
+        // A document-end bridge message may have arrived before didFinish.
+        // Reuse only signals tied to this exact target URL and page token;
+        // never promote a previous target's readiness to the new generation.
+        let destinationURL = url
+        if let comment = session.comment, !comment.isEmpty {
+            automaticDraftRestorePendingGeneration = generationID
+            restoreMultiThreadDraft(comment: comment,
+                                    generationID: generationID,
+                                    pageURL: destinationURL)
+        } else if let compact = preFinishCompactReady,
+                  Self.sameTargetThreadURL(compact.pageURL, destinationURL),
+                  compact.pageToken != oldPageToken,
+                  compact.canSubmit {
+            handleCompactReady(pageToken: compact.pageToken,
+                               hasComment: compact.hasComment,
+                               canSubmit: compact.canSubmit,
+                               pageURL: compact.pageURL)
+        }
+        if let handwriting = preFinishHandwritingReady,
+           Self.sameTargetThreadURL(handwriting.pageURL, destinationURL),
+           handwriting.pageToken != oldPageToken,
+           handwriting.ready {
+            handleHandwritingReady(pageToken: handwriting.pageToken,
+                                   ready: handwriting.ready,
+                                   generationID: generationID,
+                                   pageURL: handwriting.pageURL)
+        }
+    }
+
+    private func restoreMultiThreadDraft(comment: String,
+                                         generationID: UInt64,
+                                         pageURL: URL) {
+        guard automaticPostMachine.generationID == generationID,
+              multiThreadSession?.currentGenerationID == generationID,
+              let webView,
+              let script = CompactPageModeService.restoreAutomaticDraftScript(
+                  comment: comment
+              ) else {
+            stopAutomaticPost(.preparationFailed, generationID: generationID)
+            return
+        }
+        webView.evaluateJavaScript(script) { [weak self] result, error in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.automaticPostMachine.generationID == generationID,
+                      self.multiThreadSession?.currentGenerationID == generationID,
+                      self.automaticPostMachine.isActive,
+                      Self.sameTargetThreadURL(self.webView?.url, pageURL) else {
+                    return
+                }
+                guard error == nil, Self.javascriptBoolean(result) == true else {
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "PREPARATION",
+                        event: "DRAFT_RESTORE_FAILED",
+                        result: "STOPPED",
+                        fields: [("REASON", error == nil ? "SCRIPT_RETURNED_FALSE" : "EVALUATION_ERROR")]
+                    )
+                    self.stopAutomaticPost(.preparationFailed, generationID: generationID)
+                    return
+                }
+                self.automaticDraftRestorePendingGeneration = nil
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "PREPARATION",
+                    event: "DRAFT_RESTORE_VERIFIED",
+                    result: "READY"
+                )
+            }
+        }
     }
 
     func navigationFailed(url: URL?, error: Error) {
@@ -1796,6 +2018,12 @@ final class BrowserViewModel: ObservableObject {
         }
 
         let afterDeletion = await store.miniBrowserAllCookies()
+        if let automaticGenerationID,
+           automaticPostMachine.generationID != automaticGenerationID ||
+           automaticFinishedGenerations.contains(automaticGenerationID) {
+            isCookieRefreshing = false
+            return
+        }
         let remaining = afterDeletion.filter {
             CookieDomainMatcher.isRelated(cookieDomain: $0.domain, toHost: host)
         }
@@ -1902,6 +2130,15 @@ final class BrowserViewModel: ObservableObject {
         let allAfterReload = await store.miniBrowserAllCookies()
         let after = allAfterReload.filter {
             CookieDomainMatcher.isRelated(cookieDomain: $0.domain, toHost: pending.host)
+        }
+        if let generationID = pending.automaticGenerationID,
+           automaticPostMachine.generationID != generationID ||
+           automaticFinishedGenerations.contains(generationID) {
+            if pendingCookieRefresh?.automaticGenerationID == generationID {
+                pendingCookieRefresh = nil
+            }
+            isCookieRefreshing = false
+            return
         }
         let reloadObserved = pending.deletionConfirmed && !after.isEmpty &&
             (pending.beforeCount > 0 || pending.identityRefresh)
@@ -2023,6 +2260,15 @@ final class BrowserViewModel: ObservableObject {
                             after: String?,
                             reloadAfterCompletion: Bool,
                             purpose: APPurpose) {
+        if let generationID = Self.appPurposeGenerationID(purpose),
+           (automaticPostMachine.generationID != generationID ||
+            automaticFinishedGenerations.contains(generationID)) {
+            if Self.appPurposeGenerationID(pendingAP?.purpose ?? .manual) == generationID {
+                pendingAP = nil
+                isAPRunning = false
+            }
+            return
+        }
         let result: String
         if let before, let after {
             if before == after {
@@ -2142,6 +2388,15 @@ final class BrowserViewModel: ObservableObject {
                                  before: String?,
                                  reloadAfterCompletion: Bool,
                                  purpose: APPurpose) {
+        if let generationID = Self.appPurposeGenerationID(purpose),
+           (automaticPostMachine.generationID != generationID ||
+            automaticFinishedGenerations.contains(generationID)) {
+            if Self.appPurposeGenerationID(pendingAP?.purpose ?? .manual) == generationID {
+                pendingAP = nil
+                isAPRunning = false
+            }
+            return
+        }
         showToast("IP確認失敗", kind: .warning)
         let automaticGenerationID: UInt64?
         let apPurpose: String
@@ -2328,7 +2583,26 @@ final class BrowserViewModel: ObservableObject {
                                                   result: "SUCCEEDED")
                 }
             } catch is CancellationError {
-                // A disabled session or newer generation owns cancellation.
+                // Cancellation is normally owned by OFF/newer-generation
+                // cleanup. If the current session is still the owner, the
+                // provider cancelled independently (for example because the
+                // scene/network became unavailable) and must be settled.
+                guard let self,
+                      self.multiThreadSession?.sessionID == sessionID,
+                      self.multiThreadSession?.currentGenerationID == generationID,
+                      self.multiThreadEnabled else { return }
+                self.multiThreadTransitionTask = nil
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "CATALOG",
+                    event: "CATALOG_REFRESH_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "CANCELLED_CURRENT_SESSION")]
+                )
+                self.finishMultiThreadSession(
+                    generationID: generationID,
+                    result: "STOPPED_CATALOG_REFRESH_FAILED"
+                )
             } catch {
                 guard let self,
                       self.multiThreadSession?.sessionID == sessionID,
@@ -2429,12 +2703,16 @@ final class BrowserViewModel: ObservableObject {
 
     private func finishMultiThreadSession(generationID: UInt64?, result: String) {
         let activeGenerationID = generationID ?? automaticPostMachine.generationID
+        let hadSession = multiThreadSession != nil
         let finalLogContext = multiThreadSession.map {
             MultiThreadLogContext(
                 sessionID: $0.sessionID,
                 targetIndex: $0.currentIndex + 1,
                 threadID: $0.currentTargetID
             )
+        }
+        if let activeGenerationID {
+            automaticPostMachine.forceTerminate(generationID: activeGenerationID)
         }
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
@@ -2445,6 +2723,11 @@ final class BrowserViewModel: ObservableObject {
         guard let activeGenerationID,
               automaticPostMachine.generationID == activeGenerationID else {
             clearAutomaticPostDraft()
+            if hadSession {
+                setAutomaticPostStatusWithoutGeneration(
+                    result.hasPrefix("STOPPED") ? .stopped : .completed
+                )
+            }
             updateIdleTimerState()
             return
         }
@@ -2462,6 +2745,12 @@ final class BrowserViewModel: ObservableObject {
                                            generationID: UInt64) {
         guard automaticPostMachine.generationID == generationID else {
             updateIdleTimerState()
+            return
+        }
+        if multiThreadSession?.stopRequested == true,
+           automaticPostMachine.isActive {
+            let stopEffect = automaticPostMachine.stop(.repeatDisabled)
+            handleAutomaticPostEffect(stopEffect, generationID: generationID)
             return
         }
         defer { updateIdleTimerState() }
@@ -2824,7 +3113,8 @@ final class BrowserViewModel: ObservableObject {
             generationID: generationID,
             pageToken: pageToken,
             hasComment: session.comment?.isEmpty == false,
-            hasImage: session.hasImage
+            hasImage: session.hasImage,
+            submissionIDSeed: nextAutomaticSubmissionSeed()
         )
         automaticPostDraft = AutomaticPostDraft(
             hasComment: session.comment?.isEmpty == false,
@@ -3186,6 +3476,10 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private func submitAutomatically(attempt: Int, generationID: UInt64) {
+        if multiThreadSession?.stopRequested == true {
+            stopAutomaticPost(.repeatDisabled, generationID: generationID)
+            return
+        }
         guard automaticPostMachine.generationID == generationID,
               let webView,
               let pageToken = automaticPostMachine.pageToken,
@@ -3247,14 +3541,15 @@ final class BrowserViewModel: ObservableObject {
             guard let self else { return }
             guard self.automaticPostMachine.generationID == generationID,
                   self.automaticPostMachine.currentAttempt == attempt,
-                  self.automaticPostMachine.pageToken == pageToken else {
+                  self.automaticPostMachine.pageToken == pageToken,
+                  self.automaticPostMachine.currentSubmissionID == submissionID else {
                 if let currentGenerationID = self.automaticPostMachine.generationID {
                     self.appendAutomaticEvent(
                         generationID: currentGenerationID,
                         phase: "SUBMIT",
                         event: "CLICK_CALLBACK_IGNORED",
                         result: "IGNORED",
-                        fields: [("REASON", "STALE_GENERATION_OR_ATTEMPT")]
+                        fields: [("REASON", "STALE_GENERATION_ATTEMPT_OR_SUBMISSION")]
                     )
                 }
                 return
@@ -3418,8 +3713,12 @@ final class BrowserViewModel: ObservableObject {
                                      result: String,
                                      multiThreadContext: MultiThreadLogContext? = nil) {
         guard automaticPostMachine.generationID == generationID else { return }
+        guard !automaticFinishedGenerations.contains(generationID) else { return }
+        automaticFinishedGenerations.insert(generationID)
+        automaticPostMachine.forceTerminate(generationID: generationID)
         defer { updateIdleTimerState() }
         automaticPostPreparationTimer?.cancel()
+        automaticPostPreparationTimer = nil
         cancelAutomaticSubmitResponseTimer()
         automaticSubmitReadinessTask?.cancel()
         automaticSubmitReadinessTask = nil
@@ -3429,6 +3728,9 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
+        latestCompactReady = nil
+        pendingHandwritingReady = nil
+        automaticDraftRestorePendingGeneration = nil
         if automaticPostRepeatSession != nil,
            result.hasPrefix("STOPPED") || !sameThreadRepeatEnabled {
             appendAutomaticEvent(
@@ -3470,6 +3772,22 @@ final class BrowserViewModel: ObservableObject {
         logStore.append(action: "Automatic Post", fields: finalFields)
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
+        if pendingUAChangeGeneration == generationID {
+            pendingUAChangeGeneration = nil
+            isUAChanging = false
+        }
+        if automaticReloadGeneration == generationID {
+            automaticReloadGeneration = nil
+        }
+        if pendingCookieRefresh?.automaticGenerationID == generationID {
+            pendingCookieRefresh = nil
+            isCookieRefreshing = false
+        }
+        if let pendingAP,
+           Self.appPurposeGenerationID(pendingAP.purpose) == generationID {
+            self.pendingAP = nil
+            isAPRunning = false
+        }
         automaticPostStatusTask?.cancel()
         automaticPostStatusTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)
@@ -3477,6 +3795,7 @@ final class BrowserViewModel: ObservableObject {
                   !Task.isCancelled,
                   self.automaticPostMachine.generationID == generationID else { return }
             self.automaticPostStatus = nil
+            self.automaticPostStatusTask = nil
         }
         clearAutomaticPostDraft()
     }
@@ -3515,8 +3834,30 @@ final class BrowserViewModel: ObservableObject {
         automaticPostStatus = status
     }
 
+    /// Terminal UI for a multi-thread bootstrap that failed before a page
+    /// generation was created. There is no generation guard to use here, so
+    /// the task is owned solely by the status slot and is cancelled whenever a
+    /// later generation starts.
+    private func setAutomaticPostStatusWithoutGeneration(_ status: AutomaticPostStatus) {
+        automaticPostStatusTask?.cancel()
+        automaticPostStatus = status
+        automaticPostStatusTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.automaticPostStatus = nil
+            self.automaticPostStatusTask = nil
+        }
+    }
+
     private func beginAutomaticGenerationLogging(generationID: UInt64) {
         automaticGenerationStartedAt[generationID] = Date()
+        automaticFinishedGenerations.remove(generationID)
+        // Keep the exactly-once tombstone set bounded while retaining enough
+        // recent generations to reject delayed WebKit callbacks.
+        if automaticFinishedGenerations.count > 64,
+           let oldestFinishedGenerationID = automaticFinishedGenerations.min() {
+            automaticFinishedGenerations.remove(oldestFinishedGenerationID)
+        }
         if automaticGenerationStartedAt.count > 16,
            let oldestGenerationID = automaticGenerationStartedAt.keys.min() {
             automaticGenerationStartedAt.removeValue(forKey: oldestGenerationID)
@@ -3761,6 +4102,7 @@ final class BrowserViewModel: ObservableObject {
         case "COUNTS_MISSING": return "COUNTS_MISSING"
         case "RESTORE_SCRIPT_UNAVAILABLE": return "RESTORE_SCRIPT_UNAVAILABLE"
         case "SUBMISSION_ID_MISSING": return "SUBMISSION_ID_MISSING"
+        case "PAGE_URL_MISMATCH": return "PAGE_URL_MISMATCH"
         default: return "OTHER"
         }
     }
@@ -3835,6 +4177,25 @@ final class BrowserViewModel: ObservableObject {
 
     private static func isTargetThreadURL(_ url: URL?) -> Bool {
         CanvasImageSessionService.isTargetPageThreadURL(url)
+    }
+
+    private static func sameTargetThreadURL(_ lhs: URL?, _ rhs: URL?) -> Bool {
+        guard let lhs, let rhs,
+              isTargetThreadURL(lhs),
+              isTargetThreadURL(rhs) else { return false }
+        return lhs.host?.lowercased() == rhs.host?.lowercased() &&
+            lhs.path == rhs.path
+    }
+
+    private static func appPurposeGenerationID(_ purpose: APPurpose) -> UInt64? {
+        switch purpose {
+        case .manual:
+            return nil
+        case let .identityRefresh(generationID),
+             let .automaticIPRetry(generationID),
+             let .automaticContinuousRetry(generationID):
+            return generationID
+        }
     }
 
     private func finishIdentityRefresh() {

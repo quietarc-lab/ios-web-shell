@@ -159,7 +159,8 @@ struct BrowserWebView: UIViewRepresentable {
                     self.model.handleHandwritingReady(
                         pageToken: pageToken,
                         ready: false,
-                        generationID: preparationGenerationID
+                        generationID: preparationGenerationID,
+                        pageURL: self.attachedWebView?.url
                     )
                 }
 
@@ -184,7 +185,8 @@ struct BrowserWebView: UIViewRepresentable {
                 model.handleHandwritingReady(
                     pageToken: pageToken,
                     ready: ready,
-                    generationID: uint64Value(body["generationID"])
+                    generationID: uint64Value(body["generationID"]),
+                    pageURL: message.frameInfo.request.url ?? attachedWebView?.url
                 )
 
             case "compactReady":
@@ -212,9 +214,12 @@ struct BrowserWebView: UIViewRepresentable {
                     )
                     return
                 }
+                let comment = body["comment"] as? String
                 model.handleCompactReady(pageToken: pageToken,
                                          hasComment: hasComment,
-                                         canSubmit: canSubmit)
+                                         canSubmit: canSubmit,
+                                         comment: comment,
+                                         pageURL: message.frameInfo.request.url ?? attachedWebView?.url)
 
             case "submitReadiness":
                 guard let pageToken else {

@@ -420,6 +420,41 @@ final class AutomaticPostFlowTests: XCTestCase {
         XCTAssertEqual(machine.handle(.postCompleted(generationID: generation)), .none)
     }
 
+    func testSubmissionSeedIsPreservedAsFirstOperationIdentity() throws {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.begin(generationID: generation,
+                          oldPageToken: nil,
+                          hasComment: true,
+                          hasImage: false,
+                          submissionIDSeed: 100)
+        _ = machine.handle(.markAPCompleted(generationID: generation))
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCookieObserved(generationID: generation))
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: true,
+                                              canSubmit: true))
+        _ = submitAfterReadiness(&machine)
+        XCTAssertEqual(try XCTUnwrap(machine.currentSubmissionID), 100)
+    }
+
+    func testForceTerminateInvalidatesLateAutomaticEvents() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let submissionID = try XCTUnwrap(machine.currentSubmissionID)
+        machine.forceTerminate(generationID: generation)
+
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .communicationFailure))
+        XCTAssertFalse(machine.isActive)
+        XCTAssertEqual(machine.handle(.postCompleted(generationID: generation)), .none)
+        XCTAssertEqual(machine.handle(.submitObserved(generationID: generation,
+                                                       submissionID: submissionID)), .none)
+        XCTAssertEqual(machine.handleAlert(.cookieRetryRequired,
+                                           generationID: generation).effect,
+                       .none)
+    }
+
     func testStaleGenerationAndOldPageTokenAreIgnored() {
         var machine = AutomaticPostFlowMachine()
         _ = machine.begin(generationID: generation,
