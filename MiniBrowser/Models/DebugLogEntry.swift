@@ -32,6 +32,7 @@ struct DebugLogEntry: Codable, Identifiable, Equatable {
 
 enum LogSanitizer {
     private static let secretAssignmentPattern = #"(?i)(token|password|passwd|secret|authorization|cookie|session|api[_-]?key)=([^&\s]+)"#
+    private static let alertMessageMaximumLength = 512
 
     static func text(_ value: String) -> String {
         guard let regex = try? NSRegularExpression(pattern: secretAssignmentPattern) else {
@@ -41,6 +42,19 @@ enum LogSanitizer {
         return regex.stringByReplacingMatches(in: value,
                                               range: range,
                                               withTemplate: "$1=[REDACTED]")
+    }
+
+    static func alertMessage(_ value: String) -> String {
+        let singleLine = value
+            .replacingOccurrences(of: "\r\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        let sanitized = text(singleLine)
+        guard sanitized.count > alertMessageMaximumLength else {
+            return sanitized
+        }
+        return String(sanitized.prefix(alertMessageMaximumLength - 1)) + "…"
     }
 
     static func url(_ url: URL?) -> String {

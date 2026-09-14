@@ -149,6 +149,8 @@ Assert-Contains $dialogPolicyFile 'TargetPageAlertClassifier' 'known target-page
 Assert-Contains $dialogPolicyFile 'アクセス規制中です' 'access restriction alert classification'
 Assert-Contains $dialogPolicyFile '連続投稿はもうしばらく時間を置いてからお願い致します' 'continuous-post alert classification'
 Assert-Contains $viewModelFile 'recordTargetPageAlert' 'target-page alert observation'
+Assert-Contains $viewModelFile 'ALERT_MESSAGE' 'target-page alert message diagnostics'
+Assert-Contains $viewModelFile 'handleUnknownJavaScriptAlert\(message:' 'unknown alert message diagnostics'
 Assert-Contains $viewModelFile 'OWN_RESPONSE_CONFIRMED' 'automatic own-response confirmation logging'
 Assert-Contains $viewModelFile 'OWN_RESPONSE_TIMEOUT' 'automatic own-response timeout logging'
 Assert-Contains $viewModelFile 'EVENT_SEQ' 'automatic event ordering metadata'

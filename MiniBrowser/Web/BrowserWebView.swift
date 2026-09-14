@@ -393,12 +393,17 @@ struct BrowserWebView: UIViewRepresentable {
                     .first(where: { ThreadListViewModel.threadID(from: $0) != nil }) {
                     onThreadPostingUnavailable(url)
                 }
-                if model.handleTargetPageAlert(category, host: host) == .autoDismiss {
+                if model.handleTargetPageAlert(category,
+                                                host: host,
+                                                message: message) == .autoDismiss {
                     completeOnce()
                     return
                 }
             } else {
-                model.handleUnknownJavaScriptAlert()
+                let alertURL = frame.request.url ?? webView.url
+                model.handleUnknownJavaScriptAlert(message: message,
+                                                   host: host,
+                                                   url: alertURL)
             }
             let alert = UIAlertController(title: dialogTitle(for: frame, webView: webView),
                                           message: message,

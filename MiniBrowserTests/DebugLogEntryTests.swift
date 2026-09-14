@@ -18,6 +18,18 @@ final class DebugLogEntryTests: XCTestCase {
         XCTAssertTrue(safe.contains("normal=ok"))
     }
 
+    func testAlertMessageIsSingleLineAndRetainsDiagnosticText() {
+        let message = LogSanitizer.alertMessage("未知の\nエラー token=abc123")
+        XCTAssertEqual(message, "未知の\\nエラー token=[REDACTED]")
+        XCTAssertFalse(message.contains("\n"))
+    }
+
+    func testAlertMessageIsBounded() {
+        let message = LogSanitizer.alertMessage(String(repeating: "あ", count: 600))
+        XCTAssertEqual(message.count, 512)
+        XCTAssertTrue(message.hasSuffix("…"))
+    }
+
     func testPlainTextKeepsMillisecondResolutionForAsyncOrdering() {
         let date = Date(timeIntervalSince1970: 1_000_000.123)
         let entry = DebugLogEntry(date: date, action: "Test", fields: [])

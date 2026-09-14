@@ -1063,7 +1063,8 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func handleTargetPageAlert(_ category: TargetPageAlertCategory,
-                               host: String) -> TargetPageAlertDisposition {
+                               host: String,
+                               message: String) -> TargetPageAlertDisposition {
         if category == .accessRestricted,
            let runtimeUserAgent {
             let key = userAgentRestrictionStore.generatedRestrictionKey(
@@ -1086,6 +1087,7 @@ final class BrowserViewModel: ObservableObject {
                 await self?.recordTargetPageAlert(
                     category,
                     host: host,
+                    message: message,
                     automaticGenerationID: nil,
                     logContext: nil,
                     disposition: "SHOWN",
@@ -1122,6 +1124,7 @@ final class BrowserViewModel: ObservableObject {
             await self?.recordTargetPageAlert(
                 category,
                 host: host,
+                message: message,
                 automaticGenerationID: alertGenerationID,
                 logContext: alertContext,
                 disposition: alertDisposition,
@@ -1181,7 +1184,13 @@ final class BrowserViewModel: ObservableObject {
         return .showNormally
     }
 
-    func handleUnknownJavaScriptAlert() {
+    func handleUnknownJavaScriptAlert(message: String,
+                                      host: String?,
+                                      url: URL?) {
+        let isTargetPageAlert = host?.lowercased() == "img.2chan.net"
+        let capturedMessage = isTargetPageAlert
+            ? LogSanitizer.alertMessage(message)
+            : "[NOT_CAPTURED_NON_TARGET_HOST]"
         if let generationID = automaticPostMachine.generationID,
            automaticPostMachine.isActive {
             appendAutomaticEvent(
@@ -1189,8 +1198,25 @@ final class BrowserViewModel: ObservableObject {
                 phase: "ALERT",
                 event: "UNKNOWN_ALERT",
                 result: "STOPPED",
-                fields: [("DISPOSITION", "SHOWN")]
+                fields: [
+                    ("URL", LogSanitizer.url(url)),
+                    ("DOMAIN", host?.lowercased() ?? "(none)"),
+                    ("UA", effectiveUserAgentLogLabel),
+                    ("ALERT_MESSAGE", capturedMessage),
+                    ("DISPOSITION", "SHOWN")
+                ]
             )
+        } else {
+            logStore.append(action: "Site Post Alert", fields: [
+                ("URL", LogSanitizer.url(url)),
+                ("DOMAIN", host?.lowercased() ?? "(none)"),
+                ("UA", effectiveUserAgentLogLabel),
+                ("ALERT_CATEGORY", "UNKNOWN_ALERT"),
+                ("ALERT_MESSAGE", capturedMessage),
+                ("FLOW_MODE", "MANUAL"),
+                ("DISPOSITION", "SHOWN"),
+                ("RESULT", "OBSERVED")
+            ])
         }
         stopAutomaticPost(.unknownAlert, generationID: automaticPostMachine.generationID)
     }
@@ -1201,6 +1227,7 @@ final class BrowserViewModel: ObservableObject {
                                host: String) async {
         await recordTargetPageAlert(category,
                                     host: host,
+                                    message: category.rawValue,
                                     automaticGenerationID: nil,
                                     logContext: nil,
                                     disposition: "SHOWN",
@@ -1215,6 +1242,7 @@ final class BrowserViewModel: ObservableObject {
                                url: URL?) async {
         await recordTargetPageAlert(category,
                                     host: host,
+                                    message: category.rawValue,
                                     automaticGenerationID: automaticGenerationID,
                                     logContext: automaticGenerationID.flatMap {
                                         automaticLogContext(generationID: $0)
@@ -1226,6 +1254,7 @@ final class BrowserViewModel: ObservableObject {
 
     private func recordTargetPageAlert(_ category: TargetPageAlertCategory,
                                        host: String,
+                                       message: String,
                                        automaticGenerationID: UInt64?,
                                        logContext: AutomaticLogContext?,
                                        disposition: String,
@@ -1246,13 +1275,14 @@ final class BrowserViewModel: ObservableObject {
             automaticCookieCountDelta = previousCount.map { relatedCount - $0 }
         }
 
-        // Deliberately record only a known alert category and aggregate counts.
-        // Cookie names, values, and the site-provided message stay out of the log.
+        // Capture only the TargetPage alert text for diagnosis. Cookie names,
+        // values, form contents, and image data remain out of the log.
         var fields = [
             ("URL", LogSanitizer.url(url)),
             ("DOMAIN", normalizedHost),
             ("UA", userAgent),
             ("ALERT_CATEGORY", category.rawValue),
+            ("ALERT_MESSAGE", LogSanitizer.alertMessage(message)),
             ("RELATED_COOKIE_COUNT", String(relatedCount)),
             ("COOKIE_COUNT_DELTA", previousCount.map { String(relatedCount - $0) } ?? "NO_BASELINE"),
             ("COOKIE_SAMPLE_PHASE", "ALERT"),
