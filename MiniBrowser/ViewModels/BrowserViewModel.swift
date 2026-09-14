@@ -311,11 +311,22 @@ final class BrowserViewModel: ObservableObject {
               let draft = automaticPostDraft,
               let webView,
               let pageURL = webView.url,
-              Self.isTargetThreadURL(pageURL),
-              let nextIndex = nextEligibleUserAgentIndex(
-                after: selectedUAIndex,
-                excluding: automaticTriedUAIDs
-              ) else {
+              Self.isTargetThreadURL(pageURL) else {
+            setAutomaticPostStatus(.stopped, generationID: previousGenerationID)
+            finishAutomaticPost(generationID: previousGenerationID,
+                                result: "STOPPED_NO_AVAILABLE_UA")
+            return
+        }
+        guard let nextIndex = nextEligibleUserAgentIndex(
+            after: selectedUAIndex,
+            excluding: automaticTriedUAIDs
+        ) else {
+            appendAutomaticEvent(
+                generationID: previousGenerationID,
+                phase: "FLOW",
+                event: "NO_AVAILABLE_UA",
+                result: "STOPPED"
+            )
             setAutomaticPostStatus(.stopped, generationID: previousGenerationID)
             finishAutomaticPost(generationID: previousGenerationID,
                                 result: "STOPPED_NO_AVAILABLE_UA")
@@ -1117,6 +1128,8 @@ final class BrowserViewModel: ObservableObject {
             alert = .continuousPosting
         case .threadPostingUnavailable:
             alert = .threadPostingUnavailable
+        case .imageCountRestricted:
+            alert = .imageCountRestricted
         }
         let result = automaticPostMachine.handleAlert(alert, generationID: generationID)
         handleAutomaticPostEffect(result.effect, generationID: generationID)
@@ -1179,6 +1192,13 @@ final class BrowserViewModel: ObservableObject {
                 break
             case .threadPostingUnavailable:
                 break
+            case .imageCountRestricted:
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "FLOW",
+                    event: "IMAGE_COUNT_UA_HANDOFF",
+                    result: "NEXT_UA_REQUESTED"
+                )
             }
             return .autoDismiss
         }
@@ -1635,11 +1655,25 @@ final class BrowserViewModel: ObservableObject {
             handleAutomaticPostEffect(effect, generationID: generationID)
         case let .automaticContinuousRetry(generationID):
             guard automaticPostMachine.generationID == generationID else { break }
-            automaticAPResult = after == nil ? "FAILED" : "RECONNECTED"
-            guard after != nil else {
+            let ipChanged = before != nil && after != nil && before != after
+            automaticAPResult = ipChanged ? "RECONNECTED" : "FAILED"
+            guard ipChanged else {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "AP",
+                    event: "CONTINUOUS_AP_RETRY_FAILED",
+                    result: "STOPPED",
+                    fields: [("RESULT", result)]
+                )
                 stopAutomaticPost(.communicationFailure, generationID: generationID)
                 return
             }
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "AP",
+                event: "CONTINUOUS_AP_RETRY_SUCCEEDED",
+                result: "IP_CHANGED"
+            )
             automaticContinuousAPCompletedUptimeNanoseconds =
                 DispatchTime.now().uptimeNanoseconds
             let effect = automaticPostMachine.handle(
@@ -1786,7 +1820,7 @@ final class BrowserViewModel: ObservableObject {
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "AP",
-                event: "CONTINUOUS_RETRY_RECONNECT_REQUESTED",
+                event: "CONTINUOUS_AP_RETRY",
                 result: "STARTED",
                 fields: [("AP_PURPOSE", "AUTOMATIC_CONTINUOUS_RETRY")]
             )

@@ -57,6 +57,20 @@ final class WebDialogPolicyTests: XCTestCase {
             ),
             .threadPostingUnavailable
         )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "画像の投稿が多すぎます(11枚)."
+            ),
+            .imageCountRestricted
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "画像の投稿が多すぎます( 11 枚 )。"
+            ),
+            .imageCountRestricted
+        )
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
             message: "cookieを有効にしてもう一度送信してください"
@@ -92,6 +106,14 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
             message: "このスレッドには書けません"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "img.2chan.net",
+            message: "画像の投稿が多すぎます(11枚). 再試行してください"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "example.com",
+            message: "画像の投稿が多すぎます(11枚)."
         ))
     }
 }

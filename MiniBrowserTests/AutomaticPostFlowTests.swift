@@ -164,6 +164,39 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .stopped(generationID: generation, reason: .unknownAlert))
     }
 
+    func testImageCountRestrictionInSameThreadStartsNextUAFlow() {
+        var machine = sameThreadReadyMachine()
+        let result = machine.handleAlert(.imageCountRestricted,
+                                         generationID: generation)
+
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .startNextAutomaticFlow)
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .imageCountRestricted))
+    }
+
+    func testImageCountRestrictionOutsideSameThreadRemainsNormalAlert() {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let result = machine.handleAlert(.imageCountRestricted,
+                                         generationID: generation)
+
+        XCTAssertFalse(result.autoDismiss)
+        XCTAssertEqual(result.effect, .stopped(.unknownAlert))
+    }
+
+    func testSameThreadContinuousPostingUsesAPImmediately() {
+        var machine = sameThreadReadyMachine()
+        let result = machine.handleAlert(.continuousPosting,
+                                         generationID: generation)
+
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .startContinuousAPReconnect)
+        XCTAssertEqual(machine.state,
+                       .waitingForContinuousAPRetry(generationID: generation,
+                                                     attempt: 1))
+    }
+
     func testFinalContinuousPostingUsesAPOnlyAndFourthAttempt() {
         var machine = readyMachine(hasComment: true, hasImage: false)
         _ = machine.handleAlert(.cookieRetryRequired, generationID: generation)
@@ -386,6 +419,20 @@ final class AutomaticPostFlowTests: XCTestCase {
                                                       pageToken: "page",
                                                       ready: true))
         }
+        _ = submitAfterReadiness(&machine)
+        return machine
+    }
+
+    private func sameThreadReadyMachine() -> AutomaticPostFlowMachine {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.beginSameThreadRepeat(generationID: generation,
+                                           pageToken: "page",
+                                           hasComment: true,
+                                           hasImage: false)
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: true,
+                                              canSubmit: true))
         _ = submitAfterReadiness(&machine)
         return machine
     }

@@ -6,6 +6,7 @@ enum TargetPageAlertCategory: String, Equatable {
     case accessRestricted = "ACCESS_RESTRICTED"
     case continuousPosting = "CONTINUOUS_POSTING"
     case threadPostingUnavailable = "THREAD_POSTING_UNAVAILABLE"
+    case imageCountRestricted = "IMAGE_COUNT_RESTRICTED"
 }
 
 enum TargetPageAlertClassifier {
@@ -36,6 +37,10 @@ enum TargetPageAlertClassifier {
         }
         if normalized == "このスレッドには書けません" {
             return .threadPostingUnavailable
+        }
+        if normalized.range(of: #"^画像の投稿が多すぎます\([0-9]+枚\)[。.]$"#,
+                            options: .regularExpression) != nil {
+            return .imageCountRestricted
         }
         return nil
     }

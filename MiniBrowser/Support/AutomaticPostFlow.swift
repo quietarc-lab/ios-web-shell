@@ -6,6 +6,7 @@ enum AutomaticPostAlert: Equatable {
     case accessRestricted
     case continuousPosting
     case threadPostingUnavailable
+    case imageCountRestricted
 }
 
 enum TargetPageAlertDisposition: Equatable {
@@ -24,6 +25,7 @@ enum AutomaticPostStopReason: Equatable {
     case knownAlertAfterLimit
     case retryLimit
     case repeatDisabled
+    case imageCountRestricted
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {
@@ -104,6 +106,7 @@ struct AutomaticPostFlowMachine {
     private(set) var continuousRetryUsed = false
     private(set) var requiresHandwriting = false
     private(set) var lastAttempt = 0
+    private(set) var isSameThreadRepeat = false
 
     private var stalePageToken: String?
     private var apCompleted = false
@@ -175,6 +178,7 @@ struct AutomaticPostFlowMachine {
         }
 
         self.generationID = generationID
+        isSameThreadRepeat = false
         stalePageToken = oldPageToken
         pageToken = nil
         requiresHandwriting = hasImage
@@ -205,6 +209,7 @@ struct AutomaticPostFlowMachine {
         }
 
         self.generationID = generationID
+        isSameThreadRepeat = true
         stalePageToken = nil
         self.pageToken = pageToken
         requiresHandwriting = hasImage
@@ -356,6 +361,14 @@ struct AutomaticPostFlowMachine {
         case .threadPostingUnavailable:
             return (false, stop(.unknownAlert))
 
+        case .imageCountRestricted:
+            guard isSameThreadRepeat else {
+                return (false, stop(.unknownAlert))
+            }
+            state = .stopped(generationID: generationID,
+                             reason: .imageCountRestricted)
+            return (true, .startNextAutomaticFlow)
+
         case .accessRestricted:
             state = .stopped(generationID: generationID, reason: .accessRestricted)
             return (true, .startNextAutomaticFlow)
@@ -366,7 +379,7 @@ struct AutomaticPostFlowMachine {
                 return (true, stop(.knownAlertAfterLimit))
             }
             continuousRetryUsed = true
-            if attempt == Self.regularAttemptLimit {
+            if isSameThreadRepeat || attempt == Self.regularAttemptLimit {
                 state = .waitingForContinuousAPRetry(generationID: generationID,
                                                      attempt: attempt)
                 return (true, .startContinuousAPReconnect)
@@ -416,6 +429,7 @@ struct AutomaticPostFlowMachine {
         continuousRetryUsed = false
         requiresHandwriting = false
         lastAttempt = 0
+        isSameThreadRepeat = false
         apCompleted = false
         reloadCompleted = false
         cookieObserved = false
