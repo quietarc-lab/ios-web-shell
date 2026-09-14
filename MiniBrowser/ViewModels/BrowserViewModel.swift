@@ -1343,9 +1343,10 @@ final class BrowserViewModel: ObservableObject {
         case .submitting:
             canAcceptVisibleResponse = true
         case .succeeded:
-            // Multi-thread generations intentionally skip the 12-second
-            // visibility watchdog. DOM visibility remains diagnostic after
-            // the site's completion marker, regardless of timer ownership.
+            // Multi-thread and same-thread repeat generations intentionally
+            // skip the 12-second visibility watchdog. DOM visibility remains
+            // diagnostic after the site's completion marker, regardless of
+            // timer ownership.
             canAcceptVisibleResponse = automaticPostAccepted
         case .idle, .preparing, .waitingForSubmitReadiness, .waitingToSubmit,
              .waitingForCookieRetry, .waitingForIPRetry, .waitingForContinuousRetry,
@@ -1389,6 +1390,25 @@ final class BrowserViewModel: ObservableObject {
                     event: "OWN_RESPONSE_CONFIRMED",
                     result: "DIAGNOSTIC_ONLY",
                     fields: [("PAGE_TOKEN_STATE", "MATCH")]
+                )
+                return
+            }
+            // The site completion marker has already scheduled the next
+            // same-thread cycle. Visibility is diagnostic only in this mode;
+            // finalizing here would clear the repeat session and cancel its
+            // delay task before the next generation can start.
+            if let session = automaticPostRepeatSession,
+               sameThreadRepeatEnabled,
+               !session.stopRequested {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "VERIFICATION",
+                    event: "OWN_RESPONSE_CONFIRMED",
+                    result: "DIAGNOSTIC_ONLY",
+                    fields: [
+                        ("PAGE_TOKEN_STATE", "MATCH"),
+                        ("REPEAT_SESSION_ACTIVE", "YES")
+                    ]
                 )
                 return
             }
