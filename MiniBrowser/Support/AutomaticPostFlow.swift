@@ -139,6 +139,25 @@ struct AutomaticPostFlowMachine {
         }
     }
 
+    /// Diagnostic-only readiness flags. The values deliberately contain no
+    /// page content, Cookie data, image data, or page token.
+    var preparationDiagnosticFields: [(String, String)] {
+        let flags: [(String, Bool)] = [
+            ("AP_READY", apCompleted),
+            ("RELOAD_READY", reloadCompleted),
+            ("COOKIE_READY", cookieObserved),
+            ("COMPACT_READY", compactReady),
+            ("HANDWRITING_READY", handwritingReady)
+        ]
+        let missing = flags
+            .filter { !$0.1 }
+            .map { $0.0 }
+            .joined(separator: ",")
+        return flags.map { ($0.0, $0.1 ? "YES" : "NO") } + [
+            ("MISSING_STAGES", missing.isEmpty ? "NONE" : missing)
+        ]
+    }
+
     func isStalePageToken(_ token: String) -> Bool {
         guard let stalePageToken,
               pageToken == nil else { return false }

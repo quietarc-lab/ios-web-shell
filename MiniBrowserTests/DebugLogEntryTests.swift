@@ -24,4 +24,20 @@ final class DebugLogEntryTests: XCTestCase {
         XCTAssertTrue(entry.plainText.range(of: #"\d{2}:\d{2}:\d{2}\.\d{3}"#,
                                             options: .regularExpression) != nil)
     }
+
+    @MainActor
+    func testDebugLogStoreRetainsNewestEntriesWithinCapacity() {
+        let suiteName = "DebugLogEntryTests.capacity.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = DebugLogStore(defaults: defaults, capacity: 2)
+        store.append(action: "First", fields: [])
+        store.append(action: "Second", fields: [])
+        store.append(action: "Third", fields: [])
+
+        XCTAssertEqual(store.entries.map(\.action), ["Second", "Third"])
+        XCTAssertTrue(store.plainText(limit: 1).contains("ACTION: Third"))
+        XCTAssertFalse(store.plainText(limit: 1).contains("Second"))
+    }
 }

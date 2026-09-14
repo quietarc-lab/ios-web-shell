@@ -35,6 +35,33 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .submitting(generationID: generation, attempt: 1))
     }
 
+    func testPreparationDiagnosticsIdentifyMissingStagesWithoutContent() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.begin(generationID: generation,
+                          oldPageToken: nil,
+                          hasComment: true,
+                          hasImage: true)
+
+        let initial = Dictionary(uniqueKeysWithValues: machine.preparationDiagnosticFields)
+        XCTAssertEqual(initial["AP_READY"], "NO")
+        XCTAssertEqual(initial["RELOAD_READY"], "NO")
+        XCTAssertEqual(initial["COOKIE_READY"], "NO")
+        XCTAssertEqual(initial["COMPACT_READY"], "NO")
+        XCTAssertEqual(initial["HANDWRITING_READY"], "NO")
+        XCTAssertTrue(initial["MISSING_STAGES"]?.contains("AP_READY") == true)
+        XCTAssertFalse(initial.keys.contains("COMMENT"))
+
+        _ = machine.handle(.markAPCompleted(generationID: generation))
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCookieObserved(generationID: generation))
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: true,
+                                              canSubmit: true))
+        let beforeImage = Dictionary(uniqueKeysWithValues: machine.preparationDiagnosticFields)
+        XCTAssertEqual(beforeImage["MISSING_STAGES"], "HANDWRITING_READY")
+    }
+
     func testReadinessRequiresStableReadySignal() {
         var machine = readyForReadinessMachine()
         XCTAssertEqual(machine.handle(.submitReadinessObserved(

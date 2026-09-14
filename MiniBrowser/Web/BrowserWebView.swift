@@ -108,8 +108,20 @@ struct BrowserWebView: UIViewRepresentable {
 
             switch type {
             case "selectedImage":
-                guard let dataURL = body["dataURL"] as? String else { return }
-                _ = handwritingImageStore.replace(withDataURL: dataURL)
+                guard let dataURL = body["dataURL"] as? String else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "DATA_URL_MISSING"
+                    )
+                    return
+                }
+                guard handwritingImageStore.replace(withDataURL: dataURL) else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "DATA_URL_REJECTED"
+                    )
+                    return
+                }
                 model.setHandwritingImageAvailable(handwritingImageStore.hasImage)
 
             case "pageReady":
@@ -135,7 +147,13 @@ struct BrowserWebView: UIViewRepresentable {
                 )
                 guard let script = handwritingImageStore.restorationScript(
                     generationID: preparationGenerationID
-                ) else { return }
+                ) else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "RESTORE_SCRIPT_UNAVAILABLE"
+                    )
+                    return
+                }
                 attachedWebView?.evaluateJavaScript(script) { [weak self] _, error in
                     guard let self, error != nil else { return }
                     self.model.handleHandwritingReady(
@@ -156,7 +174,13 @@ struct BrowserWebView: UIViewRepresentable {
                                                         reason: "CURRENT_PAGE_TOKEN_MISMATCH")
                     return
                 }
-                guard let ready = body["ready"] as? Bool else { return }
+                guard let ready = body["ready"] as? Bool else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "READY_MISSING"
+                    )
+                    return
+                }
                 model.handleHandwritingReady(
                     pageToken: pageToken,
                     ready: ready,
@@ -174,18 +198,44 @@ struct BrowserWebView: UIViewRepresentable {
                                                         reason: "CURRENT_PAGE_TOKEN_MISMATCH")
                     return
                 }
-                guard let hasComment = body["hasComment"] as? Bool,
-                      let canSubmit = body["canSubmit"] as? Bool else { return }
+                guard let hasComment = body["hasComment"] as? Bool else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "HAS_COMMENT_MISSING"
+                    )
+                    return
+                }
+                guard let canSubmit = body["canSubmit"] as? Bool else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "CAN_SUBMIT_MISSING"
+                    )
+                    return
+                }
                 model.handleCompactReady(pageToken: pageToken,
                                          hasComment: hasComment,
                                          canSubmit: canSubmit)
 
             case "submitReadiness":
-                guard let pageToken,
-                      let ready = body["ready"] as? Bool,
-                      let reason = body["reason"] as? String else {
-                    model.recordAutomaticBridgeIgnored(type: type,
-                                                        reason: "INVALID_PAYLOAD")
+                guard let pageToken else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "PAGE_TOKEN_MISSING"
+                    )
+                    return
+                }
+                guard let ready = body["ready"] as? Bool else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "READY_MISSING"
+                    )
+                    return
+                }
+                guard let reason = body["reason"] as? String else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "REASON_MISSING"
+                    )
                     return
                 }
                 model.handleSubmitReadiness(pageToken: pageToken,
@@ -214,7 +264,13 @@ struct BrowserWebView: UIViewRepresentable {
                 guard let matchedCount,
                       let pendingCount,
                       let responseCount,
-                      let newResponseCount else { return }
+                      let newResponseCount else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "COUNTS_MISSING"
+                    )
+                    return
+                }
                 model.handleOwnPostVisible(
                     pageToken: pageToken,
                     matchedCount: matchedCount,
@@ -237,7 +293,13 @@ struct BrowserWebView: UIViewRepresentable {
                 guard let pendingCount,
                       let responseCount,
                       let newResponseCount,
-                      let matchedCount else { return }
+                      let matchedCount else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "COUNTS_MISSING"
+                    )
+                    return
+                }
                 model.handleOwnPostObservation(
                     pageToken: pageToken,
                     pendingCount: pendingCount,
@@ -248,6 +310,7 @@ struct BrowserWebView: UIViewRepresentable {
                 )
 
             default:
+                model.recordAutomaticUnknownBridgeMessage()
                 return
             }
         }

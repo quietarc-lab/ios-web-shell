@@ -58,6 +58,7 @@ final class BrowserViewModel: ObservableObject {
     private var automaticSubmitReadinessStableSince: Date?
     private var automaticSubmitReadinessDeadline: Date?
     private var automaticSubmitReadinessLastReason: String?
+    private var automaticSubmitReadinessFalseLogged = false
     private var automaticSubmitReadinessReason: AutomaticPostReadinessReason?
     private var automaticContinuousAPCompletedUptimeNanoseconds: UInt64?
     private var handwritingImageAvailable = false
@@ -354,7 +355,8 @@ final class BrowserViewModel: ObservableObject {
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
         setAutomaticPostStatus(.completed, generationID: generationID)
-        finishAutomaticPost(generationID: generationID, result: "SUCCEEDED")
+        finishAutomaticPost(generationID: generationID,
+                            result: "STOPPED_REPEAT_DISABLED")
     }
 
     func refreshCookies() {
@@ -443,6 +445,7 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessDeadline = nil
         automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
         automaticPostStatusTask?.cancel()
@@ -749,12 +752,16 @@ final class BrowserViewModel: ObservableObject {
             )
             return
         }
+        var handwritingFields = [("PAGE_TOKEN_STATE", "MATCH")]
+        if !ready {
+            handwritingFields.append(("FAILURE_REASON", "PAYLOAD_NOT_READY"))
+        }
         appendAutomaticEvent(
             generationID: generationID,
             phase: "PREPARATION",
             event: "HANDWRITING_READY",
             result: ready ? "ACCEPTED" : "FAILED",
-            fields: [("PAGE_TOKEN_STATE", "MATCH")]
+            fields: handwritingFields
         )
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
@@ -776,7 +783,23 @@ final class BrowserViewModel: ObservableObject {
         guard automaticPostMachine.isActive,
               let generationID = automaticPostMachine.generationID,
               let pageToken,
-              automaticPostMachine.pageToken == pageToken else { return }
+              automaticPostMachine.pageToken == pageToken else {
+            if let generationID = automaticPostMachine.generationID,
+               let statusName = Self.safePostStatusName(rawStatus),
+               !automaticPostMachine.isActive {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "BRIDGE",
+                    event: "POST_STATUS_IGNORED",
+                    result: "IGNORED",
+                    fields: [
+                        ("REASON", "FLOW_NOT_ACTIVE"),
+                        ("STATUS", statusName)
+                    ]
+                )
+            }
+            return
+        }
         let statusName: String
         if rawStatus == SitePostStatus.sending.rawValue {
             statusName = "SENDING"
@@ -807,8 +830,27 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func handlePostCompleted(pageToken: String?) {
-        guard automaticPostMachine.isActive,
-              let generationID = automaticPostMachine.generationID else { return }
+        guard let generationID = automaticPostMachine.generationID else { return }
+        guard automaticPostMachine.isActive else {
+            let tokenState: String
+            if let pageToken {
+                tokenState = automaticPostMachine.pageToken == pageToken
+                    ? "MATCH" : "STALE_OR_MISMATCH"
+            } else {
+                tokenState = "MISSING"
+            }
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "BRIDGE",
+                event: "POST_COMPLETED_IGNORED",
+                result: "IGNORED",
+                fields: [
+                    ("REASON", "FLOW_NOT_ACTIVE"),
+                    ("PAGE_TOKEN_STATE", tokenState)
+                ]
+            )
+            return
+        }
         guard let pageToken else {
             recordAutomaticBridgeIgnored(type: "postCompleted",
                                           reason: "MISSING_PAGE_TOKEN")
@@ -1770,6 +1812,7 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessTask?.cancel()
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = reason
         appendAutomaticEvent(
             generationID: generationID,
@@ -1817,7 +1860,7 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         webView.evaluateJavaScript(CompactPageModeService.submitReadinessScript) {
-            [weak self] _, error in
+            [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self,
                       !Task.isCancelled,
@@ -1840,6 +1883,38 @@ final class BrowserViewModel: ObservableObject {
                             ("REASON", reason.rawValue),
                             ("ERROR_DOMAIN", nsError.domain),
                             ("ERROR_CODE", String(nsError.code))
+                        ]
+                    )
+                }
+                let javascriptResult = Self.javascriptBoolean(result)
+                if error == nil,
+                   javascriptResult == false,
+                   !self.automaticSubmitReadinessFalseLogged {
+                    self.automaticSubmitReadinessFalseLogged = true
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "READINESS",
+                        event: "EVALUATION_FALSE",
+                        result: "RETRYING",
+                        fields: [
+                            ("ATTEMPT", String(attempt)),
+                            ("REASON", self.automaticSubmitReadinessLastReason ?? reason.rawValue),
+                            ("STAGE", "SUBMIT_READINESS")
+                        ]
+                    )
+                } else if error == nil,
+                          javascriptResult == nil,
+                          !self.automaticSubmitReadinessFalseLogged {
+                    self.automaticSubmitReadinessFalseLogged = true
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "READINESS",
+                        event: "EVALUATION_RESULT_INVALID",
+                        result: "RETRYING",
+                        fields: [
+                            ("ATTEMPT", String(attempt)),
+                            ("REASON", reason.rawValue),
+                            ("STAGE", "SUBMIT_READINESS")
                         ]
                     )
                 }
@@ -1921,8 +1996,6 @@ final class BrowserViewModel: ObservableObject {
             event: "REPEAT_SCHEDULED",
             result: "SCHEDULED",
             fields: [
-                ("SESSION_ID", String(session.sessionID)),
-                ("CYCLE", String(session.cycle)),
                 ("DELAY_MS", String(Self.sameThreadRepeatMinimumDelayNanoseconds / 1_000_000))
             ]
         )
@@ -1987,6 +2060,7 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessDeadline = nil
         automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
         setAutomaticPostStatus(.waitingForRepeat, generationID: generationID)
@@ -1999,6 +2073,16 @@ final class BrowserViewModel: ObservableObject {
         guard let restoreScript = CompactPageModeService.restoreAutomaticDraftScript(
             comment: session.comment ?? ""
         ) else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "REPEAT",
+                event: "REPEAT_PREPARATION_FAILED",
+                result: "STOPPED",
+                fields: [
+                    ("PATH", "COMMENT_RESTORE"),
+                    ("FAILURE_REASON", "SCRIPT_UNAVAILABLE")
+                ]
+            )
             stopAutomaticPost(.communicationFailure, generationID: generationID)
             return
         }
@@ -2007,8 +2091,26 @@ final class BrowserViewModel: ObservableObject {
                 guard let self,
                       self.automaticPostMachine.generationID == generationID,
                       case .preparing = self.automaticPostMachine.state else { return }
-                guard error == nil,
-                      (result as? Bool) ?? false else {
+                let didRestore = Self.javascriptBoolean(result) ?? false
+                guard error == nil, didRestore else {
+                    var fields = [
+                        ("PATH", "COMMENT_RESTORE"),
+                        ("JS_RESULT", didRestore ? "TRUE" : "FALSE")
+                    ]
+                    if let error {
+                        let nsError = error as NSError
+                        fields.append(("ERROR_DOMAIN", nsError.domain))
+                        fields.append(("ERROR_CODE", String(nsError.code)))
+                    } else {
+                        fields.append(("FAILURE_REASON", "JS_RETURNED_FALSE"))
+                    }
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "REPEAT",
+                        event: "REPEAT_PREPARATION_FAILED",
+                        result: "STOPPED",
+                        fields: fields
+                    )
                     self.stopAutomaticPost(.preparationFailed, generationID: generationID)
                     return
                 }
@@ -2029,25 +2131,78 @@ final class BrowserViewModel: ObservableObject {
                       self.automaticPostMachine.generationID == generationID,
                       case .preparing = self.automaticPostMachine.state else { return }
                 guard error == nil else {
+                    var fields = [("PATH", "CANVAS_VISIBILITY")]
+                    if let error {
+                        let nsError = error as NSError
+                        fields.append(("ERROR_DOMAIN", nsError.domain))
+                        fields.append(("ERROR_CODE", String(nsError.code)))
+                    }
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "REPEAT",
+                        event: "REPEAT_IMAGE_PREPARATION_FAILED",
+                        result: "STOPPED",
+                        fields: fields
+                    )
                     self.stopAutomaticPost(.communicationFailure, generationID: generationID)
                     return
                 }
                 let state = result as? [String: Any]
                 let exists = (state?["exists"] as? Bool) ?? false
                 let visible = (state?["visible"] as? Bool) ?? false
+                if state?["exists"] as? Bool == nil ||
+                    state?["visible"] as? Bool == nil {
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "REPEAT",
+                        event: "REPEAT_IMAGE_PREPARATION_RESULT_INVALID",
+                        result: "RETRYING",
+                        fields: [
+                            ("PATH", "CANVAS_VISIBILITY"),
+                            ("JS_RESULT", "INVALID")
+                        ]
+                    )
+                }
                 if visible {
                     self.runRepeatCanvasUpdate(generationID: generationID,
                                                webView: webView)
                 } else {
                     webView.evaluateJavaScript(
                         CanvasImageSessionService.openExistingCanvasScript
-                    ) { [weak self] _, error in
+                    ) { [weak self] result, error in
                         Task { @MainActor [weak self] in
                             guard let self,
                                   self.automaticPostMachine.generationID == generationID,
                                   case .preparing = self.automaticPostMachine.state else { return }
-                            if error != nil {
+                            if let error {
+                                var fields = [(
+                                    "PATH", "CANVAS_OPEN"
+                                )]
+                                let nsError = error as NSError
+                                fields.append(("ERROR_DOMAIN", nsError.domain))
+                                fields.append(("ERROR_CODE", String(nsError.code)))
+                                self.appendAutomaticEvent(
+                                    generationID: generationID,
+                                    phase: "REPEAT",
+                                    event: "REPEAT_IMAGE_PREPARATION_FAILED",
+                                    result: "STOPPED",
+                                    fields: fields
+                                )
                                 self.stopAutomaticPost(.communicationFailure,
+                                                        generationID: generationID)
+                            } else if Self.javascriptBoolean(result) == false {
+                                self.appendAutomaticEvent(
+                                    generationID: generationID,
+                                    phase: "REPEAT",
+                                    event: "REPEAT_IMAGE_PREPARATION_FAILED",
+                                    result: "STOPPED",
+                                    fields: [
+                                        ("PATH", "CANVAS_OPEN"),
+                                        ("JS_RESULT", "FALSE"),
+                                        ("FAILURE_REASON", "JS_RETURNED_FALSE")
+                                    ]
+                                )
+                                self.stopAutomaticPost(.preparationFailed,
                                                         generationID: generationID)
                             } else if exists {
                                 self.waitForRepeatCanvasVisibility(
@@ -2067,8 +2222,20 @@ final class BrowserViewModel: ObservableObject {
                                                webView: WKWebView,
                                                attempt: Int) {
         guard automaticPostMachine.generationID == generationID,
-              case .preparing = automaticPostMachine.state,
-              attempt < 50 else { return }
+              case .preparing = automaticPostMachine.state else { return }
+        guard attempt < 50 else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "REPEAT",
+                event: "REPEAT_IMAGE_CANVAS_VISIBILITY_TIMEOUT",
+                result: "WAITING_FOR_PREPARATION_TIMEOUT",
+                fields: [
+                    ("PATH", "CANVAS_VISIBILITY"),
+                    ("ATTEMPTS", "50")
+                ]
+            )
+            return
+        }
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard let self,
@@ -2082,11 +2249,36 @@ final class BrowserViewModel: ObservableObject {
                           self.automaticPostMachine.generationID == generationID,
                           case .preparing = self.automaticPostMachine.state else { return }
                     guard error == nil else {
+                        var fields = [("PATH", "CANVAS_VISIBILITY")]
+                        if let error {
+                            let nsError = error as NSError
+                            fields.append(("ERROR_DOMAIN", nsError.domain))
+                            fields.append(("ERROR_CODE", String(nsError.code)))
+                        }
+                        self.appendAutomaticEvent(
+                            generationID: generationID,
+                            phase: "REPEAT",
+                            event: "REPEAT_IMAGE_PREPARATION_FAILED",
+                            result: "STOPPED",
+                            fields: fields
+                        )
                         self.stopAutomaticPost(.communicationFailure,
                                                 generationID: generationID)
                         return
                     }
                     let state = result as? [String: Any]
+                    if state?["visible"] as? Bool == nil {
+                        self.appendAutomaticEvent(
+                            generationID: generationID,
+                            phase: "REPEAT",
+                            event: "REPEAT_IMAGE_PREPARATION_RESULT_INVALID",
+                            result: "RETRYING",
+                            fields: [
+                                ("PATH", "CANVAS_VISIBILITY"),
+                                ("JS_RESULT", "INVALID")
+                            ]
+                        )
+                    }
                     if (state?["visible"] as? Bool) == true {
                         self.runRepeatCanvasUpdate(generationID: generationID,
                                                    webView: webView)
@@ -2107,13 +2299,42 @@ final class BrowserViewModel: ObservableObject {
               case .preparing = automaticPostMachine.state else { return }
         webView.evaluateJavaScript(
             CompactPageModeService.repeatCanvasUpdateScript(generationID: generationID)
-        ) { [weak self] _, error in
+        ) { [weak self] result, error in
             Task { @MainActor [weak self] in
                 guard let self,
                       self.automaticPostMachine.generationID == generationID,
                       case .preparing = self.automaticPostMachine.state else { return }
-                if error != nil {
+                let didStart = Self.javascriptBoolean(result)
+                if let error {
+                    var fields = [
+                        ("PATH", "CANVAS_UPDATE"),
+                        ("JS_RESULT", didStart == true ? "TRUE" : "INVALID")
+                    ]
+                    let nsError = error as NSError
+                    fields.append(("ERROR_DOMAIN", nsError.domain))
+                    fields.append(("ERROR_CODE", String(nsError.code)))
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "REPEAT",
+                        event: "REPEAT_IMAGE_PREPARATION_FAILED",
+                        result: "STOPPED",
+                        fields: fields
+                    )
                     self.stopAutomaticPost(.communicationFailure,
+                                            generationID: generationID)
+                } else if didStart == false {
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "REPEAT",
+                        event: "REPEAT_IMAGE_PREPARATION_FAILED",
+                        result: "STOPPED",
+                        fields: [
+                            ("PATH", "CANVAS_UPDATE"),
+                            ("JS_RESULT", "FALSE"),
+                            ("FAILURE_REASON", "JS_RETURNED_FALSE")
+                        ]
+                    )
+                    self.stopAutomaticPost(.preparationFailed,
                                             generationID: generationID)
                 }
             }
@@ -2245,7 +2466,7 @@ final class BrowserViewModel: ObservableObject {
                 )
                 return
             }
-            let didClick = (result as? Bool) ?? false
+            let didClick = Self.javascriptBoolean(result) ?? false
             var callbackFields = [
                 ("ATTEMPT", String(attempt)),
                 ("JS_RESULT", didClick && error == nil ? "CLICKED" : "FAILED")
@@ -2254,6 +2475,9 @@ final class BrowserViewModel: ObservableObject {
                 let nsError = error as NSError
                 callbackFields.append(("ERROR_DOMAIN", nsError.domain))
                 callbackFields.append(("ERROR_CODE", String(nsError.code)))
+                callbackFields.append(("FAILURE_REASON", "EVALUATION_ERROR"))
+            } else if !didClick {
+                callbackFields.append(("FAILURE_REASON", "JS_RETURNED_FALSE"))
             }
             self.appendAutomaticEvent(
                 generationID: generationID,
@@ -2280,6 +2504,13 @@ final class BrowserViewModel: ObservableObject {
                   !Task.isCancelled,
                   self.automaticPostMachine.generationID == generationID,
                   case .preparing = self.automaticPostMachine.state else { return }
+            self.appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "PREPARATION_TIMEOUT",
+                result: "STOPPED",
+                fields: self.automaticPostMachine.preparationDiagnosticFields
+            )
             let effect = self.automaticPostMachine.handle(
                 .fail(generationID: generationID, reason: .preparationTimeout)
             )
@@ -2306,9 +2537,10 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessDeadline = nil
         automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
-        if let session = automaticPostRepeatSession,
+        if automaticPostRepeatSession != nil,
            result.hasPrefix("STOPPED") || !sameThreadRepeatEnabled {
             appendAutomaticEvent(
                 generationID: generationID,
@@ -2316,8 +2548,6 @@ final class BrowserViewModel: ObservableObject {
                 event: "REPEAT_STOPPED",
                 result: "STOPPED",
                 fields: [
-                    ("SESSION_ID", String(session.sessionID)),
-                    ("CYCLE", String(session.cycle)),
                     ("STOP_REASON", result)
                 ]
             )
@@ -2411,6 +2641,11 @@ final class BrowserViewModel: ObservableObject {
         if let result {
             fields.append(("EVENT_RESULT", result))
         }
+        if let session = automaticPostRepeatSession,
+           automaticPostMachine.generationID == context.generationID {
+            fields.append(("SESSION_ID", String(session.sessionID)))
+            fields.append(("CYCLE", String(session.cycle)))
+        }
         return fields
     }
 
@@ -2441,6 +2676,33 @@ final class BrowserViewModel: ObservableObject {
         )
     }
 
+    func recordAutomaticBridgeInvalidPayload(type: String, reason: String) {
+        guard automaticPostMachine.isActive,
+              let generationID = automaticPostMachine.generationID else { return }
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "BRIDGE",
+            event: "BRIDGE_PAYLOAD_INVALID",
+            result: "IGNORED",
+            fields: [
+                ("BRIDGE_TYPE", Self.safeBridgeEventName(type)),
+                ("REASON", Self.safeBridgePayloadReason(reason))
+            ]
+        )
+    }
+
+    func recordAutomaticUnknownBridgeMessage() {
+        guard automaticPostMachine.isActive,
+              let generationID = automaticPostMachine.generationID else { return }
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "BRIDGE",
+            event: "UNKNOWN_BRIDGE_MESSAGE",
+            result: "IGNORED",
+            fields: [("REASON", "UNSUPPORTED_TYPE")]
+        )
+    }
+
     private func recordAutomaticPostAccepted(generationID: UInt64,
                                              pageToken: String,
                                              source: String) {
@@ -2451,6 +2713,17 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         guard case .submitting = automaticPostMachine.state else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "SUBMIT",
+                event: "POST_ACCEPTED_IGNORED",
+                result: "IGNORED",
+                fields: [
+                    ("PAGE_TOKEN_STATE", "MATCH"),
+                    ("REASON", "STATE_NOT_SUBMITTING"),
+                    ("SOURCE", Self.safePostAcceptanceSource(source))
+                ]
+            )
             return
         }
         if automaticPostAccepted {
@@ -2516,6 +2789,9 @@ final class BrowserViewModel: ObservableObject {
 
     private static func safeBridgeEventName(_ type: String) -> String {
         switch type {
+        case "selectedImage": return "SELECTED_IMAGE"
+        case "pageReady": return "PAGE_READY"
+        case "canvasReady": return "CANVAS_READY"
         case "compactReady": return "COMPACT_READY"
         case "handwritingReady": return "HANDWRITING_READY"
         case "postStatus": return "POST_STATUS"
@@ -2524,6 +2800,21 @@ final class BrowserViewModel: ObservableObject {
         case "ownPostVisible": return "OWN_POST_VISIBLE"
         case "ownPostObservation": return "OWN_POST_OBSERVATION"
         default: return "OTHER_BRIDGE_EVENT"
+        }
+    }
+
+    private static func safeBridgePayloadReason(_ reason: String) -> String {
+        switch reason {
+        case "DATA_URL_MISSING": return "DATA_URL_MISSING"
+        case "DATA_URL_REJECTED": return "DATA_URL_REJECTED"
+        case "READY_MISSING": return "READY_MISSING"
+        case "PAGE_TOKEN_MISSING": return "PAGE_TOKEN_MISSING"
+        case "REASON_MISSING": return "REASON_MISSING"
+        case "HAS_COMMENT_MISSING": return "HAS_COMMENT_MISSING"
+        case "CAN_SUBMIT_MISSING": return "CAN_SUBMIT_MISSING"
+        case "COUNTS_MISSING": return "COUNTS_MISSING"
+        case "RESTORE_SCRIPT_UNAVAILABLE": return "RESTORE_SCRIPT_UNAVAILABLE"
+        default: return "OTHER"
         }
     }
 
@@ -2549,6 +2840,14 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    private static func safePostStatusName(_ rawStatus: String?) -> String? {
+        switch rawStatus {
+        case "…": return "SENDING"
+        case "完了": return "COMPLETED"
+        default: return nil
+        }
+    }
+
     private static func safeMatchMethod(_ method: String?) -> String {
         switch method {
         case "COMMENT_NORMALIZED": return "COMMENT_NORMALIZED"
@@ -2557,6 +2856,16 @@ final class BrowserViewModel: ObservableObject {
         case "DEFAULT_IMAGE_COMMENT": return "DEFAULT_IMAGE_COMMENT"
         default: return "NONE"
         }
+    }
+
+    private static func javascriptBoolean(_ value: Any?) -> Bool? {
+        if let value = value as? Bool {
+            return value
+        }
+        if let value = value as? NSNumber {
+            return value.boolValue
+        }
+        return nil
     }
 
     private static func postState(from result: Any?) -> (hasComment: Bool,
