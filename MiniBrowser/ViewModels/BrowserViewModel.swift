@@ -1247,6 +1247,8 @@ final class BrowserViewModel: ObservableObject {
             alert = .accessRestricted
         case .continuousPosting:
             alert = .continuousPosting
+        case .imageContinuousPosting:
+            alert = .imageContinuousPosting
         case .threadPostingUnavailable:
             alert = .threadPostingUnavailable
         case .imageCountRestricted:
@@ -1318,6 +1320,13 @@ final class BrowserViewModel: ObservableObject {
                     generationID: generationID,
                     phase: "FLOW",
                     event: "IMAGE_COUNT_UA_HANDOFF",
+                    result: "NEXT_UA_REQUESTED"
+                )
+            case .imageContinuousPosting:
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "FLOW",
+                    event: "IMAGE_CONTINUOUS_UA_HANDOFF",
                     result: "NEXT_UA_REQUESTED"
                 )
             }

@@ -5,6 +5,7 @@ enum AutomaticPostAlert: Equatable {
     case imagePostingRestricted
     case accessRestricted
     case continuousPosting
+    case imageContinuousPosting
     case threadPostingUnavailable
     case imageCountRestricted
 }
@@ -447,7 +448,7 @@ struct AutomaticPostFlowMachine {
         case .threadPostingUnavailable:
             return (false, stop(.unknownAlert))
 
-        case .imageCountRestricted:
+        case .imageCountRestricted, .imageContinuousPosting:
             guard isSameThreadRepeat else {
                 return (false, stop(.unknownAlert))
             }

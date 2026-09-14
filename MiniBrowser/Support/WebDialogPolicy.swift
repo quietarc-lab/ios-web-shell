@@ -5,6 +5,7 @@ enum TargetPageAlertCategory: String, Equatable {
     case imagePostingRestricted = "IMAGE_POSTING_RESTRICTED"
     case accessRestricted = "ACCESS_RESTRICTED"
     case continuousPosting = "CONTINUOUS_POSTING"
+    case imageContinuousPosting = "IMAGE_CONTINUOUS_POSTING"
     case threadPostingUnavailable = "THREAD_POSTING_UNAVAILABLE"
     case imageCountRestricted = "IMAGE_COUNT_RESTRICTED"
 }
@@ -34,6 +35,13 @@ enum TargetPageAlertClassifier {
         }
         if normalized == "連続投稿はもうしばらく時間を置いてからお願い致します。" {
             return .continuousPosting
+        }
+        // The image-posting form uses a distinct, exact wording for the same
+        // continuous-posting limit. Keep both observed punctuation variants
+        // explicit so nearby or embellished messages remain unknown alerts.
+        if normalized == "画像連続投稿はもうしばらく時間を置いてからお願い致します" ||
+            normalized == "画像連続投稿はもうしばらく時間を置いてからお願い致します。" {
+            return .imageContinuousPosting
         }
         if normalized == "このスレッドには書けません" {
             return .threadPostingUnavailable

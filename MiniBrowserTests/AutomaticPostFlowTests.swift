@@ -314,6 +314,27 @@ final class AutomaticPostFlowTests: XCTestCase {
         XCTAssertEqual(result.effect, .stopped(.unknownAlert))
     }
 
+    func testImageContinuousRestrictionInSameThreadStartsNextUAFlow() {
+        var machine = sameThreadReadyMachine()
+        let result = machine.handleAlert(.imageContinuousPosting,
+                                         generationID: generation)
+
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .startNextAutomaticFlow)
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .imageCountRestricted))
+    }
+
+    func testImageContinuousRestrictionOutsideSameThreadRemainsNormalAlert() {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let result = machine.handleAlert(.imageContinuousPosting,
+                                         generationID: generation)
+
+        XCTAssertFalse(result.autoDismiss)
+        XCTAssertEqual(result.effect, .stopped(.unknownAlert))
+    }
+
     func testSameThreadContinuousPostingUsesAPImmediately() {
         var machine = sameThreadReadyMachine()
         let result = machine.handleAlert(.continuousPosting,

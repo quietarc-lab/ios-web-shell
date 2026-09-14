@@ -53,6 +53,20 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertEqual(
             TargetPageAlertClassifier.category(
                 host: "img.2chan.net",
+                message: "画像連続投稿はもうしばらく\n時間を置いてからお願い致します"
+            ),
+            .imageContinuousPosting
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "画像連続投稿はもうしばらく時間を置いてからお願い致します。"
+            ),
+            .imageContinuousPosting
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
                 message: "このスレッドには\n書けません"
             ),
             .threadPostingUnavailable
@@ -110,6 +124,14 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "img.2chan.net",
             message: "画像の投稿が多すぎます(11枚). 再試行してください"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "img.2chan.net",
+            message: "画像連続投稿はもうしばらく時間を置いてからお願い致します（再試行）"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "example.com",
+            message: "画像連続投稿はもうしばらく時間を置いてからお願い致します"
         ))
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
