@@ -6,9 +6,9 @@ struct ThreadListView: View {
     let onOpenThread: (URL) -> Void
     let sameThreadRepeatEnabled: Bool
     let onToggleSameThreadRepeat: () -> Void
-    let multiThreadEnabled: Bool = false
-    let multiThreadSessionActive: Bool = false
-    let onToggleMultiThread: () -> Void = {}
+    let multiThreadEnabled: Bool
+    let multiThreadSessionActive: Bool
+    let onToggleMultiThread: () -> Void
 
     init(
         model: ThreadListViewModel,
@@ -213,7 +213,12 @@ private struct ThreadListThumbnail: View {
 
 struct ThreadListCollapsedBar: View {
     @ObservedObject var model: ThreadListViewModel
-    let interactionLocked: Bool = false
+    let interactionLocked: Bool
+
+    init(model: ThreadListViewModel, interactionLocked: Bool = false) {
+        self.model = model
+        self.interactionLocked = interactionLocked
+    }
 
     var body: some View {
         Button(action: model.toggleExpanded) {
