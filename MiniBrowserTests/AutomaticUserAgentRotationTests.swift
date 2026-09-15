@@ -34,8 +34,8 @@ final class AutomaticUserAgentRotationTests: XCTestCase {
         XCTAssertEqual(order.count, safari.count)
         XCTAssertEqual(Set(order).count, safari.count)
         XCTAssertTrue(order.dropFirst().allSatisfy { index in
-            BrowserUserAgent.all[index].deviceFamily !=
-                BrowserUserAgent.all[order[order.firstIndex(of: index)! - 1]].deviceFamily
+            let previousIndex = order[order.firstIndex(of: index)! - 1]
+            return safari[index].deviceFamily != safari[previousIndex].deviceFamily
         })
     }
 
