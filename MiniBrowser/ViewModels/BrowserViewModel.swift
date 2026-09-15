@@ -3006,14 +3006,24 @@ final class BrowserViewModel: ObservableObject {
             skipCurrentMultiThreadThread(generationID: generationID)
         case .succeeded:
             if multiThreadSession != nil {
+                if let targetID = multiThreadSession?.currentTarget?.id {
+                    automaticCatalogProvider?.markThreadRead(id: targetID)
+                }
                 automaticPostVerificationTask?.cancel()
                 automaticPostVerificationTask = nil
                 scheduleNextMultiThread(generationID: generationID)
                 return
             }
-            if let session = automaticPostRepeatSession,
-               sameThreadRepeatEnabled,
-               !session.stopRequested {
+            if let session = automaticPostRepeatSession {
+                if let targetID = ThreadListViewModel.threadID(from: session.pageURL) {
+                    automaticCatalogProvider?.markThreadRead(id: targetID)
+                }
+                guard sameThreadRepeatEnabled, !session.stopRequested else {
+                    clearAutomaticPostDraft()
+                    setAutomaticPostStatus(.completed, generationID: generationID)
+                    finishAutomaticPost(generationID: generationID, result: "SUCCEEDED")
+                    return
+                }
                 automaticPostVerificationTask?.cancel()
                 automaticPostVerificationTask = nil
                 scheduleAutomaticPostRepeat(generationID: generationID)

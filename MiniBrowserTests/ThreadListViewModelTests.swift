@@ -28,6 +28,45 @@ final class ThreadListViewModelTests: XCTestCase {
         XCTAssertEqual(restoredModel.openCount(for: item), 2)
     }
 
+    func testMarkThreadReadPersistsHighlightAndIsIdempotent() {
+        let suiteName = "ThreadListViewModelTests.markThreadRead.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = ThreadListViewModel(defaults: defaults)
+        model.markThreadRead(id: "1234567890")
+        model.markThreadRead(id: "1234567890")
+
+        XCTAssertEqual(model.openCounts["1234567890"], 1)
+        let persisted = defaults.dictionary(forKey: "ThreadListOpenCounts")?["1234567890"] as? NSNumber
+        XCTAssertEqual(persisted?.intValue, 1)
+
+        let restoredModel = ThreadListViewModel(defaults: defaults)
+        XCTAssertEqual(restoredModel.openCounts["1234567890"], 1)
+    }
+
+    func testMarkThreadReadDoesNotInflateExistingViewCount() {
+        let suiteName = "ThreadListViewModelTests.markThreadReadExisting.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let item = ThreadListItem(
+            id: "9876543210",
+            threadURL: URL(string: "https://img.2chan.net/b/res/9876543210.htm")!,
+            thumbnailURL: URL(string: "https://img.2chan.net/b/cat/987s.jpg")!,
+            replyCount: 10,
+            thumbnailData: nil,
+            openerText: "本文"
+        )
+        let model = ThreadListViewModel(defaults: defaults)
+        model.recordOpen(item)
+        model.recordOpen(item)
+
+        model.markThreadRead(id: item.id)
+
+        XCTAssertEqual(model.openCount(for: item), 2)
+    }
+
     func testResetOpenHistoryClearsAndPersistsEmptyState() {
         let suiteName = "ThreadListViewModelTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

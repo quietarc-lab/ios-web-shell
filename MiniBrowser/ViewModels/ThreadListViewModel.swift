@@ -210,6 +210,20 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
 
     func recordOpen(_ item: ThreadListItem) {
         openCounts[item.id, default: 0] += 1
+        persistOpenCounts()
+    }
+
+    /// Marks a thread as read after a successful continuous post. This is
+    /// intentionally idempotent: an automatic post must create the highlight
+    /// needed for future snapshots without inflating the user's view count on
+    /// every repeat cycle or duplicate completion callback.
+    func markThreadRead(id: String) {
+        guard !id.isEmpty, openCounts[id, default: 0] <= 0 else { return }
+        openCounts[id] = 1
+        persistOpenCounts()
+    }
+
+    private func persistOpenCounts() {
         if openCounts.count > 1_000 {
             let excess = openCounts.count - 1_000
             let oldestIDs = openCounts.keys.sorted {

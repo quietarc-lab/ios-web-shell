@@ -45,13 +45,16 @@ protocol AutomaticCatalogProvider: AnyObject {
     func currentPostSnapshot(limit: Int) -> CatalogPostSnapshot
     func refreshPostSnapshot(excludingIDs: Set<String>, limit: Int) async throws -> CatalogPostSnapshot
     func excludeThread(id: String)
+    func markThreadRead(id: String)
 }
 
 /// Keep existing test and integration providers source-compatible while the
-/// coordinator gains the ability to persist a six-hour catalog exclusion.
+/// coordinator gains the ability to persist a six-hour catalog exclusion and
+/// to reflect successful continuous posts in the catalog's read history.
 @MainActor
 extension AutomaticCatalogProvider {
     func excludeThread(id: String) {}
+    func markThreadRead(id: String) {}
 }
 
 /// Session state is intentionally independent from a page-level generation.
