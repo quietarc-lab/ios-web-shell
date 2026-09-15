@@ -31,7 +31,7 @@ $sitePostStatusViewFile = Join-Path $projectRoot 'MiniBrowser\Views\SitePostStat
 $dialogPolicyFile = Join-Path $projectRoot 'MiniBrowser\Support\WebDialogPolicy.swift'
 $automaticFlowFile = Join-Path $projectRoot 'MiniBrowser\Support\AutomaticPostFlow.swift'
 $idleTimerPolicyFile = Join-Path $projectRoot 'MiniBrowser\Support\IdleTimerPolicy.swift'
-$runtimeUserAgentFile = Join-Path $projectRoot 'MiniBrowser\Support\RuntimeUserAgentGenerator.swift'
+$rotationFile = Join-Path $projectRoot 'MiniBrowser\Support\AutomaticUserAgentRotation.swift'
 $uaRestrictionFile = Join-Path $projectRoot 'MiniBrowser\Support\UserAgentRestrictionStore.swift'
 $sitePostStatusFile = Join-Path $projectRoot 'MiniBrowser\Models\SitePostStatus.swift'
 $inputZoomFile = Join-Path $projectRoot 'MiniBrowser\Services\InputAutoZoomPreventionService.swift'
@@ -157,10 +157,10 @@ Assert-Contains $automaticFlowFile 'submitResponseTimedOut' 'automatic submit re
 Assert-Contains $automaticFlowFile 'submitResponseRetry' 'automatic submit conditional retry reason'
 Assert-Contains $automaticFlowFile 'generationID' 'automatic post generation guard'
 Assert-Contains $automaticFlowFile 'stalePageToken' 'automatic post page token guard'
-Assert-Contains $runtimeUserAgentFile 'maximumAttempts = 32' 'bounded launch user-agent generation'
-Assert-Contains $runtimeUserAgentFile 'static func isValid' 'validated launch user-agent generation'
-Assert-Contains $runtimeUserAgentFile 'iPhone' 'iPhone launch user-agent candidates'
-Assert-Contains $runtimeUserAgentFile 'iPad' 'iPad launch user-agent candidates'
+Assert-Contains $rotationFile 'makeOrder' 'session-specific automatic UA order'
+Assert-Contains $rotationFile 'differentDevice' 'device-family diversity preference'
+Assert-Contains $rotationFile 'differentBrowser' 'browser-family diversity preference'
+Assert-Contains $rotationFile 'browserFamily\s*!=\s*previous\.browserFamily' 'browser-family diversity fallback'
 Assert-Contains $dialogPolicyFile 'return false' 'site alerts are not auto-dismissed'
 Assert-Contains $dialogPolicyFile 'TargetPageAlertClassifier' 'known target-page alert classification'
 Assert-Contains $dialogPolicyFile 'アクセス規制中です' 'access restriction alert classification'
@@ -178,7 +178,8 @@ Assert-Contains $viewModelFile 'nextEligibleUserAgentIndex' 'restricted-UA rotat
 Assert-Contains $uaRestrictionFile '7 \* 24 \* 60 \* 60' 'seven-day UA restriction duration'
 Assert-Contains $uaRestrictionFile 'generatedRestrictionKey' 'salted generated-UA restriction key'
 Assert-Contains $viewModelFile 'effectiveUserAgent' 'effective launch-UA propagation'
-Assert-Contains $viewModelFile 'User Agent Launch Selection' 'anonymous launch-UA selection log'
+Assert-Contains $viewModelFile 'User Agent Catalog Ready' 'fixed catalog startup log'
+Assert-NotContains $viewModelFile 'runtimeUserAgent|RuntimeUserAgentGenerator|UA 自動' 'no launch-time generated UA path'
 Assert-Contains $viewModelFile 'RELOADED_POST_COOKIE_UNVERIFIED' 'cookie reload is not treated as posting-cookie proof'
 Assert-Contains $viewModelFile 'sameThreadRepeatEnabled' 'same-thread repeat toggle state'
 Assert-Contains $viewModelFile 'setAppSceneActive' 'foreground scene activity wiring'
@@ -234,15 +235,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $uaText = Get-Content -LiteralPath $uaFile -Raw -Encoding UTF8
-$expectedUserAgentCount = 100
+$maximumUserAgentCount = 300
 $uaCount = ([regex]::Matches($uaText, '\.init\(id:\s*\d+')).Count
-if ($uaCount -ne $expectedUserAgentCount) {
-    throw "Expected exactly $expectedUserAgentCount user agents, found $uaCount."
+if ($uaCount -lt 1 -or $uaCount -gt $maximumUserAgentCount) {
+    throw "Expected between 1 and $maximumUserAgentCount user agents, found $uaCount."
 }
 $uaValues = [regex]::Matches($uaText, 'value:\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
 $distinctUaCount = ($uaValues | Select-Object -Unique).Count
-if ($distinctUaCount -ne $expectedUserAgentCount) {
-    throw "Expected $expectedUserAgentCount distinct user-agent strings."
+if ($distinctUaCount -ne $uaCount) {
+    throw "Expected every user-agent string to be unique; found $distinctUaCount distinct values for $uaCount entries."
 }
 if ($uaValues -match 'CPU (iPhone )?OS 26_') {
     throw 'iOS 26 UA profiles must use the frozen iOS 18 OS token.'

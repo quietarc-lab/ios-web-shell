@@ -42,8 +42,11 @@ final class BrowserViewModel: ObservableObject {
     private let ipService: IPAddressService
     private let userAgentRestrictionStore: UserAgentRestrictionStore
     private var selectedUAIndex: Int
-    private var runtimeUserAgent: RuntimeUserAgent?
     private var automaticTriedUAIDs: Set<Int> = []
+    /// A session-only shuffled order. It is created once when an automatic
+    /// flow starts and is never persisted or rebuilt during a handoff.
+    private var automaticUserAgentOrder: [Int] = []
+    private var automaticUserAgentOrderCursor = 0
     private var automaticPostDraft: AutomaticPostDraft?
     private var automaticPostRepeatSession: AutomaticPostRepeatSession?
     private var automaticPostRepeatSessionID: UInt64 = 0
@@ -174,57 +177,41 @@ final class BrowserViewModel: ObservableObject {
     }
 
     init(defaults: UserDefaults = .standard,
-         ipService: IPAddressService = IPAddressService(),
-         userAgentGenerator: RuntimeUserAgentGenerator = RuntimeUserAgentGenerator()) {
+         ipService: IPAddressService = IPAddressService()) {
         self.defaults = defaults
         self.logStore = DebugLogStore(defaults: defaults)
         self.bookmarkStore = BookmarkStore(defaults: defaults)
         self.ipService = ipService
         self.userAgentRestrictionStore = UserAgentRestrictionStore(defaults: defaults)
-        self.runtimeUserAgent = nil
-        let catalogNeedsReset = defaults.integer(forKey: Keys.userAgentCatalogVersion) !=
+        let catalogNeedsMigration = defaults.integer(forKey: Keys.userAgentCatalogVersion) !=
             BrowserUserAgent.catalogVersion
-        if catalogNeedsReset {
-            self.selectedUAIndex = 0
-        } else if let savedID = defaults.object(forKey: Keys.userAgentID) as? Int,
-                  let savedIndex = BrowserUserAgent.all.firstIndex(where: { $0.id == savedID }) {
+        let savedID = defaults.object(forKey: Keys.userAgentID) as? Int
+        let savedIDIndex = savedID.flatMap { savedID in
+            BrowserUserAgent.all.firstIndex(where: { $0.id == savedID })
+        }
+        let savedIndexValue = defaults.object(forKey: Keys.userAgentIndex) as? Int
+        if let savedIndex = savedIDIndex {
             self.selectedUAIndex = savedIndex
         } else {
             let savedIndex = defaults.integer(forKey: Keys.userAgentIndex)
             self.selectedUAIndex = BrowserUserAgent.all.indices.contains(savedIndex) ? savedIndex : 0
         }
-        if catalogNeedsReset {
-            defaults.set(0, forKey: Keys.userAgentIndex)
-            defaults.set(BrowserUserAgent.all[0].id, forKey: Keys.userAgentID)
-            userAgentRestrictionStore.clearAll()
+        // Catalog updates are append-only. Preserve a valid saved ID and all
+        // seven-day restriction entries, including legacy generated keys;
+        // only repair the index/ID pair when the saved profile no longer
+        // exists.
+        if catalogNeedsMigration || savedIDIndex == nil ||
+            savedIndexValue != selectedUAIndex ||
+            savedID != BrowserUserAgent.all[selectedUAIndex].id {
+            defaults.set(selectedUAIndex, forKey: Keys.userAgentIndex)
+            defaults.set(BrowserUserAgent.all[selectedUAIndex].id, forKey: Keys.userAgentID)
         }
         defaults.set(BrowserUserAgent.catalogVersion, forKey: Keys.userAgentCatalogVersion)
-
-        let generatedUserAgent = userAgentGenerator.generate { value in
-            let key = userAgentRestrictionStore.generatedRestrictionKey(for: value)
-            return userAgentRestrictionStore.isRestricted(key)
-        }
-        let launchSelectionSource: String
-        if let generatedUserAgent {
-            runtimeUserAgent = generatedUserAgent
-            launchSelectionSource = "GENERATED"
-        } else {
-            let restrictedIDs = userAgentRestrictionStore.restrictedIDs()
-            if let fallbackIndex = BrowserUserAgent.all.indices.first(where: {
-                !restrictedIDs.contains(BrowserUserAgent.all[$0].id)
-            }) {
-                selectedUAIndex = fallbackIndex
-                defaults.set(selectedUAIndex, forKey: Keys.userAgentIndex)
-                defaults.set(BrowserUserAgent.all[fallbackIndex].id,
-                             forKey: Keys.userAgentID)
-                launchSelectionSource = "FIXED_FALLBACK"
-            } else {
-                launchSelectionSource = "FIXED_CURRENT"
-            }
-            runtimeUserAgent = nil
-        }
-        logStore.append(action: "User Agent Launch Selection", fields: [
-            ("SOURCE", launchSelectionSource),
+        // Reading the restriction set also removes expired entries, without
+        // changing valid IDs during an additive catalog migration.
+        _ = userAgentRestrictionStore.restrictedIDs()
+        logStore.append(action: "User Agent Catalog Ready", fields: [
+            ("CATALOG_COUNT", String(BrowserUserAgent.all.count)),
             ("RESULT", "READY")
         ])
     }
@@ -233,24 +220,28 @@ final class BrowserViewModel: ObservableObject {
         BrowserUserAgent.all[selectedUAIndex]
     }
 
-    /// The UA used for all requests in the current process. A generated value
-    /// is selected once during model initialization and is not regenerated on
-    /// scene activation or WebView recreation.
+    /// The fixed catalog value used for every request in the current process.
     var effectiveUserAgent: String {
-        runtimeUserAgent?.value ?? currentUserAgent.value
+        currentUserAgent.value
     }
 
     var userAgentButtonTitle: String {
-        if runtimeUserAgent != nil {
-            return "UA 自動"
-        }
-        return "UA \(selectedUAIndex + 1)/\(BrowserUserAgent.all.count)"
+        let available = availableUserAgentIndices()
+        let position = available.firstIndex(of: selectedUAIndex).map { $0 + 1 } ?? 0
+        return "UA \(position)/\(available.count)"
     }
 
     private var effectiveUserAgentLogLabel: String {
-        runtimeUserAgent == nil
-            ? "\(selectedUAIndex + 1)/\(BrowserUserAgent.all.count) \(currentUserAgent.name)"
-            : "GENERATED"
+        let available = availableUserAgentIndices()
+        let position = available.firstIndex(of: selectedUAIndex).map { $0 + 1 } ?? 0
+        return "\(position)/\(available.count) \(currentUserAgent.name)"
+    }
+
+    private func availableUserAgentIndices() -> [Int] {
+        let restricted = userAgentRestrictionStore.restrictedIDs()
+        return BrowserUserAgent.all.indices.filter {
+            !restricted.contains(BrowserUserAgent.all[$0].id)
+        }
     }
 
     func attachAutomaticCatalogProvider(_ provider: AutomaticCatalogProvider) {
@@ -498,6 +489,29 @@ final class BrowserViewModel: ObservableObject {
         return nil
     }
 
+    private func nextAutomaticUserAgentIndex(excluding excludedUAIDs: Set<Int>) -> Int? {
+        let restrictedUAIDs = userAgentRestrictionStore.restrictedIDs()
+        while automaticUserAgentOrderCursor < automaticUserAgentOrder.count {
+            let candidateIndex = automaticUserAgentOrder[automaticUserAgentOrderCursor]
+            automaticUserAgentOrderCursor += 1
+            let candidateID = BrowserUserAgent.all[candidateIndex].id
+            guard !excludedUAIDs.contains(candidateID),
+                  !restrictedUAIDs.contains(candidateID) else {
+                continue
+            }
+            return candidateIndex
+        }
+        return nil
+    }
+
+    private func prepareAutomaticUserAgentOrder() {
+        automaticUserAgentOrder = AutomaticUserAgentRotation.makeOrder(
+            catalog: BrowserUserAgent.all,
+            restrictedIDs: userAgentRestrictionStore.restrictedIDs()
+        )
+        automaticUserAgentOrderCursor = 0
+    }
+
     private func nextAutomaticSubmissionSeed() -> UInt64 {
         automaticSubmissionSequence &+= 1
         if automaticSubmissionSequence == 0 {
@@ -526,8 +540,10 @@ final class BrowserViewModel: ObservableObject {
             }
             return
         }
-        guard let nextIndex = nextEligibleUserAgentIndex(
-            after: selectedUAIndex,
+        if automaticUserAgentOrder.isEmpty {
+            prepareAutomaticUserAgentOrder()
+        }
+        guard let nextIndex = nextAutomaticUserAgentIndex(
             excluding: automaticTriedUAIDs
         ) else {
             appendAutomaticEvent(
@@ -631,13 +647,28 @@ final class BrowserViewModel: ObservableObject {
 
         if newAutomaticSession {
             automaticTriedUAIDs.removeAll()
+            prepareAutomaticUserAgentOrder()
+            // The UA that was already active when the user pressed the
+            // automatic button is not a new session candidate. This keeps a
+            // handoff from immediately returning to the same profile.
+            automaticTriedUAIDs.insert(currentUserAgent.id)
         }
-        guard let nextIndex = targetUAIndex ?? nextEligibleUserAgentIndex(
-            after: selectedUAIndex,
-            excluding: excludedUAIDs
-        ) else {
+        let nextIndex: Int?
+        if let targetUAIndex {
+            nextIndex = targetUAIndex
+        } else if automatic {
+            if automaticUserAgentOrder.isEmpty {
+                prepareAutomaticUserAgentOrder()
+            }
+            nextIndex = nextAutomaticUserAgentIndex(excluding: automaticTriedUAIDs)
+        } else {
+            nextIndex = nextEligibleUserAgentIndex(
+                after: selectedUAIndex,
+                excluding: excludedUAIDs
+            )
+        }
+        guard let nextIndex else {
             isUAChanging = false
-            automaticTriedUAIDs.removeAll()
             if multiThreadSession != nil {
                 appendAutomaticEvent(
                     generationID: automaticPostMachine.generationID ?? automaticPostGeneration,
@@ -655,7 +686,6 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         selectedUAIndex = nextIndex
-        runtimeUserAgent = nil
         defaults.set(selectedUAIndex, forKey: Keys.userAgentIndex)
         defaults.set(currentUserAgent.id, forKey: Keys.userAgentID)
         if automatic,
@@ -1991,13 +2021,6 @@ final class BrowserViewModel: ObservableObject {
     func handleTargetPageAlert(_ category: TargetPageAlertCategory,
                                host: String,
                                message: String) -> TargetPageAlertDisposition {
-        if category == .accessRestricted,
-           let runtimeUserAgent {
-            let key = userAgentRestrictionStore.generatedRestrictionKey(
-                for: runtimeUserAgent.value
-            )
-            userAgentRestrictionStore.restrict(key)
-        }
         let alertGenerationID = automaticPostMachine.isActive
             ? automaticPostMachine.generationID
             : nil
@@ -2027,9 +2050,7 @@ final class BrowserViewModel: ObservableObject {
         cancelAutomaticSubmitResponseTimer()
 
         if category == .accessRestricted {
-            if runtimeUserAgent == nil {
-                userAgentRestrictionStore.restrict(currentUserAgent.id)
-            }
+            userAgentRestrictionStore.restrict(currentUserAgent.id)
         }
 
         let alert: AutomaticPostAlert
@@ -4370,6 +4391,8 @@ final class BrowserViewModel: ObservableObject {
     private func clearAutomaticPostDraft() {
         automaticPostDraft = nil
         automaticTriedUAIDs.removeAll()
+        automaticUserAgentOrder.removeAll()
+        automaticUserAgentOrderCursor = 0
         cancelAutomaticRepeatSession()
     }
 

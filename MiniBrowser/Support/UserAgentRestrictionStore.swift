@@ -95,9 +95,9 @@ struct UserAgentRestrictionStore {
         return "generated:" + digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Removes restrictions from a previous catalog when the profile set is
-    /// replaced. Restriction IDs are catalog-specific and must not be applied
-    /// to newly assigned profile values.
+    /// Explicit administrative reset retained for compatibility with older
+    /// callers. Catalog migrations no longer call this method: fixed profile
+    /// IDs and legacy generated keys remain valid across append-only updates.
     func clearAll() {
         defaults.removeObject(forKey: storageKey)
     }

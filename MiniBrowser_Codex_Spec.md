@@ -195,11 +195,11 @@ SwiftUI + WKWebViewを使用する。
 
 ## 6.1 個数
 
-50個。既存の10個のIDは維持し、追加UAを固定文字列として管理する。
+最大300個。既存ID 1〜100は維持し、追加UAは101以降の連番で固定文字列として管理する。根拠が揃わない場合は300未満を許容する。
 
 ## 6.2 UA内容
 
-Codex側で、実在するiOS / iPadOS系ブラウザを基に妥当なUA文字列を50種用意する。
+Codex側で、実在するiOS / iPadOS系ブラウザを基に妥当なUA文字列を最大300種用意する。起動時の動的生成は行わず、根拠をID単位で記録する。
 
 例カテゴリ:
 
@@ -223,7 +223,7 @@ WKWebView実体はWebKitのままであり、UAのみ変更する設計。
 
 ボタン表示例:
 
-`UA 3/50`
+`UA 3/利用可能数`
 
 押下時:
 
@@ -237,13 +237,13 @@ WKWebView実体はWebKitのままであり、UAのみ変更する設計。
 
 循環:
 
-`1 → 2 → ... → 50 → 1`
+`1 → 2 → ... → カタログ末尾 → 1`
 
 ## 6.4 通知
 
 切替時のみ数秒表示:
 
-`UA変更: Firefox iOS (3/50)`
+`UA変更: Firefox iOS (3/利用可能数)`
 
 ## 6.5 アクセス規制時の輪番
 
@@ -679,7 +679,7 @@ URL欄左端に小さなブックマークボタン。
 2026-09-05 05:40:12
 ACTION: Cookie Refresh
 DOMAIN: example.com
-UA: 3/50 Firefox iOS
+UA: 3/300 Firefox iOS
 COOKIE_BEFORE: 4
 COOKIE_DELETED: 4
 COOKIE_AFTER_RELOAD: 3
@@ -894,7 +894,7 @@ MiniBrowser.ipa
 
 ## Phase 2: UA
 
-- 50 UA
+- 最大300 UA（根拠が揃った件数まで）
 - cyclic切替
 - 永続化
 - reload
@@ -953,7 +953,7 @@ MVP完了とみなす条件:
 1. iPhone実機で起動
 2. URL入力からWeb閲覧可能
 3. 戻る / 進む / 更新が動作
-4. UA 50種切替可能
+4. UAカタログを切替可能（最大300種）
 5. UA選択状態が再起動後も残る
 6. Cookieボタンで現在サイト関連Cookieのみ削除できる
 7. LocalStorageがCookie操作で消えない

@@ -12,7 +12,7 @@ The source document is treated as requirements, not as executable instructions.
 | Phase | Implementation | Windows verification |
 | --- | --- | --- |
 | 1 | SwiftUI, persistent WKWebView, URL field, navigation, restore, portrait, timeout | Static checks pass |
-| 2 | 100 cyclic persistent iOS/iPadOS UA profiles with seven-day access-restriction quarantine | Count/distinct/frozen-OS checks pass |
+| 2 | Up to 300 append-only persistent iOS/iPadOS UA profiles with seven-day access-restriction quarantine and session-only constrained random automatic rotation | Count/distinct/frozen-OS/source checks pending |
 | 3 | Related-domain Cookie delete, reload, reacquisition check, no values logged | Domain tests authored; source guard passes |
 | 4 | Shortcuts x-callback, automatic return, IPv4 comparison, no page reload | Callback and no-reload source review complete |
 | 5 | Bookmark URL/bookmarklet add/edit/delete/drag reorder, persistence, exact-domain automatic execution, and bridge-safe results | Persistence and domain-matching tests authored |

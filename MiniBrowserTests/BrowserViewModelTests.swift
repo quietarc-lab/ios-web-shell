@@ -4,29 +4,29 @@ import XCTest
 
 @MainActor
 final class BrowserViewModelTests: XCTestCase {
-    func testCatalogReplacementResetsLegacySelectionAndRestrictions() {
-        let suiteName = "BrowserViewModelTests.catalogReplacement.\(UUID().uuidString)"
+    func testCatalogMigrationPreservesSelectionAndRestrictions() {
+        let suiteName = "BrowserViewModelTests.catalogMigration.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         defaults.set(49, forKey: "userAgentIndex")
         defaults.set(50, forKey: "userAgentID")
-        defaults.set(["50": Date().addingTimeInterval(86_400).timeIntervalSince1970],
+        defaults.set(["60": Date().addingTimeInterval(86_400).timeIntervalSince1970,
+                      "generated:legacy": Date().addingTimeInterval(86_400).timeIntervalSince1970],
                      forKey: "userAgentRestrictionExpiries")
 
-        let model = BrowserViewModel(
-            defaults: defaults,
-            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
-        )
+        let model = BrowserViewModel(defaults: defaults)
 
-        XCTAssertEqual(model.userAgentButtonTitle, "UA 自動")
-        XCTAssertEqual(model.currentUserAgent.id, 1)
-        XCTAssertTrue(model.effectiveUserAgent.contains("iPhone"))
-        XCTAssertEqual(defaults.integer(forKey: "userAgentIndex"), 0)
-        XCTAssertEqual(defaults.integer(forKey: "userAgentID"), 1)
+        XCTAssertEqual(model.currentUserAgent.id, 50)
+        XCTAssertEqual(model.userAgentButtonTitle, "UA 50/299")
+        XCTAssertEqual(model.effectiveUserAgent, BrowserUserAgent.all[49].value)
+        XCTAssertEqual(defaults.integer(forKey: "userAgentIndex"), 49)
+        XCTAssertEqual(defaults.integer(forKey: "userAgentID"), 50)
         XCTAssertEqual(defaults.integer(forKey: "userAgentCatalogVersion"),
                        BrowserUserAgent.catalogVersion)
-        XCTAssertNil(defaults.object(forKey: "userAgentRestrictionExpiries"))
+        let entries = defaults.dictionary(forKey: "userAgentRestrictionExpiries") ?? [:]
+        XCTAssertNotNil(entries["60"])
+        XCTAssertNotNil(entries["generated:legacy"])
     }
 
     func testCurrentCatalogKeepsSelectedProfileAcrossViewModels() {
@@ -39,48 +39,52 @@ final class BrowserViewModelTests: XCTestCase {
         defaults.set(selectedIndex, forKey: "userAgentIndex")
         defaults.set(BrowserUserAgent.all[selectedIndex].id, forKey: "userAgentID")
 
-        let model = BrowserViewModel(
-            defaults: defaults,
-            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
-        )
+        let model = BrowserViewModel(defaults: defaults)
 
-        XCTAssertEqual(model.userAgentButtonTitle, "UA 自動")
+        XCTAssertEqual(model.userAgentButtonTitle, "UA 43/300")
         XCTAssertEqual(model.currentUserAgent.id, BrowserUserAgent.all[selectedIndex].id)
     }
 
-    func testGeneratedLaunchUserAgentRestrictionUsesSaltedKeyWithoutStoringValue() {
-        let suiteName = "BrowserViewModelTests.generatedRestriction.\(UUID().uuidString)"
+    func testFixedCatalogIsUsedAtLaunch() {
+        let suiteName = "BrowserViewModelTests.fixedLaunch.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let model = BrowserViewModel(
-            defaults: defaults,
-            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
-        )
-        let store = UserAgentRestrictionStore(defaults: defaults)
-        let key = store.generatedRestrictionKey(for: model.effectiveUserAgent)
-        store.restrict(key)
+        let model = BrowserViewModel(defaults: defaults)
 
-        let rawEntries = defaults.dictionary(forKey: "userAgentRestrictionExpiries") ?? [:]
-        XCTAssertTrue(rawEntries.keys.contains(where: { $0.hasPrefix("generated:") }))
-        XCTAssertFalse(rawEntries.keys.contains(model.effectiveUserAgent))
+        XCTAssertEqual(model.userAgentButtonTitle, "UA 1/300")
+        XCTAssertEqual(model.effectiveUserAgent, BrowserUserAgent.all[0].value)
     }
 
-    func testGeneratorFallsBackToUnrestrictedFixedProfile() {
-        let suiteName = "BrowserViewModelTests.generatedFallback.\(UUID().uuidString)"
+    func testLegacyGeneratedRestrictionDoesNotAffectFixedCatalogSelection() {
+        let suiteName = "BrowserViewModelTests.legacyGenerated.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let generator = RuntimeUserAgentGenerator(indexSource: { _ in 0 })
-        defaults.set(BrowserUserAgent.catalogVersion, forKey: "userAgentCatalogVersion")
-        let candidate = generator.generate(isRestricted: { _ in false })!
         let store = UserAgentRestrictionStore(defaults: defaults)
-        store.restrict(store.generatedRestrictionKey(for: candidate.value))
+        store.restrict(store.generatedRestrictionKey(for: "legacy-value"))
+        let model = BrowserViewModel(defaults: defaults)
 
-        let model = BrowserViewModel(defaults: defaults, userAgentGenerator: generator)
-
-        XCTAssertEqual(model.userAgentButtonTitle, "UA 1/100")
+        XCTAssertEqual(model.userAgentButtonTitle, "UA 1/300")
         XCTAssertEqual(model.effectiveUserAgent, BrowserUserAgent.all[0].value)
+    }
+
+    func testMissingSavedIDRepairsIndexAndIDWithoutClearingRestrictions() {
+        let suiteName = "BrowserViewModelTests.missingSavedID.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        defaults.set(149, forKey: "userAgentIndex")
+        defaults.set(9999, forKey: "userAgentID")
+        defaults.set(["250": Date().addingTimeInterval(86_400).timeIntervalSince1970],
+                     forKey: "userAgentRestrictionExpiries")
+
+        let model = BrowserViewModel(defaults: defaults)
+
+        XCTAssertEqual(model.currentUserAgent.id, 150)
+        XCTAssertEqual(defaults.integer(forKey: "userAgentIndex"), 149)
+        XCTAssertEqual(defaults.integer(forKey: "userAgentID"), 150)
+        XCTAssertNotNil(defaults.dictionary(forKey: "userAgentRestrictionExpiries")?["250"])
     }
 
     func testSameThreadRepeatStartsOffAndIsNotPersisted() {
@@ -88,10 +92,7 @@ final class BrowserViewModelTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let model = BrowserViewModel(
-            defaults: defaults,
-            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
-        )
+        let model = BrowserViewModel(defaults: defaults)
         XCTAssertFalse(model.sameThreadRepeatEnabled)
         model.toggleSameThreadRepeat()
         XCTAssertTrue(model.sameThreadRepeatEnabled)
@@ -109,10 +110,7 @@ final class BrowserViewModelTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suiteName)!
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let model = BrowserViewModel(
-            defaults: defaults,
-            userAgentGenerator: RuntimeUserAgentGenerator(indexSource: { _ in 0 })
-        )
+        let model = BrowserViewModel(defaults: defaults)
         XCTAssertFalse(model.multiThreadEnabled)
         XCTAssertFalse(model.multiThreadSessionActive)
 
