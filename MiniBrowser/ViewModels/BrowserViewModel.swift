@@ -52,6 +52,17 @@ final class BrowserViewModel: ObservableObject {
     private var multiThreadSessionID: UInt64 = 0
     private var multiThreadTransitionTask: Task<Void, Never>?
     private var pendingMultiThreadNavigation: (sessionID: UInt64, target: CatalogPostTarget)?
+    /// A dropped target can report that it has no usable thread/form before
+    /// `didFinish` creates the next page generation. Keep that bridge result
+    /// tied to the pending destination until navigation is committed.
+    private struct PendingMultiThreadUnavailable: Equatable {
+        let sessionID: UInt64
+        let targetID: String
+        let pageToken: String
+        let pageURL: URL
+        let reason: String
+    }
+    private var pendingMultiThreadUnavailable: PendingMultiThreadUnavailable?
     private weak var automaticCatalogProvider: AutomaticCatalogProvider?
     private var pendingCookieRefresh: PendingCookieRefresh?
     private var pendingAP: PendingAP?
@@ -441,6 +452,7 @@ final class BrowserViewModel: ObservableObject {
         )
         multiThreadSession = session
         multiThreadSessionActive = true
+        pendingMultiThreadUnavailable = nil
         updateIdleTimerState()
         automaticPostDraft = AutomaticPostDraft(
             hasComment: comment?.isEmpty == false,
@@ -457,9 +469,15 @@ final class BrowserViewModel: ObservableObject {
             target.threadURL.host?.lowercased() == currentPageURL.host?.lowercased()
         guard !samePage else { return }
         pendingMultiThreadNavigation = (session.sessionID, target)
+        pendingMultiThreadUnavailable = nil
         setMultiThreadStatusWithoutGeneration(.navigatingToNextThread)
         guard webView?.load(URLRequest(url: target.threadURL)) != nil else {
-            finishMultiThreadSession(generationID: nil, result: "STOPPED_NAVIGATION_FAILED")
+            pendingMultiThreadNavigation = nil
+            skipPendingMultiThreadTargetWithoutGeneration(
+                sessionID: session.sessionID,
+                target: target,
+                reason: "NAVIGATION_LOAD_FAILED"
+            )
             return
         }
     }
@@ -706,6 +724,7 @@ final class BrowserViewModel: ObservableObject {
         latestCompactReady = nil
         pendingHandwritingReady = nil
         pendingHandwritingRestore = nil
+        pendingMultiThreadUnavailable = nil
         automaticDraftRestorePendingGeneration = nil
         automaticCookieRelatedCount = nil
         automaticCookieCountDelta = nil
@@ -866,6 +885,9 @@ final class BrowserViewModel: ObservableObject {
                                 result: "STOPPED_PAGE_NAVIGATION")
         }
         automaticReloadGeneration = nil
+        if pendingMultiThreadNavigation == nil {
+            pendingMultiThreadUnavailable = nil
+        }
         isLoading = true
         sitePostStatus = nil
         latestCompactReady = nil
@@ -922,6 +944,77 @@ final class BrowserViewModel: ObservableObject {
         return nil
     }
 
+    /// Handles the compact-page bridge's early indication that the current
+    /// catalog target has no usable thread/form (the usual shape of a dropped
+    /// or expired thread). Only a running multi-thread session may consume
+    /// this signal; manual and single-thread flows keep their existing stop
+    /// and alert behavior.
+    func handleThreadUnavailable(pageToken: String,
+                                 pageURL: URL? = nil,
+                                 reason: String) {
+        guard reason == "THREAD_NOT_POSTABLE",
+              multiThreadEnabled,
+              let session = multiThreadSession,
+              let target = session.currentTarget,
+              let callbackURL = pageURL ?? webView?.url,
+              Self.sameTargetThreadURL(callbackURL, target.threadURL) else {
+            recordAutomaticBridgeIgnored(type: "threadUnavailable",
+                                         reason: "TARGET_MISMATCH")
+            return
+        }
+
+        if automaticPostMachine.isActive,
+           automaticPostMachine.isMultiThread,
+           let generationID = automaticPostMachine.generationID {
+            let tokenAccepted = automaticPostMachine.pageToken == pageToken ||
+                (automaticPostMachine.pageToken == nil &&
+                 !automaticPostMachine.isStalePageToken(pageToken))
+            guard tokenAccepted else {
+                recordAutomaticBridgeIgnored(type: "threadUnavailable",
+                                             reason: "STALE_OR_MISMATCH")
+                return
+            }
+            skipActiveMultiThreadTarget(generationID: generationID,
+                                        reason: "THREAD_UNAVAILABLE")
+            return
+        }
+
+        // Before didFinish, the destination has no generation yet. Hold the
+        // result until the matching navigation finishes so the old page's
+        // callbacks cannot advance the new target out of order.
+        if let pending = pendingMultiThreadNavigation,
+           pending.sessionID == session.sessionID,
+           pending.target.id == target.id {
+            pendingMultiThreadUnavailable = PendingMultiThreadUnavailable(
+                sessionID: session.sessionID,
+                targetID: target.id,
+                pageToken: pageToken,
+                pageURL: callbackURL,
+                reason: "THREAD_UNAVAILABLE"
+            )
+            appendAutomaticEvent(
+                generationID: automaticPostMachine.generationID ?? automaticPostGeneration,
+                phase: "BRIDGE",
+                event: "THREAD_UNAVAILABLE",
+                result: "PENDING",
+                fields: [
+                    ("PAGE_TOKEN_STATE", "MATCH"),
+                    ("REASON", "THREAD_NOT_POSTABLE")
+                ]
+            )
+            return
+        }
+
+        // A late signal after the previous generation has become terminal is
+        // still safe to consume when it identifies the current target. This
+        // path is intentionally limited to multi-thread sessions.
+        skipPendingMultiThreadTargetWithoutGeneration(
+            sessionID: session.sessionID,
+            target: target,
+            reason: "THREAD_UNAVAILABLE"
+        )
+    }
+
     func handleCompactReady(pageToken: String,
                             hasComment: Bool,
                             canSubmit: Bool,
@@ -952,6 +1045,21 @@ final class BrowserViewModel: ObservableObject {
                 result: "IGNORED",
                 fields: [("PAGE_TOKEN_STATE", "STALE_OR_MISMATCH")]
             )
+            return
+        }
+        if automaticPostMachine.isMultiThread, !canSubmit {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "BRIDGE",
+                event: "THREAD_UNAVAILABLE",
+                result: "SKIP_REQUESTED",
+                fields: [
+                    ("PAGE_TOKEN_STATE", "MATCH"),
+                    ("REASON", "SUBMIT_FORM_UNAVAILABLE")
+                ]
+            )
+            skipActiveMultiThreadTarget(generationID: generationID,
+                                        reason: "THREAD_UNAVAILABLE")
             return
         }
         if automaticPostMachine.isMultiThread,
@@ -1532,15 +1640,35 @@ final class BrowserViewModel: ObservableObject {
                     phase: "NAVIGATION",
                     event: "NEXT_THREAD_NAVIGATION_FAILED",
                     result: "STOPPED",
-                    fields: [("REASON", "TARGET_MISMATCH")]
+                    fields: [("REASON", "TARGET_MISMATCH"),
+                             ("DISPOSITION", "SKIP_CURRENT_THREAD")]
                 )
-                finishMultiThreadSession(
-                    generationID: session.currentGenerationID,
-                    result: "STOPPED_PAGE_NAVIGATION"
+                pendingMultiThreadNavigation = nil
+                skipPendingMultiThreadTargetWithoutGeneration(
+                    sessionID: session.sessionID,
+                    target: pending.target,
+                    reason: "NAVIGATION_TARGET_MISMATCH"
                 )
                 return
             }
+            let pendingUnavailable = pendingMultiThreadUnavailable
             pendingMultiThreadNavigation = nil
+            if let pendingUnavailable,
+               pendingUnavailable.sessionID == session.sessionID,
+               pendingUnavailable.targetID == pending.target.id,
+               Self.sameTargetThreadURL(pendingUnavailable.pageURL, loadedURL) {
+                // The dropped-thread bridge arrived before didFinish, so no
+                // generation should be started for this target. Move on with
+                // the existing session draft and UA accounting intact.
+                pendingMultiThreadUnavailable = nil
+                skipPendingMultiThreadTargetWithoutGeneration(
+                    sessionID: session.sessionID,
+                    target: pending.target,
+                    reason: pendingUnavailable.reason
+                )
+                return
+            }
+            pendingMultiThreadUnavailable = nil
             if session.currentGenerationID == nil {
                 // The first catalog target was different from the page that
                 // supplied the draft. Perform the initial UA refresh only
@@ -1765,6 +1893,17 @@ final class BrowserViewModel: ObservableObject {
             ("RESULT", "FAILED")
         ])
         failPendingCookieRefresh(result: "RELOAD_FAILED")
+        if let pending = pendingMultiThreadNavigation,
+           let session = multiThreadSession,
+           pending.sessionID == session.sessionID {
+            pendingMultiThreadNavigation = nil
+            skipPendingMultiThreadTargetWithoutGeneration(
+                sessionID: session.sessionID,
+                target: pending.target,
+                reason: "NAVIGATION_FAILED"
+            )
+            return
+        }
         if multiThreadSession != nil {
             finishMultiThreadSession(
                 generationID: multiThreadSession?.currentGenerationID ??
@@ -1791,6 +1930,17 @@ final class BrowserViewModel: ObservableObject {
             ("RESULT", "TIMEOUT")
         ])
         failPendingCookieRefresh(result: "RELOAD_TIMEOUT")
+        if let pending = pendingMultiThreadNavigation,
+           let session = multiThreadSession,
+           pending.sessionID == session.sessionID {
+            pendingMultiThreadNavigation = nil
+            skipPendingMultiThreadTargetWithoutGeneration(
+                sessionID: session.sessionID,
+                target: pending.target,
+                reason: "NAVIGATION_TIMEOUT"
+            )
+            return
+        }
         if multiThreadSession != nil {
             finishMultiThreadSession(
                 generationID: multiThreadSession?.currentGenerationID ??
@@ -2591,7 +2741,8 @@ final class BrowserViewModel: ObservableObject {
         let canContinueAfterSkip: Bool
         if afterSkippedThread,
            case let .stopped(_, reason) = automaticPostMachine.state,
-           reason == .threadPostingUnavailable {
+           reason == .threadPostingUnavailable ||
+           reason == .threadUnavailable {
             canContinueAfterSkip = true
         } else {
             canContinueAfterSkip = false
@@ -2786,6 +2937,207 @@ final class BrowserViewModel: ObservableObject {
         )
     }
 
+    private func skipActiveMultiThreadTarget(generationID: UInt64,
+                                             reason: String) {
+        guard automaticPostMachine.generationID == generationID,
+              automaticPostMachine.isMultiThread,
+              automaticPostMachine.isActive,
+              multiThreadSession?.currentGenerationID == generationID else {
+            return
+        }
+        let effect = automaticPostMachine.skipCurrentThread(
+            reason: .threadUnavailable
+        )
+        guard effect == .skipCurrentThread else { return }
+        invalidateAutomaticGenerationForThreadSkip(generationID: generationID)
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "FLOW",
+            event: "THREAD_SKIP_REQUESTED",
+            result: "CONTINUE",
+            fields: [("REASON", reason)]
+        )
+        handleAutomaticPostEffect(effect, generationID: generationID)
+    }
+
+    private func invalidateAutomaticGenerationForThreadSkip(generationID: UInt64) {
+        automaticFinishedGenerations.insert(generationID)
+        automaticPostPreparationTimer?.cancel()
+        automaticPostPreparationTimer = nil
+        automaticSubmitReadinessTask?.cancel()
+        automaticSubmitReadinessTask = nil
+        cancelAutomaticSubmitResponseTimer()
+        automaticPostVerificationTask?.cancel()
+        automaticPostVerificationTask = nil
+        automaticReloadGeneration = nil
+        if pendingCookieRefresh?.automaticGenerationID == generationID {
+            pendingCookieRefresh = nil
+            isCookieRefreshing = false
+        }
+        if let pendingAP,
+           Self.appPurposeGenerationID(pendingAP.purpose) == generationID {
+            self.pendingAP = nil
+            isAPRunning = false
+        }
+        isIdentityRefreshInProgress = false
+        isUAChanging = false
+    }
+
+    /// Advances a multi-thread session when the destination failed before a
+    /// page generation could be created (for example, an HTTP/navigation
+    /// failure or the early no-form bridge from a dropped thread).
+    private func skipPendingMultiThreadTargetWithoutGeneration(
+        sessionID: UInt64,
+        target: CatalogPostTarget,
+        reason: String
+    ) {
+        guard multiThreadEnabled,
+              var session = multiThreadSession,
+              session.sessionID == sessionID,
+              session.currentTarget?.id == target.id else { return }
+
+        pendingMultiThreadNavigation = nil
+        pendingMultiThreadUnavailable = nil
+        session.markCurrentProcessed()
+        automaticCatalogProvider?.excludeThread(id: target.id)
+        multiThreadSession = session
+        appendAutomaticEvent(
+            generationID: session.currentGenerationID ?? automaticPostGeneration,
+            phase: "FLOW",
+            event: "THREAD_SKIPPED",
+            result: "CONTINUE",
+            fields: [
+                ("REASON", reason),
+                ("GENERATION_ID_STATE", "UNBOUND")
+            ]
+        )
+
+        guard !session.stopRequested else {
+            finishMultiThreadSession(generationID: session.currentGenerationID,
+                                     result: "STOPPED_MULTI_THREAD_DISABLED")
+            return
+        }
+
+        let nextResult = nextMultiThreadPostableTarget(session: &session)
+        multiThreadSession = session
+        if let generationID = session.currentGenerationID {
+            logReplyLimitSkips(nextResult.replyLimitSkippedIDs,
+                               generationID: generationID)
+        }
+        if let next = nextResult.target {
+            scheduleMultiThreadNavigationWithoutGeneration(
+                sessionID: session.sessionID,
+                target: next,
+                skipped: true
+            )
+            return
+        }
+
+        guard !session.catalogRefreshUsed else {
+            finishMultiThreadSession(generationID: session.currentGenerationID,
+                                     result: "SUCCEEDED")
+            return
+        }
+        refreshMultiThreadCatalogWithoutGeneration(sessionID: session.sessionID)
+    }
+
+    private func scheduleMultiThreadNavigationWithoutGeneration(
+        sessionID: UInt64,
+        target: CatalogPostTarget,
+        skipped: Bool
+    ) {
+        guard multiThreadSession?.sessionID == sessionID,
+              multiThreadEnabled,
+              let webView else { return }
+        let delayNanoseconds: UInt64 = skipped ? 0 : 3_000_000_000
+        setMultiThreadStatusWithoutGeneration(.waitingForNextThread)
+        multiThreadTransitionTask?.cancel()
+        multiThreadTransitionTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanoseconds)
+            guard let self,
+                  !Task.isCancelled,
+                  self.multiThreadEnabled,
+                  self.multiThreadSession?.sessionID == sessionID,
+                  self.multiThreadSession?.currentTarget?.id == target.id else {
+                return
+            }
+            self.setMultiThreadStatusWithoutGeneration(.navigatingToNextThread)
+            self.pendingMultiThreadNavigation = (sessionID, target)
+            self.pendingMultiThreadUnavailable = nil
+            self.appendAutomaticEvent(
+                generationID: self.multiThreadSession?.currentGenerationID ??
+                    self.automaticPostGeneration,
+                phase: "NAVIGATION",
+                event: "NEXT_THREAD_NAVIGATION_STARTED",
+                result: "STARTED",
+                fields: [("GENERATION_ID_STATE", "UNBOUND")]
+            )
+            guard webView.load(URLRequest(url: target.threadURL)) != nil else {
+                self.pendingMultiThreadNavigation = nil
+                self.skipPendingMultiThreadTargetWithoutGeneration(
+                    sessionID: sessionID,
+                    target: target,
+                    reason: "NAVIGATION_LOAD_FAILED"
+                )
+                return
+            }
+            self.multiThreadTransitionTask = nil
+        }
+    }
+
+    private func refreshMultiThreadCatalogWithoutGeneration(sessionID: UInt64) {
+        guard var session = multiThreadSession,
+              session.sessionID == sessionID,
+              !session.catalogRefreshUsed,
+              let provider = automaticCatalogProvider else {
+            finishMultiThreadSession(generationID: multiThreadSession?.currentGenerationID,
+                                     result: "SUCCEEDED")
+            return
+        }
+        session.catalogRefreshUsed = true
+        multiThreadSession = session
+        setMultiThreadStatusWithoutGeneration(.refreshingCatalog)
+        let processed = session.processedThreadIDs
+        multiThreadTransitionTask?.cancel()
+        multiThreadTransitionTask = Task { @MainActor [weak self] in
+            do {
+                let refreshed = try await provider.refreshPostSnapshot(
+                    excludingIDs: processed,
+                    limit: 60
+                )
+                guard let self,
+                      self.multiThreadEnabled,
+                      var current = self.multiThreadSession,
+                      current.sessionID == sessionID else { return }
+                current.appendUnprocessedTargets(from: refreshed)
+                self.multiThreadSession = current
+                self.multiThreadTransitionTask = nil
+                let nextResult = self.nextMultiThreadPostableTarget(session: &current)
+                self.multiThreadSession = current
+                if let next = nextResult.target {
+                    self.scheduleMultiThreadNavigationWithoutGeneration(
+                        sessionID: sessionID,
+                        target: next,
+                        skipped: true
+                    )
+                } else {
+                    self.finishMultiThreadSession(
+                        generationID: current.currentGenerationID,
+                        result: "SUCCEEDED"
+                    )
+                }
+            } catch {
+                guard let self,
+                      self.multiThreadSession?.sessionID == sessionID else { return }
+                self.multiThreadTransitionTask = nil
+                self.finishMultiThreadSession(
+                    generationID: self.multiThreadSession?.currentGenerationID,
+                    result: "STOPPED_CATALOG_REFRESH_FAILED"
+                )
+            }
+        }
+    }
+
     private func scheduleMultiThreadNavigation(sessionID: UInt64,
                                                generationID: UInt64,
                                                target: CatalogPostTarget,
@@ -2818,6 +3170,7 @@ final class BrowserViewModel: ObservableObject {
             self.setAutomaticPostStatus(.navigatingToNextThread,
                                         generationID: generationID)
             self.pendingMultiThreadNavigation = (sessionID, target)
+            self.pendingMultiThreadUnavailable = nil
             self.appendAutomaticEvent(
                 generationID: generationID,
                 phase: "NAVIGATION",
@@ -2832,25 +3185,33 @@ final class BrowserViewModel: ObservableObject {
                     event: "NEXT_THREAD_NAVIGATION_FAILED",
                     result: "STOPPED"
                 )
-                self.finishMultiThreadSession(generationID: generationID,
-                                              result: "STOPPED_NAVIGATION_FAILED")
+                self.pendingMultiThreadNavigation = nil
+                self.skipPendingMultiThreadTargetWithoutGeneration(
+                    sessionID: sessionID,
+                    target: target,
+                    reason: "NAVIGATION_LOAD_FAILED"
+                )
                 return
             }
             self.multiThreadTransitionTask = nil
         }
     }
 
-    private func skipCurrentMultiThreadThread(generationID: UInt64) {
+    private func skipCurrentMultiThreadThread(generationID: UInt64,
+                                              reason: String = "THREAD_POSTING_UNAVAILABLE") {
         guard var session = multiThreadSession,
               session.currentGenerationID == generationID else { return }
         session.markCurrentProcessed()
+        if let targetID = session.currentTarget?.id {
+            automaticCatalogProvider?.excludeThread(id: targetID)
+        }
         multiThreadSession = session
         appendAutomaticEvent(
             generationID: generationID,
             phase: "FLOW",
             event: "THREAD_SKIPPED",
             result: "CONTINUE",
-            fields: [("REASON", "THREAD_POSTING_UNAVAILABLE")]
+            fields: [("REASON", reason)]
         )
         guard !session.stopRequested else {
             multiThreadSession = session
@@ -2889,6 +3250,7 @@ final class BrowserViewModel: ObservableObject {
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
         pendingMultiThreadNavigation = nil
+        pendingMultiThreadUnavailable = nil
         pendingHandwritingRestore = nil
         multiThreadSession = nil
         multiThreadSessionActive = false
@@ -3003,7 +3365,21 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
             setAutomaticPostStatus(.waitingForNextThread, generationID: generationID)
-            skipCurrentMultiThreadThread(generationID: generationID)
+            let skipReason: String
+            if case let .stopped(_, reason) = automaticPostMachine.state {
+                switch reason {
+                case .threadUnavailable:
+                    skipReason = "THREAD_UNAVAILABLE"
+                case .threadPostingUnavailable:
+                    skipReason = "THREAD_POSTING_UNAVAILABLE"
+                default:
+                    skipReason = "THREAD_UNAVAILABLE"
+                }
+            } else {
+                skipReason = "THREAD_UNAVAILABLE"
+            }
+            skipCurrentMultiThreadThread(generationID: generationID,
+                                         reason: skipReason)
         case .succeeded:
             if multiThreadSession != nil {
                 if let targetID = multiThreadSession?.currentTarget?.id {
@@ -3874,6 +4250,13 @@ final class BrowserViewModel: ObservableObject {
                 result: "STOPPED",
                 fields: self.automaticPostMachine.preparationDiagnosticFields
             )
+            if self.automaticPostMachine.isMultiThread {
+                self.skipActiveMultiThreadTarget(
+                    generationID: generationID,
+                    reason: "PREPARATION_TIMEOUT"
+                )
+                return
+            }
             let effect = self.automaticPostMachine.handle(
                 .fail(generationID: generationID, reason: .preparationTimeout)
             )
@@ -4272,6 +4655,7 @@ final class BrowserViewModel: ObservableObject {
         case "submitObserved": return "SUBMIT_OBSERVED"
         case "ownPostVisible": return "OWN_POST_VISIBLE"
         case "ownPostObservation": return "OWN_POST_OBSERVATION"
+        case "threadUnavailable": return "THREAD_UNAVAILABLE"
         default: return "OTHER_BRIDGE_EVENT"
         }
     }
@@ -4289,6 +4673,7 @@ final class BrowserViewModel: ObservableObject {
         case "RESTORE_SCRIPT_UNAVAILABLE": return "RESTORE_SCRIPT_UNAVAILABLE"
         case "SUBMISSION_ID_MISSING": return "SUBMISSION_ID_MISSING"
         case "PAGE_URL_MISMATCH": return "PAGE_URL_MISMATCH"
+        case "REASON_INVALID": return "REASON_INVALID"
         default: return "OTHER"
         }
     }
@@ -4319,6 +4704,9 @@ final class BrowserViewModel: ObservableObject {
     private static func automaticStopResult(for reason: AutomaticPostStopReason) -> String {
         if reason == .submitResponseTimeout {
             return "STOPPED_SUBMIT_RESPONSE_TIMEOUT"
+        }
+        if reason == .threadUnavailable {
+            return "STOPPED_THREAD_UNAVAILABLE"
         }
         return "STOPPED_\(String(describing: reason).uppercased())"
     }

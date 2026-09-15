@@ -51,6 +51,9 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(script.contains("initializeCompactPage"))
         XCTAssertTrue(script.contains("pagehelperCompactInitialized"))
         XCTAssertTrue(script.contains("retryCount >= 20"))
+        XCTAssertTrue(script.contains("type: \"threadUnavailable\""))
+        XCTAssertTrue(script.contains("THREAD_NOT_POSTABLE"))
+        XCTAssertTrue(script.contains("notifyThreadUnavailable"))
     }
 
     func testScriptIncludesGlobalDraftRetentionControls() {

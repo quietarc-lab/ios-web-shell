@@ -607,6 +607,25 @@ final class AutomaticPostFlowTests: XCTestCase {
                                 reason: .threadPostingUnavailable))
     }
 
+    func testMultiThreadSkipsUnavailableTargetDuringPreparation() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.beginMultiThreadNavigation(
+            generationID: generation,
+            oldPageToken: "old-page",
+            hasComment: true,
+            hasImage: false
+        )
+
+        XCTAssertEqual(
+            machine.skipCurrentThread(reason: .threadUnavailable),
+            .skipCurrentThread
+        )
+        XCTAssertEqual(
+            machine.state,
+            .stopped(generationID: generation, reason: .threadUnavailable)
+        )
+    }
+
     func testMultiThreadImageRestrictionRequestsNextUA() {
         var machine = AutomaticPostFlowMachine()
         _ = machine.begin(generationID: generation,

@@ -223,6 +223,31 @@ struct BrowserWebView: UIViewRepresentable {
                                          comment: comment,
                                          pageURL: message.frameInfo.request.url ?? attachedWebView?.url)
 
+            case "threadUnavailable":
+                guard let pageToken else {
+                    model.recordAutomaticBridgeIgnored(type: type,
+                                                        reason: "MISSING_PAGE_TOKEN")
+                    return
+                }
+                guard acceptPageToken(pageToken) else {
+                    model.recordAutomaticBridgeIgnored(type: type,
+                                                        reason: "CURRENT_PAGE_TOKEN_MISMATCH")
+                    return
+                }
+                guard let reason = body["reason"] as? String,
+                      reason == "THREAD_NOT_POSTABLE" else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "REASON_INVALID"
+                    )
+                    return
+                }
+                model.handleThreadUnavailable(
+                    pageToken: pageToken,
+                    pageURL: message.frameInfo.request.url ?? attachedWebView?.url,
+                    reason: reason
+                )
+
             case "submitReadiness":
                 guard let pageToken else {
                     model.recordAutomaticBridgeInvalidPayload(

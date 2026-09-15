@@ -22,6 +22,29 @@ enum CompactPageModeService {
         return token;
       })();
 
+      const nativeMessageHandler = window.webkit && window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.miniBrowserHandwriting;
+      let threadUnavailableReported = false;
+
+      function sendNative(payload) {
+        if (!nativeMessageHandler) return;
+        nativeMessageHandler.postMessage(Object.assign({ pageToken }, payload));
+      }
+
+      // A dropped/expired thread can still return HTTP 200 with an ordinary
+      // document, but without the thread container or reply form. Report
+      // that condition once after the normal short initialization window so
+      // a multi-thread session can skip it instead of waiting for the full
+      // preparation watchdog.
+      function notifyThreadUnavailable() {
+        if (threadUnavailableReported) return;
+        threadUnavailableReported = true;
+        sendNative({
+          type: "threadUnavailable",
+          reason: "THREAD_NOT_POSTABLE"
+        });
+      }
+
       function initializeCompactPage() {
         const thread = doc.querySelector("div.thre");
         const form = Array.from(doc.forms).find(candidate =>
@@ -237,14 +260,6 @@ enum CompactPageModeService {
       const submitButton = Array.from(form.querySelectorAll(
         'input[type="submit"], button[type="submit"]'
       )).find(button => /返信|送信/.test(button.value || button.textContent || ""));
-
-      const nativeMessageHandler = window.webkit && window.webkit.messageHandlers &&
-        window.webkit.messageHandlers.miniBrowserHandwriting;
-
-      function sendNative(payload) {
-        if (!nativeMessageHandler) return;
-        nativeMessageHandler.postMessage(Object.assign({ pageToken }, payload));
-      }
 
       function clearEmail() {
         if (!emailInput) return;
@@ -882,7 +897,9 @@ enum CompactPageModeService {
       let retryCount = 0;
       const retryInitialization = () => {
         retryCount += 1;
-        if (initializeCompactPage() || retryCount >= 20) {
+        const initialized = initializeCompactPage();
+        if (initialized || retryCount >= 20) {
+          if (!initialized) notifyThreadUnavailable();
           retryObserver.disconnect();
           clearInterval(retryTimer);
         }

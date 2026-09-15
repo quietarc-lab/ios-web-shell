@@ -29,6 +29,10 @@ enum AutomaticPostStopReason: Equatable {
     case imageCountRestricted
     case submitResponseTimeout
     case threadPostingUnavailable
+    /// The target document loaded, but did not expose a usable thread/form.
+    /// Multi-thread sessions may skip this target and continue with the next
+    /// snapshot entry; single-thread flows still treat it as a failure.
+    case threadUnavailable
     case catalogRefreshFailed
 }
 
@@ -498,9 +502,7 @@ struct AutomaticPostFlowMachine {
             guard isMultiThread else {
                 return (false, stop(.unknownAlert))
             }
-            state = .stopped(generationID: generationID,
-                             reason: .threadPostingUnavailable)
-            return (true, .skipCurrentThread)
+            return (true, skipCurrentThread(reason: .threadPostingUnavailable))
 
         case .imageCountRestricted, .imageContinuousPosting:
             guard isSameThreadRepeat || isMultiThread else {
@@ -558,6 +560,21 @@ struct AutomaticPostFlowMachine {
         awaitingSubmitResponseRetry = false
         state = .stopped(generationID: generationID, reason: reason)
         return .stopped(reason)
+    }
+
+    /// Marks the current multi-thread target as unavailable while preserving
+    /// the session coordinator's ability to advance to another target. This
+    /// is deliberately separate from `stop(_:)`: a missing/dead target is a
+    /// per-thread condition, not a terminal batch failure.
+    mutating func skipCurrentThread(reason: AutomaticPostStopReason) -> AutomaticPostFlowEffect {
+        guard isMultiThread,
+              isActive,
+              let generationID else {
+            return .none
+        }
+        awaitingSubmitResponseRetry = false
+        state = .stopped(generationID: generationID, reason: reason)
+        return .skipCurrentThread
     }
 
     /// Forces an active generation into a terminal state without producing a
