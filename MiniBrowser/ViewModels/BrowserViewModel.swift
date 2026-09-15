@@ -74,6 +74,15 @@ final class BrowserViewModel: ObservableObject {
     /// a newly selected catalog target. Keep it associated with the frame URL
     /// until the matching generation owns the page; never replay it globally.
     private var pendingHandwritingReady: (pageURL: URL?, pageToken: String, ready: Bool)?
+    /// A canvas restoration started before a multi-thread destination finished
+    /// loading has no generation ID to embed in its asynchronous callback. Keep
+    /// the request identity long enough to bind that one callback to the new
+    /// generation after navigation completes.
+    private struct PendingHandwritingRestore: Equatable {
+        let pageURL: URL
+        let pageToken: String
+    }
+    private var pendingHandwritingRestore: PendingHandwritingRestore?
     /// A multi-thread destination with a captured comment must not accept an
     /// empty/different early compactReady signal while its draft restoration
     /// script is still running.
@@ -686,6 +695,7 @@ final class BrowserViewModel: ObservableObject {
         automaticPostStatusTask = nil
         latestCompactReady = nil
         pendingHandwritingReady = nil
+        pendingHandwritingRestore = nil
         automaticDraftRestorePendingGeneration = nil
         automaticCookieRelatedCount = nil
         automaticCookieCountDelta = nil
@@ -850,6 +860,7 @@ final class BrowserViewModel: ObservableObject {
         sitePostStatus = nil
         latestCompactReady = nil
         pendingHandwritingReady = nil
+        pendingHandwritingRestore = nil
         refreshNavigationState()
     }
 
@@ -874,12 +885,31 @@ final class BrowserViewModel: ObservableObject {
         automaticPostMachine.isStalePageToken(pageToken)
     }
 
-    func handwritingPreparationGenerationID(pageToken: String) -> UInt64? {
-        guard automaticPostMachine.isActive,
-              !automaticPostMachine.isStalePageToken(pageToken) else {
+    func handwritingPreparationGenerationID(pageToken: String,
+                                            pageURL: URL? = nil) -> UInt64? {
+        guard !automaticPostMachine.isStalePageToken(pageToken) else {
             return nil
         }
-        return automaticPostMachine.generationID
+        if automaticPostMachine.isActive {
+            return automaticPostMachine.generationID
+        }
+
+        // During a multi-thread transition the destination document can create
+        // its canvas before didFinish starts the destination generation. The
+        // restoration script must still run, but its callback is intentionally
+        // unbound until the destination generation owns the matching page.
+        guard let pageURL,
+              let pendingNavigation = pendingMultiThreadNavigation,
+              let session = multiThreadSession,
+              session.sessionID == pendingNavigation.sessionID,
+              Self.sameTargetThreadURL(pageURL, pendingNavigation.target.threadURL) else {
+            return nil
+        }
+        pendingHandwritingRestore = PendingHandwritingRestore(
+            pageURL: pageURL,
+            pageToken: pageToken
+        )
+        return nil
     }
 
     func handleCompactReady(pageToken: String,
@@ -1130,6 +1160,11 @@ final class BrowserViewModel: ObservableObject {
                                          reason: "PAGE_URL_MISMATCH")
             return
         }
+        let callbackURL = pageURL ?? webView?.url
+        let isPendingMultiThreadRestore = incomingGenerationID == nil &&
+            automaticPostMachine.isMultiThread &&
+            matchesPendingHandwritingRestore(pageToken: pageToken,
+                                             pageURL: callbackURL)
         let handwritingTokenAccepted = automaticPostMachine.pageToken == pageToken ||
             (automaticPostMachine.pageToken == nil &&
              !automaticPostMachine.isStalePageToken(pageToken))
@@ -1143,7 +1178,7 @@ final class BrowserViewModel: ObservableObject {
             )
             return
         }
-        guard incomingGenerationID == generationID else {
+        guard incomingGenerationID == generationID || isPendingMultiThreadRestore else {
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "BRIDGE",
@@ -1155,6 +1190,17 @@ final class BrowserViewModel: ObservableObject {
                 ]
             )
             return
+        }
+        if isPendingMultiThreadRestore {
+            pendingHandwritingRestore = nil
+        } else if let callbackURL,
+                  pendingHandwritingRestore?.pageToken == pageToken,
+                  Self.sameTargetThreadURL(pendingHandwritingRestore?.pageURL,
+                                           callbackURL) {
+            // An exactly tagged callback supersedes any pre-finish unbound
+            // request for the same page, preventing a late duplicate from
+            // authorizing a second readiness transition.
+            pendingHandwritingRestore = nil
         }
         let effect = automaticPostMachine.handle(.markHandwritingReady(
             generationID: generationID,
@@ -1172,6 +1218,9 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         var handwritingFields = [("PAGE_TOKEN_STATE", "MATCH")]
+        if isPendingMultiThreadRestore {
+            handwritingFields.append(("GENERATION_ID_STATE", "BOUND_FROM_PENDING_RESTORE"))
+        }
         if !ready {
             handwritingFields.append(("FAILURE_REASON", "PAYLOAD_NOT_READY"))
         }
@@ -1602,8 +1651,8 @@ final class BrowserViewModel: ObservableObject {
         }
         if let handwriting = preFinishHandwritingReady,
            Self.sameTargetThreadURL(handwriting.pageURL, destinationURL),
-           handwriting.pageToken != oldPageToken,
-           handwriting.ready {
+           handwriting.pageToken != oldPageToken {
+            pendingHandwritingRestore = nil
             handleHandwritingReady(pageToken: handwriting.pageToken,
                                    ready: handwriting.ready,
                                    generationID: generationID,
@@ -2737,6 +2786,7 @@ final class BrowserViewModel: ObservableObject {
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
         pendingMultiThreadNavigation = nil
+        pendingHandwritingRestore = nil
         multiThreadSession = nil
         multiThreadSessionActive = false
         multiThreadEnabled = false
@@ -3750,6 +3800,7 @@ final class BrowserViewModel: ObservableObject {
         automaticContinuousAPCompletedUptimeNanoseconds = nil
         latestCompactReady = nil
         pendingHandwritingReady = nil
+        pendingHandwritingRestore = nil
         automaticDraftRestorePendingGeneration = nil
         if automaticPostRepeatSession != nil,
            result.hasPrefix("STOPPED") || !sameThreadRepeatEnabled {
@@ -4205,6 +4256,19 @@ final class BrowserViewModel: ObservableObject {
               isTargetThreadURL(rhs) else { return false }
         return lhs.host?.lowercased() == rhs.host?.lowercased() &&
             lhs.path == rhs.path
+    }
+
+    private func matchesPendingHandwritingRestore(pageToken: String,
+                                                  pageURL: URL?) -> Bool {
+        guard let pendingHandwritingRestore,
+              pendingHandwritingRestore.pageToken == pageToken,
+              Self.sameTargetThreadURL(pendingHandwritingRestore.pageURL, pageURL),
+              let session = multiThreadSession,
+              let currentTarget = session.currentTarget,
+              Self.sameTargetThreadURL(currentTarget.threadURL, pageURL) else {
+            return false
+        }
+        return true
     }
 
     private static func appPurposeGenerationID(_ purpose: APPurpose) -> UInt64? {

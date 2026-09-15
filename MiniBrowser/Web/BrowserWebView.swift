@@ -142,8 +142,10 @@ struct BrowserWebView: UIViewRepresentable {
                                                         reason: "CURRENT_PAGE_TOKEN_MISMATCH")
                     return
                 }
+                let canvasPageURL = message.frameInfo.request.url ?? attachedWebView?.url
                 let preparationGenerationID = model.handwritingPreparationGenerationID(
-                    pageToken: pageToken
+                    pageToken: pageToken,
+                    pageURL: canvasPageURL
                 )
                 guard let script = handwritingImageStore.restorationScript(
                     generationID: preparationGenerationID
@@ -160,7 +162,7 @@ struct BrowserWebView: UIViewRepresentable {
                         pageToken: pageToken,
                         ready: false,
                         generationID: preparationGenerationID,
-                        pageURL: self.attachedWebView?.url
+                        pageURL: canvasPageURL ?? self.attachedWebView?.url
                     )
                 }
 
