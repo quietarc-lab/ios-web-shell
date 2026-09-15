@@ -60,4 +60,40 @@ final class MultiThreadPostSessionTests: XCTestCase {
         XCTAssertEqual(session.snapshot.targets.map(\.id), ["1", "2"])
         XCTAssertEqual(session.advanceToNextUnprocessed()?.id, "2")
     }
+
+    func testTwoAcceptedPostsRequestUserAgentRotationAndSkippedTargetsDoNotCount() {
+        let target = CatalogPostTarget(
+            id: "1",
+            threadURL: URL(string: "https://img.2chan.net/b/res/1.htm")!
+        )
+        var session = MultiThreadPostSession(
+            sessionID: 2,
+            snapshot: CatalogPostSnapshot(sort: .momentum, targets: [target]),
+            comment: nil,
+            hasImage: true
+        )
+
+        XCTAssertFalse(session.shouldRotateUserAgent)
+        XCTAssertEqual(MultiThreadPostSession.userAgentPostBatchLimit, 2)
+        session.markCurrentProcessed()
+        XCTAssertEqual(session.postsSinceUserAgentChange, 0)
+        session.recordAcceptedPost()
+        XCTAssertFalse(session.shouldRotateUserAgent)
+        session.recordAcceptedPost()
+        XCTAssertTrue(session.shouldRotateUserAgent)
+
+        session.resetUserAgentPostCount()
+        XCTAssertFalse(session.shouldRotateUserAgent)
+    }
+
+    func testCatalogTargetRetainsReplyCountForStaleCompletedEntries() {
+        let target = CatalogPostTarget(
+            id: "1000",
+            threadURL: URL(string: "https://img.2chan.net/b/res/1000.htm")!,
+            replyCount: 1_000
+        )
+
+        XCTAssertTrue(target.isReplyLimitReached)
+        XCTAssertEqual(target.replyCount, 1_000)
+    }
 }

@@ -18,6 +18,7 @@ enum AutomaticPostStatus: String, Equatable {
     case waitingForRepeat = "同スレ次回待機"
     case waitingForNextThread = "次スレ待機"
     case navigatingToNextThread = "次スレへ移動中"
+    case switchingAfterThreadBatch = "2スレ投稿 → 次のUAへ"
     case refreshingCatalog = "カタログ再取得中"
     case acceptedPendingVerification = "受付済み・反映確認中"
     case completed = "完了"
@@ -32,7 +33,8 @@ enum AutomaticPostStatus: String, Equatable {
              .reconnectingAfterIPLimit, .finalSendAfterIPChange,
              .switchingAfterAccessRestriction, .reconnectingAfterContinuousLimit,
              .finalSendAfterContinuousLimit, .waitingForRepeat,
-             .waitingForNextThread, .navigatingToNextThread, .refreshingCatalog,
+             .waitingForNextThread, .navigatingToNextThread,
+             .switchingAfterThreadBatch, .refreshingCatalog,
              .acceptedPendingVerification:
             return false
         }

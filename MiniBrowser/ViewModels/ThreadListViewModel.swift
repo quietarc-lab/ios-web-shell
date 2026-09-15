@@ -109,14 +109,12 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
 
     func currentPostSnapshot(limit: Int = 60) -> CatalogPostSnapshot {
         purgeExpiredThreadExclusions()
-        let boundedLimit = min(Self.listItemLimit, max(0, limit))
         return CatalogPostSnapshot(
             sort: selectedSort,
-            targets: items.filter { !excludedThreadIDs.contains($0.id) }
-                .prefix(boundedLimit)
-                .map {
-                CatalogPostTarget(id: $0.id, threadURL: $0.threadURL)
-            }
+            targets: Self.postTargets(from: items,
+                                      openCounts: openCounts,
+                                      excludedIDs: excludedThreadIDs,
+                                      limit: limit)
         )
     }
 
@@ -152,9 +150,10 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
         // next target transition.
         return CatalogPostSnapshot(
             sort: sort,
-            targets: loaded.map {
-                CatalogPostTarget(id: $0.id, threadURL: $0.threadURL)
-            }
+            targets: Self.postTargets(from: loaded,
+                                      openCounts: openCounts,
+                                      excludedIDs: excluded,
+                                      limit: limit)
         )
     }
 
@@ -279,6 +278,30 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
         } else {
             defaults.set(values, forKey: Keys.excludedThreadExpirations)
         }
+    }
+
+    /// Builds the deterministic target list used by automatic multi-thread
+    /// posting. Viewed threads are filtered before the limit is applied, so a
+    /// snapshot may intentionally contain fewer than 60 entries.
+    static func postTargets(from source: [ThreadListItem],
+                            openCounts: [String: Int],
+                            excludedIDs: Set<String> = [],
+                            limit: Int = 60) -> [CatalogPostTarget] {
+        let boundedLimit = min(Self.listItemLimit, max(0, limit))
+        guard boundedLimit > 0 else { return [] }
+        return source
+            .filter {
+                !$0.id.isEmpty &&
+                !excludedIDs.contains($0.id) &&
+                openCounts[$0.id, default: 0] == 0 &&
+                $0.replyCount < 1_000
+            }
+            .prefix(boundedLimit)
+            .map {
+                CatalogPostTarget(id: $0.id,
+                                  threadURL: $0.threadURL,
+                                  replyCount: $0.replyCount)
+            }
     }
 
     private func loadThumbnails(for loaded: [ThreadListItem],

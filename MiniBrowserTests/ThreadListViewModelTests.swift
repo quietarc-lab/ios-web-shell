@@ -150,4 +150,48 @@ final class ThreadListViewModelTests: XCTestCase {
         XCTAssertNil(stored?["old"])
         XCTAssertNotNil(stored?["new"])
     }
+
+    func testPostTargetsUseOnlyUnviewedThreadsAndMayContainFewerThanLimit() {
+        let items = (1...4).map { id in
+            ThreadListItem(
+                id: String(id),
+                threadURL: URL(string: "https://img.2chan.net/b/res/\(id).htm")!,
+                thumbnailURL: URL(string: "https://img.2chan.net/b/cat/\(id)s.jpg")!,
+                replyCount: id == 4 ? 1_000 : id,
+                thumbnailData: nil,
+                openerText: nil
+            )
+        }
+
+        let targets = ThreadListViewModel.postTargets(
+            from: items,
+            openCounts: ["2": 1],
+            excludedIDs: ["3"],
+            limit: 60
+        )
+
+        XCTAssertEqual(targets.map(\.id), ["1"])
+        XCTAssertEqual(targets.first?.replyCount, 1)
+    }
+
+    func testPostTargetsApplyLimitAfterViewedAndCompletedFiltering() {
+        let items = (1...5).map { id in
+            ThreadListItem(
+                id: String(id),
+                threadURL: URL(string: "https://img.2chan.net/b/res/\(id).htm")!,
+                thumbnailURL: URL(string: "https://img.2chan.net/b/cat/\(id)s.jpg")!,
+                replyCount: id,
+                thumbnailData: nil,
+                openerText: nil
+            )
+        }
+
+        let targets = ThreadListViewModel.postTargets(
+            from: items,
+            openCounts: ["1": 1, "2": 2],
+            limit: 2
+        )
+
+        XCTAssertEqual(targets.map(\.id), ["3", "4"])
+    }
 }

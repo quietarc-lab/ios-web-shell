@@ -640,6 +640,16 @@ final class BrowserViewModel: ObservableObject {
         runtimeUserAgent = nil
         defaults.set(selectedUAIndex, forKey: Keys.userAgentIndex)
         defaults.set(currentUserAgent.id, forKey: Keys.userAgentID)
+        if automatic,
+           multiThread,
+           !newAutomaticSession,
+           var session = multiThreadSession {
+            // A restriction handoff or the scheduled two-target UA rotation
+            // starts a fresh UA batch. The in-memory draft/session itself is
+            // retained, but accepted-post counting begins at zero again.
+            session.resetUserAgentPostCount()
+            multiThreadSession = session
+        }
         if automatic {
             automaticTriedUAIDs.insert(currentUserAgent.id)
             if let session = multiThreadSession, multiThread {
@@ -1541,6 +1551,41 @@ final class BrowserViewModel: ObservableObject {
                     pageURL: loadedURL,
                     generationID: generationID,
                     oldPageToken: nil,
+                    hasComment: session.comment?.isEmpty == false,
+                    comment: session.comment,
+                    hasImage: session.hasImage,
+                    automatic: true,
+                    readError: false,
+                    targetUAIndex: nil,
+                    excludedUAIDs: automaticTriedUAIDs,
+                    newAutomaticSession: false,
+                    multiThread: true
+                )
+            } else if let previousGenerationID = session.currentGenerationID,
+                      session.shouldRotateUserAgent {
+                // A multi-thread session keeps one UA for two accepted target
+                // posts. The next target is loaded first, then the normal UA
+                // refresh generation is started on that destination page.
+                appendAutomaticEvent(
+                    generationID: previousGenerationID,
+                    phase: "FLOW",
+                    event: "UA_ROTATION_AFTER_TWO_THREADS",
+                    result: "NEXT_UA_REQUESTED",
+                    fields: [
+                        ("POSTS_SINCE_UA_CHANGE",
+                         String(session.postsSinceUserAgentChange))
+                    ]
+                )
+                automaticPostGeneration &+= 1
+                let generationID = automaticPostGeneration
+                setAutomaticPostStatus(
+                    .switchingAfterThreadBatch,
+                    generationID: previousGenerationID
+                )
+                startUserAgentChange(
+                    pageURL: loadedURL,
+                    generationID: generationID,
+                    oldPageToken: automaticPostMachine.pageToken,
                     hasComment: session.comment?.isEmpty == false,
                     comment: session.comment,
                     hasImage: session.hasImage,
@@ -2560,16 +2605,25 @@ final class BrowserViewModel: ObservableObject {
         }
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
+        if !afterSkippedThread {
+            session.recordAcceptedPost()
+        }
         session.markCurrentProcessed()
-        multiThreadSession = session
 
         guard !session.stopRequested else {
+            multiThreadSession = session
             finishMultiThreadSession(generationID: generationID,
                                      result: "STOPPED_MULTI_THREAD_DISABLED")
             return
         }
 
-        if let next = session.advanceToNextUnprocessed() {
+        let nextResult = nextMultiThreadPostableTarget(session: &session)
+        multiThreadSession = session
+        if !nextResult.replyLimitSkippedIDs.isEmpty {
+            logReplyLimitSkips(nextResult.replyLimitSkippedIDs,
+                               generationID: generationID)
+        }
+        if let next = nextResult.target {
             multiThreadSession = session
             scheduleMultiThreadNavigation(sessionID: session.sessionID,
                                           generationID: generationID,
@@ -2638,7 +2692,13 @@ final class BrowserViewModel: ObservableObject {
                     ]
                 )
                 self.multiThreadTransitionTask = nil
-                if let next = current.advanceToNextUnprocessed() {
+                let nextResult = self.nextMultiThreadPostableTarget(session: &current)
+                self.multiThreadSession = current
+                if !nextResult.replyLimitSkippedIDs.isEmpty {
+                    self.logReplyLimitSkips(nextResult.replyLimitSkippedIDs,
+                                            generationID: generationID)
+                }
+                if let next = nextResult.target {
                     self.multiThreadSession = current
                     self.scheduleMultiThreadNavigation(
                         sessionID: sessionID,
@@ -2689,6 +2749,41 @@ final class BrowserViewModel: ObservableObject {
                 )
             }
         }
+    }
+
+    /// Advances over stale snapshot entries that reached the 1,000-reply
+    /// limit after the catalog was captured. Such entries are the only
+    /// non-alert condition that removes a target from a running session.
+    private func nextMultiThreadPostableTarget(
+        session: inout MultiThreadPostSession
+    ) -> (target: CatalogPostTarget?, replyLimitSkippedIDs: [String]) {
+        var skippedIDs: [String] = []
+        while let target = session.advanceToNextUnprocessed() {
+            guard !target.isReplyLimitReached else {
+                session.markCurrentProcessed()
+                automaticCatalogProvider?.excludeThread(id: target.id)
+                skippedIDs.append(target.id)
+                continue
+            }
+            return (target, skippedIDs)
+        }
+        return (nil, skippedIDs)
+    }
+
+    private func logReplyLimitSkips(_ skippedIDs: [String],
+                                   generationID: UInt64) {
+        guard !skippedIDs.isEmpty else { return }
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "FLOW",
+            event: "THREAD_SKIPPED",
+            result: "CONTINUE",
+            fields: [
+                ("REASON", "REPLY_LIMIT"),
+                ("SKIPPED_COUNT", String(skippedIDs.count)),
+                ("SKIPPED_THREAD_IDS", skippedIDs.joined(separator: ","))
+            ]
+        )
     }
 
     private func scheduleMultiThreadNavigation(sessionID: UInt64,
@@ -2757,13 +2852,21 @@ final class BrowserViewModel: ObservableObject {
             result: "CONTINUE",
             fields: [("REASON", "THREAD_POSTING_UNAVAILABLE")]
         )
-        guard !session.stopRequested,
-              let next = session.advanceToNextUnprocessed() else {
+        guard !session.stopRequested else {
+            multiThreadSession = session
             scheduleNextMultiThread(generationID: generationID,
                                     afterSkippedThread: true)
             return
         }
+        let nextResult = nextMultiThreadPostableTarget(session: &session)
         multiThreadSession = session
+        logReplyLimitSkips(nextResult.replyLimitSkippedIDs,
+                           generationID: generationID)
+        guard let next = nextResult.target else {
+            scheduleNextMultiThread(generationID: generationID,
+                                    afterSkippedThread: true)
+            return
+        }
         scheduleMultiThreadNavigation(sessionID: session.sessionID,
                                       generationID: generationID,
                                       target: next,
@@ -3973,6 +4076,8 @@ final class BrowserViewModel: ObservableObject {
                   automaticPostMachine.generationID == context.generationID {
             fields.append(("SESSION_ID", String(session.sessionID)))
             fields.append(("TARGET_INDEX", String(session.currentIndex + 1)))
+            fields.append(("POSTS_SINCE_UA_CHANGE",
+                           String(session.postsSinceUserAgentChange)))
             if let targetID = session.currentTargetID {
                 fields.append(("THREAD_ID", targetID))
             }

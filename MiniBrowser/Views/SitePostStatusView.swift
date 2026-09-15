@@ -33,6 +33,7 @@ struct SitePostStatusView: View {
                  .switchingAfterAccessRestriction, .reconnectingAfterContinuousLimit,
                  .finalSendAfterContinuousLimit, .waitingForRepeat,
                  .waitingForNextThread, .navigatingToNextThread,
+                 .switchingAfterThreadBatch,
                  .refreshingCatalog,
                  .acceptedPendingVerification:
                 return .blue
