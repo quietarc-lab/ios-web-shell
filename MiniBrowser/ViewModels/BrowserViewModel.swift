@@ -372,7 +372,10 @@ final class BrowserViewModel: ObservableObject {
                 targetUAIndex: nil,
                 excludedUAIDs: [],
                 newAutomaticSession: true,
-                multiThread: shouldStartMulti
+                multiThread: shouldStartMulti,
+                sameThreadRepeat: shouldStartAutomatic &&
+                    sameThreadRepeatEnabled &&
+                    !shouldStartMulti
             )
         }
     }
@@ -566,6 +569,9 @@ final class BrowserViewModel: ObservableObject {
         setAutomaticPostStatus(.switchingAfterAccessRestriction,
                                generationID: previousGenerationID)
         let oldPageToken = automaticPostMachine.pageToken ?? latestCompactReady?.pageToken
+        let continueSameThreadRepeat = sameThreadRepeatEnabled &&
+            automaticPostRepeatSession != nil &&
+            !automaticPostMachine.isMultiThread
         automaticPostGeneration &+= 1
         let nextGenerationID = automaticPostGeneration
         startUserAgentChange(
@@ -580,7 +586,8 @@ final class BrowserViewModel: ObservableObject {
             targetUAIndex: nextIndex,
             excludedUAIDs: automaticTriedUAIDs,
             newAutomaticSession: false,
-            multiThread: automaticPostMachine.isMultiThread
+            multiThread: automaticPostMachine.isMultiThread,
+            sameThreadRepeat: continueSameThreadRepeat
         )
     }
 
@@ -633,7 +640,8 @@ final class BrowserViewModel: ObservableObject {
                                       targetUAIndex: Int?,
                                       excludedUAIDs: Set<Int>,
                                       newAutomaticSession: Bool,
-                                      multiThread: Bool = false) {
+                                      multiThread: Bool = false,
+                                      sameThreadRepeat: Bool = false) {
         guard let webView else {
             isUAChanging = false
             if multiThreadSession != nil {
@@ -772,6 +780,7 @@ final class BrowserViewModel: ObservableObject {
                                                 ? (multiThreadSession?.hasImage ?? hasImage)
                                                 : hasImage,
                                             multiThread: multiThread,
+                                            sameThreadRepeat: sameThreadRepeat,
                                             submissionIDSeed: submissionIDSeed)
             if var session = multiThreadSession, multiThread {
                 session.currentGenerationID = generationID

@@ -311,6 +311,32 @@ final class AutomaticPostFlowTests: XCTestCase {
                                 reason: .imageCountRestricted))
     }
 
+    func testSameThreadModeSurvivesUAHandoffGeneration() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.begin(generationID: generation,
+                          oldPageToken: nil,
+                          hasComment: false,
+                          hasImage: true,
+                          sameThreadRepeat: true)
+        _ = machine.handle(.markAPCompleted(generationID: generation))
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCookieObserved(generationID: generation))
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: false,
+                                              canSubmit: true))
+        _ = machine.handle(.markHandwritingReady(generationID: generation,
+                                                  pageToken: "page",
+                                                  ready: true))
+        _ = submitAfterReadiness(&machine)
+
+        XCTAssertTrue(machine.isSameThreadRepeat)
+        let result = machine.handleAlert(.imageCountRestricted,
+                                         generationID: generation)
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .startNextAutomaticFlow)
+    }
+
     func testImageCountRestrictionOutsideSameThreadRemainsNormalAlert() {
         var machine = readyMachine(hasComment: true, hasImage: false)
         let result = machine.handleAlert(.imageCountRestricted,

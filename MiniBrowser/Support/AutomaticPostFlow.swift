@@ -210,6 +210,7 @@ struct AutomaticPostFlowMachine {
                         hasComment: Bool,
                         hasImage: Bool,
                         multiThread: Bool = false,
+                        sameThreadRepeat: Bool = false,
                         submissionIDSeed: UInt64? = nil) -> AutomaticPostFlowEffect {
         guard hasComment || hasImage else {
             state = .stopped(generationID: generationID, reason: .noContent)
@@ -218,7 +219,12 @@ struct AutomaticPostFlowMachine {
         }
 
         self.generationID = generationID
-        isSameThreadRepeat = false
+        // A UA handoff starts a fresh generation, but it can still belong to
+        // the same-thread repeat session. Preserve that mode so image-limit
+        // and continuous-post alerts keep their session-specific recovery
+        // behavior after the handoff. Multi-thread generations have their
+        // own mode and must not be classified as same-thread repeats.
+        isSameThreadRepeat = sameThreadRepeat && !multiThread
         isMultiThread = multiThread
         stalePageToken = oldPageToken
         pageToken = nil
