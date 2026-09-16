@@ -53,6 +53,20 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertEqual(
             TargetPageAlertClassifier.category(
                 host: "img.2chan.net",
+                message: "連続投稿はしばらく\n時間を置いてからお願い致します"
+            ),
+            .continuousPosting
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "連続投稿はしばらく時間を置いてからお願い致します。"
+            ),
+            .continuousPosting
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
                 message: "画像連続投稿はもうしばらく\n時間を置いてからお願い致します"
             ),
             .imageContinuousPosting
@@ -128,6 +142,10 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "img.2chan.net",
             message: "画像連続投稿はもうしばらく時間を置いてからお願い致します（再試行）"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "img.2chan.net",
+            message: "連続投稿はしばらく時間を置いてからお願い致します（再試行）"
         ))
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",

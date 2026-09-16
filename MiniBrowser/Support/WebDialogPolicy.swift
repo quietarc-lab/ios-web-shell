@@ -33,7 +33,12 @@ enum TargetPageAlertClassifier {
                             options: .regularExpression) != nil {
             return .accessRestricted
         }
-        if normalized == "連続投稿はもうしばらく時間を置いてからお願い致します。" {
+        // Some target pages omit 「もう」 and/or the final punctuation. Keep
+        // those observed exact variants on the same continuous-posting path;
+        // embellished or otherwise similar text must remain unknown.
+        if normalized == "連続投稿はもうしばらく時間を置いてからお願い致します。" ||
+            normalized == "連続投稿はしばらく時間を置いてからお願い致します" ||
+            normalized == "連続投稿はしばらく時間を置いてからお願い致します。" {
             return .continuousPosting
         }
         // The image-posting form uses a distinct, exact wording for the same
