@@ -133,6 +133,14 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(BrowserViewModel.sameThreadRepeatSubmitDelayNanoseconds, 0)
     }
 
+    func testMultiThreadSuccessAndContinuousAPRetryUseOneSecondBuffers() {
+        XCTAssertEqual(BrowserViewModel.multiThreadSuccessWaitNanoseconds,
+                       1_000_000_000)
+        XCTAssertEqual(BrowserViewModel.continuousAPRetryDelayNanoseconds,
+                       1_000_000_000)
+        XCTAssertEqual(AutomaticPostFlowMachine.continuousAPReconnectAttemptLimit, 3)
+    }
+
     func testMultiThreadToggleStartsOffIsNotPersistedAndIsExclusive() {
         let suiteName = "BrowserViewModelTests.multiThreadToggle.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

@@ -8,6 +8,8 @@ final class BrowserViewModel: ObservableObject {
     private static let standardSubmitDelayNanoseconds: UInt64 = 2_000_000_000
     static let sameThreadRepeatMinimumDelayNanoseconds: UInt64 = 250_000_000
     static let sameThreadRepeatSubmitDelayNanoseconds: UInt64 = 0
+    static let multiThreadSuccessWaitNanoseconds: UInt64 = 1_000_000_000
+    static let continuousAPRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
     private static let automaticSubmitResponseTimeoutNanoseconds: UInt64 = 15_000_000_000
 
@@ -51,6 +53,7 @@ final class BrowserViewModel: ObservableObject {
     private var automaticPostRepeatSession: AutomaticPostRepeatSession?
     private var automaticPostRepeatSessionID: UInt64 = 0
     private var automaticPostRepeatDelayTask: Task<Void, Never>?
+    private var automaticContinuousAPRetryDelayTask: Task<Void, Never>?
     private var multiThreadSession: MultiThreadPostSession?
     private var multiThreadSessionID: UInt64 = 0
     private var multiThreadTransitionTask: Task<Void, Never>?
@@ -761,6 +764,7 @@ final class BrowserViewModel: ObservableObject {
         automaticPostVerificationTask = nil
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
+        cancelAutomaticContinuousAPRetryDelay()
         automaticSubmitReadinessTask = nil
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessDeadline = nil
@@ -1946,6 +1950,7 @@ final class BrowserViewModel: ObservableObject {
         automaticPostVerificationTask = nil
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
+        cancelAutomaticContinuousAPRetryDelay()
         automaticSubmitReadinessStableSince = nil
         automaticSubmitReadinessDeadline = nil
         automaticSubmitReadinessLastReason = nil
@@ -2783,9 +2788,8 @@ final class BrowserViewModel: ObservableObject {
             handleAutomaticPostEffect(effect, generationID: generationID)
         case let .automaticContinuousRetry(generationID):
             guard automaticPostMachine.generationID == generationID else { break }
-            let ipChanged = before != nil && after != nil && before != after
-            automaticAPResult = ipChanged ? "RECONNECTED" : "FAILED"
-            guard ipChanged else {
+            guard before != nil, after != nil else {
+                automaticAPResult = "FAILED"
                 appendAutomaticEvent(
                     generationID: generationID,
                     phase: "AP",
@@ -2794,6 +2798,44 @@ final class BrowserViewModel: ObservableObject {
                     fields: [("RESULT", result)]
                 )
                 stopAutomaticPost(.communicationFailure, generationID: generationID)
+                return
+            }
+            let ipChanged = before != after
+            automaticAPResult = ipChanged ? "RECONNECTED" : "FAILED"
+            guard ipChanged else {
+                guard case .waitingForContinuousAPRetry = automaticPostMachine.state else {
+                    return
+                }
+                let effect = automaticPostMachine.handle(
+                    .continuousAPReconnectUnchanged(generationID: generationID)
+                )
+                if case .scheduleContinuousAPReconnectRetry = effect {
+                    appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "AP",
+                        event: "CONTINUOUS_AP_RETRY_UNCHANGED",
+                        result: "RETRY_SCHEDULED",
+                        fields: [
+                            ("AP_ATTEMPT",
+                             String(automaticPostMachine.continuousAPReconnectAttempts - 1)),
+                            ("DELAY_MS",
+                             String(Self.continuousAPRetryDelayNanoseconds / 1_000_000))
+                        ]
+                    )
+                } else {
+                    appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "AP",
+                        event: "CONTINUOUS_AP_RETRY_FAILED",
+                        result: "STOPPED",
+                        fields: [
+                            ("RESULT", result),
+                            ("AP_ATTEMPT",
+                             String(automaticPostMachine.continuousAPReconnectAttempts))
+                        ]
+                    )
+                }
+                handleAutomaticPostEffect(effect, generationID: generationID)
                 return
             }
             appendAutomaticEvent(
@@ -3147,6 +3189,7 @@ final class BrowserViewModel: ObservableObject {
         cancelAutomaticSubmitResponseTimer()
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
+        cancelAutomaticContinuousAPRetryDelay()
         automaticReloadGeneration = nil
         if pendingCookieRefresh?.automaticGenerationID == generationID {
             pendingCookieRefresh = nil
@@ -3228,7 +3271,7 @@ final class BrowserViewModel: ObservableObject {
         guard multiThreadSession?.sessionID == sessionID,
               multiThreadEnabled,
               let webView else { return }
-        let delayNanoseconds: UInt64 = skipped ? 0 : 3_000_000_000
+        let delayNanoseconds: UInt64 = skipped ? 0 : Self.multiThreadSuccessWaitNanoseconds
         setMultiThreadStatusWithoutGeneration(.waitingForNextThread)
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = Task { @MainActor [weak self] in
@@ -3325,7 +3368,7 @@ final class BrowserViewModel: ObservableObject {
         guard multiThreadSession?.sessionID == sessionID,
               multiThreadEnabled,
               let webView else { return }
-        let delayNanoseconds: UInt64 = skipped ? 0 : 3_000_000_000
+        let delayNanoseconds: UInt64 = skipped ? 0 : Self.multiThreadSuccessWaitNanoseconds
         setAutomaticPostStatus(.waitingForNextThread, generationID: generationID)
         appendAutomaticEvent(
             generationID: generationID,
@@ -3430,6 +3473,7 @@ final class BrowserViewModel: ObservableObject {
         }
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
+        cancelAutomaticContinuousAPRetryDelay()
         pendingMultiThreadNavigation = nil
         pendingMultiThreadAvailabilityProbe = nil
         pendingMultiThreadUnavailable = nil
@@ -3517,12 +3561,16 @@ final class BrowserViewModel: ObservableObject {
                 purpose: .automaticIPRetry(generationID: generationID)
             )
         case .startContinuousAPReconnect:
+            cancelAutomaticContinuousAPRetryDelay()
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "AP",
                 event: "CONTINUOUS_AP_RETRY",
                 result: "STARTED",
-                fields: [("AP_PURPOSE", "AUTOMATIC_CONTINUOUS_RETRY")]
+                fields: [
+                    ("AP_ATTEMPT", String(automaticPostMachine.continuousAPReconnectAttempts)),
+                    ("AP_PURPOSE", "AUTOMATIC_CONTINUOUS_RETRY")
+                ]
             )
             setAutomaticPostStatus(.reconnectingAfterContinuousLimit,
                                    generationID: generationID)
@@ -3530,6 +3578,8 @@ final class BrowserViewModel: ObservableObject {
                 reloadAfterCompletion: false,
                 purpose: .automaticContinuousRetry(generationID: generationID)
             )
+        case .scheduleContinuousAPReconnectRetry:
+            scheduleContinuousAPReconnectRetry(generationID: generationID)
         case .startNextAutomaticFlow:
             appendAutomaticEvent(
                 generationID: generationID,
@@ -3875,6 +3925,7 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessFalseLogged = false
         automaticSubmitReadinessReason = nil
         automaticContinuousAPCompletedUptimeNanoseconds = nil
+        cancelAutomaticContinuousAPRetryDelay()
         setAutomaticPostStatus(.waitingForRepeat, generationID: generationID)
         startAutomaticPostPreparationTimeout(generationID: generationID)
         updateIdleTimerState()
@@ -4151,6 +4202,45 @@ final class BrowserViewModel: ObservableObject {
                                             generationID: generationID)
                 }
             }
+        }
+    }
+
+    private func scheduleContinuousAPReconnectRetry(generationID: UInt64) {
+        guard automaticPostMachine.generationID == generationID,
+              case .waitingForContinuousAPRetry = automaticPostMachine.state,
+              automaticPostMachine.continuousAPReconnectAttempts > 1 else {
+            return
+        }
+        let attempt = automaticPostMachine.continuousAPReconnectAttempts
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "AP",
+            event: "CONTINUOUS_AP_RETRY_SCHEDULED",
+            result: "SCHEDULED",
+            fields: [
+                ("AP_ATTEMPT", String(attempt)),
+                ("DELAY_MS", String(Self.continuousAPRetryDelayNanoseconds / 1_000_000)),
+                ("AP_PURPOSE", "AUTOMATIC_CONTINUOUS_RETRY")
+            ]
+        )
+        setAutomaticPostStatus(.reconnectingAfterContinuousLimit,
+                               generationID: generationID)
+        cancelAutomaticContinuousAPRetryDelay()
+        automaticContinuousAPRetryDelayTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.continuousAPRetryDelayNanoseconds)
+            guard let self,
+                  !Task.isCancelled,
+                  self.automaticPostMachine.generationID == generationID,
+                  self.automaticPostMachine.isActive,
+                  case .waitingForContinuousAPRetry = self.automaticPostMachine.state,
+                  !self.isAPRunning,
+                  self.pendingAP == nil,
+                  !self.automaticFinishedGenerations.contains(generationID) else {
+                return
+            }
+            self.automaticContinuousAPRetryDelayTask = nil
+            self.handleAutomaticPostEffect(.startContinuousAPReconnect,
+                                            generationID: generationID)
         }
     }
 
@@ -4468,6 +4558,7 @@ final class BrowserViewModel: ObservableObject {
         automaticPostPreparationTimer?.cancel()
         automaticPostPreparationTimer = nil
         cancelAutomaticSubmitResponseTimer()
+        cancelAutomaticContinuousAPRetryDelay()
         automaticSubmitReadinessTask?.cancel()
         automaticSubmitReadinessTask = nil
         automaticSubmitReadinessStableSince = nil
@@ -4562,6 +4653,13 @@ final class BrowserViewModel: ObservableObject {
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
         automaticPostRepeatSession = nil
+        cancelAutomaticContinuousAPRetryDelay()
+        updateIdleTimerState()
+    }
+
+    private func cancelAutomaticContinuousAPRetryDelay() {
+        automaticContinuousAPRetryDelayTask?.cancel()
+        automaticContinuousAPRetryDelayTask = nil
         updateIdleTimerState()
     }
 

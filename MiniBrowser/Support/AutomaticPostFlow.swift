@@ -69,6 +69,7 @@ enum AutomaticPostFlowEffect: Equatable {
     case submit(attempt: Int)
     case startIPReconnect
     case startContinuousAPReconnect
+    case scheduleContinuousAPReconnectRetry
     case startNextAutomaticFlow
     case skipCurrentThread
     case succeeded
@@ -95,6 +96,7 @@ enum AutomaticPostFlowEvent: Equatable {
     case cookieAlertDismissed(generationID: UInt64)
     case continuousAlertDismissed(generationID: UInt64)
     case ipReconnectCompleted(generationID: UInt64, success: Bool)
+    case continuousAPReconnectUnchanged(generationID: UInt64)
     case continuousAPReconnectCompleted(generationID: UInt64, success: Bool)
     case submitObserved(generationID: UInt64, submissionID: UInt64)
     case submitResponseTimedOut(generationID: UInt64, submissionID: UInt64)
@@ -107,6 +109,10 @@ enum AutomaticPostFlowEvent: Equatable {
 struct AutomaticPostFlowMachine {
     static let regularAttemptLimit = 3
     static let maximumAttempts = 4
+    /// A continuous-post restriction may be caused by an AP shortcut that
+    /// returned before the address actually changed. Allow the initial AP
+    /// request plus two bounded retries for that specific outcome.
+    static let continuousAPReconnectAttemptLimit = 3
     static let readinessStableMilliseconds = 500
 
     private(set) var state: AutomaticPostFlowState = .idle
@@ -116,6 +122,7 @@ struct AutomaticPostFlowMachine {
     private(set) var ipRetryUsed = false
     private(set) var ipRetryIsTerminal = false
     private(set) var continuousRetryUsed = false
+    private(set) var continuousAPReconnectAttempts = 0
     private(set) var requiresHandwriting = false
     private(set) var lastAttempt = 0
     private(set) var isSameThreadRepeat = false
@@ -233,6 +240,7 @@ struct AutomaticPostFlowMachine {
         ipRetryUsed = false
         ipRetryIsTerminal = false
         continuousRetryUsed = false
+        continuousAPReconnectAttempts = 0
         lastAttempt = 0
         currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
@@ -271,6 +279,7 @@ struct AutomaticPostFlowMachine {
         ipRetryUsed = false
         ipRetryIsTerminal = false
         continuousRetryUsed = false
+        continuousAPReconnectAttempts = 0
         lastAttempt = 0
         currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
@@ -310,6 +319,7 @@ struct AutomaticPostFlowMachine {
         ipRetryUsed = false
         ipRetryIsTerminal = false
         continuousRetryUsed = false
+        continuousAPReconnectAttempts = 0
         lastAttempt = 0
         currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
@@ -423,6 +433,16 @@ struct AutomaticPostFlowMachine {
             }
             return beginSubmitReadiness(attempt: attempt + 1, reason: .ipRetry)
 
+        case .continuousAPReconnectUnchanged:
+            guard case .waitingForContinuousAPRetry = state else {
+                return .none
+            }
+            guard continuousAPReconnectAttempts < Self.continuousAPReconnectAttemptLimit else {
+                return stop(.communicationFailure)
+            }
+            continuousAPReconnectAttempts += 1
+            return .scheduleContinuousAPReconnectRetry
+
         case .ipSubmitDelayElapsed:
             return .none
 
@@ -529,6 +549,7 @@ struct AutomaticPostFlowMachine {
             }
             continuousRetryUsed = true
             if isSameThreadRepeat || attempt == Self.regularAttemptLimit {
+                continuousAPReconnectAttempts = 1
                 state = .waitingForContinuousAPRetry(generationID: generationID,
                                                      attempt: attempt)
                 return (true, .startContinuousAPReconnect)
@@ -602,6 +623,7 @@ struct AutomaticPostFlowMachine {
         ipRetryUsed = false
         ipRetryIsTerminal = false
         continuousRetryUsed = false
+        continuousAPReconnectAttempts = 0
         requiresHandwriting = false
         lastAttempt = 0
         currentSubmissionID = nil
@@ -697,6 +719,7 @@ private extension AutomaticPostFlowEvent {
         case let .markCompactReady(id, _, _, _),
              let .markHandwritingReady(id, _, _),
              let .ipReconnectCompleted(id, _),
+             let .continuousAPReconnectUnchanged(id),
              let .continuousAPReconnectCompleted(id, _):
             return id
         }

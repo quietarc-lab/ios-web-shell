@@ -379,6 +379,43 @@ final class AutomaticPostFlowTests: XCTestCase {
                                                      attempt: 1))
     }
 
+    func testContinuousAPUnchangedRetriesTwiceThenStops() {
+        var machine = sameThreadReadyMachine()
+        _ = machine.handleAlert(.continuousPosting, generationID: generation)
+
+        XCTAssertEqual(machine.continuousAPReconnectAttempts, 1)
+        XCTAssertEqual(machine.handle(.continuousAPReconnectUnchanged(
+            generationID: generation
+        )), .scheduleContinuousAPReconnectRetry)
+        XCTAssertEqual(machine.continuousAPReconnectAttempts, 2)
+        XCTAssertEqual(machine.state,
+                       .waitingForContinuousAPRetry(generationID: generation,
+                                                     attempt: 1))
+
+        XCTAssertEqual(machine.handle(.continuousAPReconnectUnchanged(
+            generationID: generation
+        )), .scheduleContinuousAPReconnectRetry)
+        XCTAssertEqual(machine.continuousAPReconnectAttempts, 3)
+
+        XCTAssertEqual(machine.handle(.continuousAPReconnectUnchanged(
+            generationID: generation
+        )), .stopped(.communicationFailure))
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .communicationFailure))
+    }
+
+    func testContinuousAPFailureStopsWithoutUnchangedIPBuffer() {
+        var machine = sameThreadReadyMachine()
+        _ = machine.handleAlert(.continuousPosting, generationID: generation)
+
+        XCTAssertEqual(machine.handle(.continuousAPReconnectCompleted(
+            generationID: generation,
+            success: false
+        )), .stopped(.communicationFailure))
+        XCTAssertEqual(machine.continuousAPReconnectAttempts, 1)
+    }
+
     func testFinalContinuousPostingUsesAPOnlyAndFourthAttempt() {
         var machine = readyMachine(hasComment: true, hasImage: false)
         _ = machine.handleAlert(.cookieRetryRequired, generationID: generation)
