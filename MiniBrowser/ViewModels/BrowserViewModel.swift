@@ -1189,8 +1189,7 @@ final class BrowserViewModel: ObservableObject {
                 } catch {
                     return
                 }
-                guard let self,
-                      self.isolationStopEnabled,
+                guard self.isolationStopEnabled,
                       self.appSceneIsActive,
                       self.isolationMonitorContext == context,
                       self.currentIsolationMonitorContext() == context else {
