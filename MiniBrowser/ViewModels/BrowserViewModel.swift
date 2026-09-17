@@ -55,6 +55,17 @@ final class BrowserViewModel: ObservableObject {
     private var multiThreadSessionID: UInt64 = 0
     private var multiThreadTransitionTask: Task<Void, Never>?
     private var pendingMultiThreadNavigation: (sessionID: UInt64, target: CatalogPostTarget)?
+    /// Monotonically identifies each WebView navigation. A destination
+    /// availability probe must not be allowed to settle a later reload or
+    /// redirect that happens to reuse the same thread URL.
+    private var multiThreadNavigationSequence: UInt64 = 0
+    private struct PendingMultiThreadAvailabilityProbe: Equatable {
+        let sessionID: UInt64
+        let targetID: String
+        let pageURL: URL
+        let navigationSequence: UInt64
+    }
+    private var pendingMultiThreadAvailabilityProbe: PendingMultiThreadAvailabilityProbe?
     /// A dropped target can report that it has no usable thread/form before
     /// `didFinish` creates the next page generation. Keep that bridge result
     /// tied to the pending destination until navigation is committed.
@@ -762,6 +773,7 @@ final class BrowserViewModel: ObservableObject {
         latestCompactReady = nil
         pendingHandwritingReady = nil
         pendingHandwritingRestore = nil
+        pendingMultiThreadAvailabilityProbe = nil
         pendingMultiThreadUnavailable = nil
         automaticDraftRestorePendingGeneration = nil
         automaticCookieRelatedCount = nil
@@ -900,6 +912,7 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func navigationStarted() {
+        multiThreadNavigationSequence &+= 1
         if multiThreadSession != nil,
            pendingMultiThreadNavigation == nil,
            let generationID = automaticPostMachine.generationID {
@@ -926,6 +939,7 @@ final class BrowserViewModel: ObservableObject {
         automaticReloadGeneration = nil
         if pendingMultiThreadNavigation == nil {
             pendingMultiThreadUnavailable = nil
+            pendingMultiThreadAvailabilityProbe = nil
         }
         isLoading = true
         sitePostStatus = nil
@@ -1683,6 +1697,7 @@ final class BrowserViewModel: ObservableObject {
                              ("DISPOSITION", "SKIP_CURRENT_THREAD")]
                 )
                 pendingMultiThreadNavigation = nil
+                pendingMultiThreadAvailabilityProbe = nil
                 skipPendingMultiThreadTargetWithoutGeneration(
                     sessionID: session.sessionID,
                     target: pending.target,
@@ -1691,7 +1706,6 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
             let pendingUnavailable = pendingMultiThreadUnavailable
-            pendingMultiThreadNavigation = nil
             if let pendingUnavailable,
                pendingUnavailable.sessionID == session.sessionID,
                pendingUnavailable.targetID == pending.target.id,
@@ -1699,6 +1713,8 @@ final class BrowserViewModel: ObservableObject {
                 // The dropped-thread bridge arrived before didFinish, so no
                 // generation should be started for this target. Move on with
                 // the existing session draft and UA accounting intact.
+                pendingMultiThreadNavigation = nil
+                pendingMultiThreadAvailabilityProbe = nil
                 pendingMultiThreadUnavailable = nil
                 skipPendingMultiThreadTargetWithoutGeneration(
                     sessionID: session.sessionID,
@@ -1707,66 +1723,99 @@ final class BrowserViewModel: ObservableObject {
                 )
                 return
             }
-            pendingMultiThreadUnavailable = nil
-            if session.currentGenerationID == nil {
-                // The first catalog target was different from the page that
-                // supplied the draft. Perform the initial UA refresh only
-                // after that target has actually loaded.
-                automaticPostGeneration &+= 1
-                let generationID = automaticPostGeneration
-                startUserAgentChange(
-                    pageURL: loadedURL,
-                    generationID: generationID,
-                    oldPageToken: nil,
-                    hasComment: session.comment?.isEmpty == false,
-                    comment: session.comment,
-                    hasImage: session.hasImage,
-                    automatic: true,
-                    readError: false,
-                    targetUAIndex: nil,
-                    excludedUAIDs: automaticTriedUAIDs,
-                    newAutomaticSession: false,
-                    multiThread: true
-                )
-            } else if let previousGenerationID = session.currentGenerationID,
-                      session.shouldRotateUserAgent {
-                // A multi-thread session keeps one UA for two accepted target
-                // posts. The next target is loaded first, then the normal UA
-                // refresh generation is started on that destination page.
-                appendAutomaticEvent(
-                    generationID: previousGenerationID,
-                    phase: "FLOW",
-                    event: "UA_ROTATION_AFTER_TWO_THREADS",
-                    result: "NEXT_UA_REQUESTED",
-                    fields: [
-                        ("POSTS_SINCE_UA_CHANGE",
-                         String(session.postsSinceUserAgentChange))
-                    ]
-                )
-                automaticPostGeneration &+= 1
-                let generationID = automaticPostGeneration
-                setAutomaticPostStatus(
-                    .switchingAfterThreadBatch,
-                    generationID: previousGenerationID
-                )
-                startUserAgentChange(
-                    pageURL: loadedURL,
-                    generationID: generationID,
-                    oldPageToken: automaticPostMachine.pageToken,
-                    hasComment: session.comment?.isEmpty == false,
-                    comment: session.comment,
-                    hasImage: session.hasImage,
-                    automatic: true,
-                    readError: false,
-                    targetUAIndex: nil,
-                    excludedUAIDs: automaticTriedUAIDs,
-                    newAutomaticSession: false,
-                    multiThread: true
-                )
-            } else {
-                startMultiThreadGenerationAfterNavigation(url: loadedURL,
-                                                          session: session)
+            let probe = PendingMultiThreadAvailabilityProbe(
+                sessionID: session.sessionID,
+                targetID: pending.target.id,
+                pageURL: loadedURL,
+                navigationSequence: multiThreadNavigationSequence
+            )
+            if pendingMultiThreadAvailabilityProbe == probe {
+                return
             }
+            pendingMultiThreadAvailabilityProbe = probe
+            guard let webView else {
+                pendingMultiThreadAvailabilityProbe = nil
+                continueMultiThreadDestinationAfterNavigation(
+                    session: session,
+                    target: pending.target,
+                    loadedURL: loadedURL
+                )
+                return
+            }
+            webView.evaluateJavaScript(CompactPageModeService.threadAvailabilityScript) {
+                [weak self] result, error in
+                guard let self else { return }
+                Task { @MainActor in
+                    guard self.pendingMultiThreadAvailabilityProbe == probe,
+                          self.multiThreadNavigationSequence == probe.navigationSequence,
+                          let currentPending = self.pendingMultiThreadNavigation,
+                          currentPending.sessionID == probe.sessionID,
+                          currentPending.target.id == probe.targetID,
+                          let currentSession = self.multiThreadSession,
+                          currentSession.sessionID == probe.sessionID,
+                          currentSession.currentTarget?.id == probe.targetID else {
+                        return
+                    }
+                    self.pendingMultiThreadAvailabilityProbe = nil
+
+                    let pendingUnavailable = self.pendingMultiThreadUnavailable
+                    if let pendingUnavailable,
+                       pendingUnavailable.sessionID == currentSession.sessionID,
+                       pendingUnavailable.targetID == currentPending.target.id,
+                       Self.sameTargetThreadURL(pendingUnavailable.pageURL,
+                                                probe.pageURL) {
+                        self.pendingMultiThreadNavigation = nil
+                        self.pendingMultiThreadUnavailable = nil
+                        self.skipPendingMultiThreadTargetWithoutGeneration(
+                            sessionID: currentSession.sessionID,
+                            target: currentPending.target,
+                            reason: pendingUnavailable.reason
+                        )
+                        return
+                    }
+
+                    if error == nil,
+                       let availability = Self.threadAvailability(from: result),
+                       (!availability.hasThread || !availability.hasForm) {
+                        self.pendingMultiThreadNavigation = nil
+                        self.pendingMultiThreadUnavailable = nil
+                        self.appendAutomaticEvent(
+                            generationID: currentSession.currentGenerationID ??
+                                self.automaticPostGeneration,
+                            phase: "NAVIGATION",
+                            event: "THREAD_UNAVAILABLE",
+                            result: "PROBE_SKIP_REQUESTED",
+                            fields: [
+                                ("PAGE_TOKEN_STATE", "UNBOUND"),
+                                ("REASON", "THREAD_NOT_POSTABLE")
+                            ]
+                        )
+                        self.skipPendingMultiThreadTargetWithoutGeneration(
+                            sessionID: currentSession.sessionID,
+                            target: currentPending.target,
+                            reason: "THREAD_NOT_POSTABLE_PROBE"
+                        )
+                        return
+                    }
+
+                    if error != nil {
+                        self.appendAutomaticEvent(
+                            generationID: currentSession.currentGenerationID ??
+                                self.automaticPostGeneration,
+                            phase: "NAVIGATION",
+                            event: "THREAD_AVAILABILITY_PROBE",
+                            result: "UNAVAILABLE",
+                            fields: [("REASON", "EVALUATION_ERROR")]
+                        )
+                    }
+                    self.continueMultiThreadDestinationAfterNavigation(
+                        session: currentSession,
+                        target: currentPending.target,
+                        loadedURL: probe.pageURL
+                    )
+                }
+            }
+            return
         }
         if let pending = pendingCookieRefresh,
            let generationID = pending.automaticGenerationID,
@@ -1783,13 +1832,110 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    /// Settles a successfully loaded multi-thread destination after its
+    /// structural availability has been checked. Keeping the pending
+    /// navigation alive until this point prevents a dropped page from being
+    /// mistaken for a normal page generation during the transition.
+    private func continueMultiThreadDestinationAfterNavigation(
+        session: MultiThreadPostSession,
+        target: CatalogPostTarget,
+        loadedURL: URL
+    ) {
+        guard multiThreadSession?.sessionID == session.sessionID,
+              multiThreadSession?.currentTarget?.id == target.id,
+              let pending = pendingMultiThreadNavigation,
+              pending.sessionID == session.sessionID,
+              pending.target.id == target.id else {
+            return
+        }
+        pendingMultiThreadNavigation = nil
+        pendingMultiThreadAvailabilityProbe = nil
+        pendingMultiThreadUnavailable = nil
+
+        if session.currentGenerationID == nil {
+            // The first catalog target was different from the page that
+            // supplied the draft. Perform the initial UA refresh only after
+            // that target has actually loaded.
+            automaticPostGeneration &+= 1
+            let generationID = automaticPostGeneration
+            startUserAgentChange(
+                pageURL: loadedURL,
+                generationID: generationID,
+                oldPageToken: nil,
+                hasComment: session.comment?.isEmpty == false,
+                comment: session.comment,
+                hasImage: session.hasImage,
+                automatic: true,
+                readError: false,
+                targetUAIndex: nil,
+                excludedUAIDs: automaticTriedUAIDs,
+                newAutomaticSession: false,
+                multiThread: true
+            )
+        } else if let previousGenerationID = session.currentGenerationID,
+                  session.shouldRotateUserAgent {
+            // A multi-thread session keeps one UA for two accepted target
+            // posts. The next target is loaded first, then the normal UA
+            // refresh generation is started on that destination page.
+            appendAutomaticEvent(
+                generationID: previousGenerationID,
+                phase: "FLOW",
+                event: "UA_ROTATION_AFTER_TWO_THREADS",
+                result: "NEXT_UA_REQUESTED",
+                fields: [
+                    ("POSTS_SINCE_UA_CHANGE",
+                     String(session.postsSinceUserAgentChange))
+                ]
+            )
+            automaticPostGeneration &+= 1
+            let generationID = automaticPostGeneration
+            setAutomaticPostStatus(
+                .switchingAfterThreadBatch,
+                generationID: previousGenerationID
+            )
+            startUserAgentChange(
+                pageURL: loadedURL,
+                generationID: generationID,
+                oldPageToken: automaticPostMachine.pageToken,
+                hasComment: session.comment?.isEmpty == false,
+                comment: session.comment,
+                hasImage: session.hasImage,
+                automatic: true,
+                readError: false,
+                targetUAIndex: nil,
+                excludedUAIDs: automaticTriedUAIDs,
+                newAutomaticSession: false,
+                multiThread: true
+            )
+        } else {
+            startMultiThreadGenerationAfterNavigation(url: loadedURL,
+                                                      session: session)
+        }
+    }
+
     private func startMultiThreadGenerationAfterNavigation(url: URL,
                                                            session: MultiThreadPostSession) {
         guard multiThreadSession?.sessionID == session.sessionID,
-              let target = session.currentTarget,
-              ThreadListViewModel.threadID(from: url) == target.id else {
-            finishMultiThreadSession(generationID: automaticPostMachine.generationID,
-                                     result: "STOPPED_PAGE_NAVIGATION")
+              let target = session.currentTarget else {
+            return
+        }
+        guard ThreadListViewModel.threadID(from: url) == target.id else {
+            appendAutomaticEvent(
+                generationID: session.currentGenerationID ?? automaticPostGeneration,
+                phase: "NAVIGATION",
+                event: "NEXT_THREAD_NAVIGATION_FAILED",
+                result: "SKIP_CURRENT_THREAD",
+                fields: [
+                    ("REASON", "TARGET_MISMATCH"),
+                    ("DISPOSITION", "SKIP_CURRENT_THREAD")
+                ]
+            )
+            pendingMultiThreadAvailabilityProbe = nil
+            skipPendingMultiThreadTargetWithoutGeneration(
+                sessionID: session.sessionID,
+                target: target,
+                reason: "NAVIGATION_TARGET_MISMATCH"
+            )
             return
         }
 
@@ -1936,6 +2082,7 @@ final class BrowserViewModel: ObservableObject {
            let session = multiThreadSession,
            pending.sessionID == session.sessionID {
             pendingMultiThreadNavigation = nil
+            pendingMultiThreadAvailabilityProbe = nil
             skipPendingMultiThreadTargetWithoutGeneration(
                 sessionID: session.sessionID,
                 target: pending.target,
@@ -1973,6 +2120,7 @@ final class BrowserViewModel: ObservableObject {
            let session = multiThreadSession,
            pending.sessionID == session.sessionID {
             pendingMultiThreadNavigation = nil
+            pendingMultiThreadAvailabilityProbe = nil
             skipPendingMultiThreadTargetWithoutGeneration(
                 sessionID: session.sessionID,
                 target: pending.target,
@@ -3027,6 +3175,7 @@ final class BrowserViewModel: ObservableObject {
               session.currentTarget?.id == target.id else { return }
 
         pendingMultiThreadNavigation = nil
+        pendingMultiThreadAvailabilityProbe = nil
         pendingMultiThreadUnavailable = nil
         session.markCurrentProcessed()
         automaticCatalogProvider?.excludeThread(id: target.id)
@@ -3092,6 +3241,7 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
             self.setMultiThreadStatusWithoutGeneration(.navigatingToNextThread)
+            self.pendingMultiThreadAvailabilityProbe = nil
             self.pendingMultiThreadNavigation = (sessionID, target)
             self.pendingMultiThreadUnavailable = nil
             self.appendAutomaticEvent(
@@ -3199,6 +3349,7 @@ final class BrowserViewModel: ObservableObject {
                   currentTarget.id == target.id else { return }
             self.setAutomaticPostStatus(.navigatingToNextThread,
                                         generationID: generationID)
+            self.pendingMultiThreadAvailabilityProbe = nil
             self.pendingMultiThreadNavigation = (sessionID, target)
             self.pendingMultiThreadUnavailable = nil
             self.appendAutomaticEvent(
@@ -3280,6 +3431,7 @@ final class BrowserViewModel: ObservableObject {
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
         pendingMultiThreadNavigation = nil
+        pendingMultiThreadAvailabilityProbe = nil
         pendingMultiThreadUnavailable = nil
         pendingHandwritingRestore = nil
         multiThreadSession = nil
@@ -4327,6 +4479,7 @@ final class BrowserViewModel: ObservableObject {
         latestCompactReady = nil
         pendingHandwritingReady = nil
         pendingHandwritingRestore = nil
+        pendingMultiThreadAvailabilityProbe = nil
         automaticDraftRestorePendingGeneration = nil
         if automaticPostRepeatSession != nil,
            result.hasPrefix("STOPPED") || !sameThreadRepeatEnabled {
@@ -4779,6 +4932,18 @@ final class BrowserViewModel: ObservableObject {
         return (dictionary["hasComment"] as? Bool ?? false,
                 dictionary["comment"] as? String,
                 dictionary["canSubmit"] as? Bool ?? false)
+    }
+
+    static func threadAvailability(from result: Any?) ->
+        (hasThread: Bool, hasForm: Bool)? {
+        guard let dictionary = result as? [String: Any],
+              let eligible = dictionary["eligible"] as? Bool,
+              eligible,
+              let hasThread = dictionary["hasThread"] as? Bool,
+              let hasForm = dictionary["hasForm"] as? Bool else {
+            return nil
+        }
+        return (hasThread, hasForm)
     }
 
     private static func isTargetThreadURL(_ url: URL?) -> Bool {

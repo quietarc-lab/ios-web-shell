@@ -106,6 +106,13 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(stateScript.contains("comment:"))
         XCTAssertTrue(stateScript.contains("canSubmit"))
 
+        let availabilityScript = CompactPageModeService.threadAvailabilityScript
+        XCTAssertTrue(availabilityScript.contains("hasThread"))
+        XCTAssertTrue(availabilityScript.contains("hasForm"))
+        XCTAssertTrue(availabilityScript.contains("textarea[name=\"com\"]"))
+        XCTAssertTrue(availabilityScript.contains("eligible"))
+        XCTAssertFalse(availabilityScript.contains("form.submit"))
+
         let restoreScript = try XCTUnwrap(
             CompactPageModeService.restoreAutomaticDraftScript(comment: "保存本文")
         )

@@ -939,6 +939,30 @@ enum CompactPageModeService {
     })();
     """#)
 
+    /// Read-only navigation guard used by multi-thread posting. A dropped or
+    /// expired thread can still finish with a target-page URL while omitting
+    /// the thread container and reply form. This probe deliberately reports
+    /// only structural availability; submit/readiness decisions remain owned
+    /// by the page-level automatic flow.
+    static let threadAvailabilityScript = PageMarkerNamespace.neutralize(#"""
+    (() => {
+      "use strict";
+      if (location.hostname !== "img.2chan.net" ||
+          !/^\/[^/]+\/res\/\d+\.htm$/.test(location.pathname)) {
+        return { eligible: false, hasThread: false, hasForm: false };
+      }
+      const thread = document.querySelector("div.thre");
+      const form = Array.from(document.forms).find(candidate =>
+        candidate.querySelector('textarea[name="com"]')
+      );
+      return {
+        eligible: true,
+        hasThread: Boolean(thread),
+        hasForm: Boolean(form)
+      };
+    })();
+    """#)
+
     static func restoreAutomaticDraftScript(comment: String) -> String? {
         guard let literal = javaScriptStringLiteral(comment) else { return nil }
         return PageMarkerNamespace.neutralize(#"""

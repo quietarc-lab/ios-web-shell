@@ -56,6 +56,34 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(model.effectiveUserAgent, BrowserUserAgent.all[0].value)
     }
 
+    func testThreadAvailabilityProbeRequiresEligibleStructuralResult() {
+        let available = BrowserViewModel.threadAvailability(from: [
+            "eligible": true,
+            "hasThread": true,
+            "hasForm": true
+        ])
+        XCTAssertEqual(available?.hasThread, true)
+        XCTAssertEqual(available?.hasForm, true)
+
+        let dropped = BrowserViewModel.threadAvailability(from: [
+            "eligible": true,
+            "hasThread": false,
+            "hasForm": false
+        ])
+        XCTAssertEqual(dropped?.hasThread, false)
+        XCTAssertEqual(dropped?.hasForm, false)
+
+        XCTAssertNil(BrowserViewModel.threadAvailability(from: [
+            "eligible": false,
+            "hasThread": false,
+            "hasForm": false
+        ]))
+        XCTAssertNil(BrowserViewModel.threadAvailability(from: [
+            "eligible": true,
+            "hasThread": true
+        ]))
+    }
+
     func testLegacyGeneratedRestrictionDoesNotAffectFixedCatalogSelection() {
         let suiteName = "BrowserViewModelTests.legacyGenerated.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
