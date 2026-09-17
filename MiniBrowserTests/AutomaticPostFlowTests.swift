@@ -135,7 +135,30 @@ final class AutomaticPostFlowTests: XCTestCase {
         )), .stopped(.submitResponseTimeout))
         XCTAssertEqual(machine.state,
                        .stopped(generationID: generation,
-                                reason: .submitResponseTimeout))
+                                 reason: .submitResponseTimeout))
+    }
+
+    func testCookieRetryResponseTimeoutRequestsOneCookieRefresh() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        _ = machine.handleAlert(.cookieRetryRequired, generationID: generation)
+        _ = machine.handle(.cookieAlertDismissed(generationID: generation))
+        _ = submitAfterReadiness(&machine)
+        let cookieRetrySubmissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: cookieRetrySubmissionID
+        )), .startSubmitReadiness(attempt: 2, reason: .submitResponseRetry))
+        _ = submitAfterReadiness(&machine)
+        let responseRetrySubmissionID = try XCTUnwrap(machine.currentSubmissionID)
+
+        XCTAssertEqual(machine.handle(.submitResponseTimedOut(
+            generationID: generation,
+            submissionID: responseRetrySubmissionID
+        )), .startCookieRefreshAfterTimeout)
+        XCTAssertTrue(machine.cookieRefreshAfterTimeoutUsed)
+        XCTAssertEqual(machine.state,
+                       .waitingForCookieRefresh(generationID: generation, attempt: 2))
     }
 
     func testLateCompletionDuringResponseRetrySuppressesSecondClick() throws {

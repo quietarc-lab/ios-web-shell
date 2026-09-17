@@ -55,6 +55,7 @@ enum AutomaticPostFlowState: Equatable {
     case waitingToSubmit(generationID: UInt64, attempt: Int)
     case submitting(generationID: UInt64, attempt: Int)
     case waitingForCookieRetry(generationID: UInt64, attempt: Int)
+    case waitingForCookieRefresh(generationID: UInt64, attempt: Int)
     case waitingForIPRetry(generationID: UInt64, attempt: Int)
     case waitingForContinuousRetry(generationID: UInt64, attempt: Int)
     case waitingForContinuousAPRetry(generationID: UInt64, attempt: Int)
@@ -70,6 +71,7 @@ enum AutomaticPostFlowEffect: Equatable {
     case startIPReconnect
     case startContinuousAPReconnect
     case scheduleContinuousAPReconnectRetry
+    case startCookieRefreshAfterTimeout
     case startNextAutomaticFlow
     case skipCurrentThread
     case succeeded
@@ -130,11 +132,16 @@ struct AutomaticPostFlowMachine {
     private(set) var currentSubmissionID: UInt64? = nil
     private(set) var submitEventObserved = false
     private(set) var submitResponseRetryUsed = false
+    /// The one bounded recovery that re-reads Cookies after a response
+    /// timeout which already followed the site's Cookie retry alert.
+    private(set) var cookieRefreshAfterTimeoutUsed = false
     /// A response timeout may race with a site's delayed completion marker.
     /// Keep the timed-out submission identifiable while the one allowed retry
     /// is being prepared so that a late completion can finish the flow without
     /// dispatching a duplicate click.
     private(set) var awaitingSubmitResponseRetry = false
+    private(set) var lastSubmitReadinessReason: AutomaticPostReadinessReason = .initial
+    private(set) var submitResponseRetryOrigin: AutomaticPostReadinessReason?
 
     private var stalePageToken: String?
     private var apCompleted = false
@@ -147,7 +154,8 @@ struct AutomaticPostFlowMachine {
     var isActive: Bool {
         switch state {
         case .preparing, .waitingForSubmitReadiness, .waitingToSubmit,
-             .submitting, .waitingForCookieRetry, .waitingForIPRetry,
+             .submitting, .waitingForCookieRetry, .waitingForCookieRefresh,
+             .waitingForIPRetry,
              .waitingForContinuousRetry, .waitingForContinuousAPRetry:
             return true
         case .idle, .succeeded, .stopped:
@@ -161,6 +169,7 @@ struct AutomaticPostFlowMachine {
              let .waitingToSubmit(_, attempt),
              let .submitting(_, attempt),
              let .waitingForCookieRetry(_, attempt),
+             let .waitingForCookieRefresh(_, attempt),
              let .waitingForIPRetry(_, attempt),
              let .waitingForContinuousRetry(_, attempt),
              let .waitingForContinuousAPRetry(_, attempt):
@@ -218,6 +227,7 @@ struct AutomaticPostFlowMachine {
                         hasImage: Bool,
                         multiThread: Bool = false,
                         sameThreadRepeat: Bool = false,
+                        cookieRefreshAfterTimeoutUsed: Bool = false,
                         submissionIDSeed: UInt64? = nil) -> AutomaticPostFlowEffect {
         guard hasComment || hasImage else {
             state = .stopped(generationID: generationID, reason: .noContent)
@@ -245,7 +255,10 @@ struct AutomaticPostFlowMachine {
         currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
         submitResponseRetryUsed = false
+        self.cookieRefreshAfterTimeoutUsed = cookieRefreshAfterTimeoutUsed
         awaitingSubmitResponseRetry = false
+        lastSubmitReadinessReason = .initial
+        submitResponseRetryOrigin = nil
         apCompleted = false
         reloadCompleted = false
         cookieObserved = false
@@ -284,7 +297,10 @@ struct AutomaticPostFlowMachine {
         currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
         submitResponseRetryUsed = false
+        cookieRefreshAfterTimeoutUsed = false
         awaitingSubmitResponseRetry = false
+        lastSubmitReadinessReason = .initial
+        submitResponseRetryOrigin = nil
         // A catalog transition does not delete Cookies or reconnect AP. The
         // navigation itself is the only preparation stage still pending.
         apCompleted = true
@@ -324,7 +340,10 @@ struct AutomaticPostFlowMachine {
         currentSubmissionID = submissionIDSeed.map { $0 > 0 ? $0 - 1 : 0 }
         submitEventObserved = false
         submitResponseRetryUsed = false
+        cookieRefreshAfterTimeoutUsed = false
         awaitingSubmitResponseRetry = false
+        lastSubmitReadinessReason = .sameThreadRepeat
+        submitResponseRetryOrigin = nil
         // The page, AP state, and Cookie observation are already valid for a
         // same-page repeat. Compact-form and handwriting readiness are still
         // re-established through the bridge before the next click.
@@ -485,14 +504,31 @@ struct AutomaticPostFlowMachine {
                   currentSubmissionID == submissionID else {
                 return .none
             }
-            guard !submitEventObserved,
-                  !submitResponseRetryUsed else {
+            guard !submitEventObserved else {
                 return stop(.submitResponseTimeout)
             }
-            submitResponseRetryUsed = true
-            awaitingSubmitResponseRetry = true
-            return beginSubmitReadiness(attempt: attempt,
-                                        reason: .submitResponseRetry)
+            if !submitResponseRetryUsed {
+                submitResponseRetryUsed = true
+                submitResponseRetryOrigin = lastSubmitReadinessReason
+                awaitingSubmitResponseRetry = true
+                return beginSubmitReadiness(attempt: attempt,
+                                            reason: .submitResponseRetry)
+            }
+            // A timeout immediately after the site's Cookie retry means the
+            // page may still be using the pre-refresh Cookie state. Rebuild
+            // the Cookie/page preparation once, retaining the in-memory draft
+            // in the coordinator. A later timeout remains terminal.
+            guard submitResponseRetryOrigin == .cookieRetry,
+                  !cookieRefreshAfterTimeoutUsed,
+                  !continuousRetryUsed,
+                  !ipRetryUsed else {
+                return stop(.submitResponseTimeout)
+            }
+            cookieRefreshAfterTimeoutUsed = true
+            awaitingSubmitResponseRetry = false
+            state = .waitingForCookieRefresh(generationID: eventGenerationID,
+                                              attempt: attempt)
+            return .startCookieRefreshAfterTimeout
 
         case .postCompleted:
             let canAcceptLateCompletion: Bool
@@ -629,7 +665,10 @@ struct AutomaticPostFlowMachine {
         currentSubmissionID = nil
         submitEventObserved = false
         submitResponseRetryUsed = false
+        cookieRefreshAfterTimeoutUsed = false
         awaitingSubmitResponseRetry = false
+        lastSubmitReadinessReason = .initial
+        submitResponseRetryOrigin = nil
         isSameThreadRepeat = false
         isMultiThread = false
         apCompleted = false
@@ -653,6 +692,7 @@ struct AutomaticPostFlowMachine {
                                            attempt: 1,
                                            reason: preparationReason)
         lastAttempt = 1
+        lastSubmitReadinessReason = preparationReason
         return .startSubmitReadiness(attempt: 1, reason: preparationReason)
     }
 
@@ -667,6 +707,7 @@ struct AutomaticPostFlowMachine {
                                            attempt: attempt,
                                            reason: reason)
         lastAttempt = attempt
+        lastSubmitReadinessReason = reason
         return .startSubmitReadiness(attempt: attempt, reason: reason)
     }
 

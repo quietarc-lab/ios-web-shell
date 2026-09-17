@@ -421,7 +421,8 @@ final class BrowserViewModel: ObservableObject {
                     result: "STOPPED_MULTI_THREAD_DISABLED"
                 )
             case .preparing, .waitingForSubmitReadiness, .waitingToSubmit,
-                 .waitingForCookieRetry, .waitingForIPRetry,
+                 .waitingForCookieRetry, .waitingForCookieRefresh,
+                 .waitingForIPRetry,
                  .waitingForContinuousRetry, .waitingForContinuousAPRetry:
                 let effect = automaticPostMachine.stop(.repeatDisabled)
                 if let generationID = automaticPostMachine.generationID {
@@ -603,6 +604,127 @@ final class BrowserViewModel: ObservableObject {
             multiThread: automaticPostMachine.isMultiThread,
             sameThreadRepeat: continueSameThreadRepeat
         )
+    }
+
+    /// Rebuilds only the Cookie/page preparation after the single response
+    /// retry has also timed out following a Cookie alert. No UA or AP change
+    /// is performed here; a new generation invalidates late callbacks from
+    /// the failed submission while the in-memory draft and session remain.
+    private func startAutomaticCookieRefreshAfterTimeout(
+        previousGenerationID: UInt64
+    ) {
+        guard automaticPostMachine.generationID == previousGenerationID,
+              automaticPostMachine.isActive,
+              !isCookieRefreshing,
+              pendingCookieRefresh == nil,
+              pendingAP == nil,
+              let webView,
+              let pageURL = webView.url,
+              Self.isTargetThreadURL(pageURL),
+              let draft = automaticPostDraft ?? multiThreadSession.map({
+                  AutomaticPostDraft(
+                      hasComment: $0.comment?.isEmpty == false,
+                      comment: $0.comment,
+                      hasImage: $0.hasImage
+                  )
+              }) else {
+            let effect = automaticPostMachine.stop(.communicationFailure)
+            handleAutomaticPostEffect(effect, generationID: previousGenerationID)
+            return
+        }
+
+        let wasMultiThread = automaticPostMachine.isMultiThread
+        let wasSameThreadRepeat = automaticPostMachine.isSameThreadRepeat
+        let oldPageToken = automaticPostMachine.pageToken
+
+        automaticFinishedGenerations.insert(previousGenerationID)
+        automaticPostMachine.forceTerminate(generationID: previousGenerationID)
+        automaticPostPreparationTimer?.cancel()
+        automaticPostPreparationTimer = nil
+        automaticSubmitReadinessTask?.cancel()
+        automaticSubmitReadinessTask = nil
+        cancelAutomaticSubmitResponseTimer()
+        automaticPostVerificationTask?.cancel()
+        automaticPostVerificationTask = nil
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = nil
+        cancelAutomaticContinuousAPRetryDelay()
+        automaticPostStatusTask?.cancel()
+        automaticPostStatusTask = nil
+        automaticSubmitReadinessStableSince = nil
+        automaticSubmitReadinessDeadline = nil
+        automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessFalseLogged = false
+        automaticSubmitReadinessReason = nil
+        automaticContinuousAPCompletedUptimeNanoseconds = nil
+        automaticCookieRelatedCount = nil
+        automaticCookieCountDelta = nil
+        automaticAPResult = "NOT_REQUESTED"
+        latestCompactReady = nil
+        pendingHandwritingReady = nil
+        pendingHandwritingRestore = nil
+        pendingMultiThreadAvailabilityProbe = nil
+        pendingMultiThreadUnavailable = nil
+        pendingUAChangeGeneration = nil
+        automaticReloadGeneration = nil
+        isUAChanging = false
+        isIdentityRefreshInProgress = false
+
+        automaticPostGeneration &+= 1
+        let generationID = automaticPostGeneration
+        automaticPostMachine.reset()
+        let beginEffect = automaticPostMachine.begin(
+            generationID: generationID,
+            oldPageToken: oldPageToken,
+            hasComment: draft.hasComment,
+            hasImage: draft.hasImage,
+            multiThread: wasMultiThread,
+            sameThreadRepeat: wasSameThreadRepeat,
+            cookieRefreshAfterTimeoutUsed: true,
+            submissionIDSeed: nextAutomaticSubmissionSeed()
+        )
+        automaticPostDraft = draft
+        if wasMultiThread, var session = multiThreadSession {
+            session.currentGenerationID = generationID
+            session.currentTargetID = session.currentTarget?.id
+            multiThreadSession = session
+        }
+        beginAutomaticGenerationLogging(generationID: generationID)
+        automaticDraftRestorePendingGeneration = draft.comment?.isEmpty == false
+            ? generationID
+            : nil
+        automaticReloadGeneration = generationID
+        setAutomaticPostStatus(.checkingCookie, generationID: generationID)
+        startAutomaticPostPreparationTimeout(generationID: generationID)
+
+        if case let .stopped(reason) = beginEffect {
+            handleAutomaticPostEffect(.stopped(reason), generationID: generationID)
+            return
+        }
+        let apEffect = automaticPostMachine.handle(
+            .markAPCompleted(generationID: generationID)
+        )
+        handleAutomaticPostEffect(apEffect, generationID: generationID)
+
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "COOKIE",
+            event: "TIMEOUT_COOKIE_REFRESH_STARTED",
+            result: "STARTED",
+            fields: [
+                ("SOURCE_GENERATION_ID", String(previousGenerationID)),
+                ("AP_PURPOSE", "NOT_REQUESTED")
+            ]
+        )
+        isCookieRefreshing = true
+        Task { [weak self] in
+            await self?.deleteRelatedCookiesForRefresh(
+                identityRefresh: false,
+                automaticGenerationID: generationID,
+                reloadWhenNoCookie: true
+            )
+        }
+        updateIdleTimerState()
     }
 
     func toggleSameThreadRepeat() {
@@ -1119,6 +1241,30 @@ final class BrowserViewModel: ObservableObject {
                                         reason: "THREAD_UNAVAILABLE")
             return
         }
+        if automaticDraftRestorePendingGeneration == generationID,
+           let expectedComment = automaticPostDraft?.comment,
+           !expectedComment.isEmpty {
+            guard let comment else {
+                recordAutomaticBridgeInvalidPayload(type: "compactReady",
+                                                    reason: "COMMENT_MISSING")
+                return
+            }
+            guard comment == expectedComment else {
+                latestCompactReady = (pageURL ?? webView?.url,
+                                      pageToken,
+                                      hasComment,
+                                      canSubmit)
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "PREPARATION",
+                    event: "DRAFT_CONTENT_PENDING",
+                    result: "WAITING",
+                    fields: [("REASON", "RESTORE_IN_PROGRESS")]
+                )
+                return
+            }
+            automaticDraftRestorePendingGeneration = nil
+        }
         if automaticPostMachine.isMultiThread,
            let expectedComment = multiThreadSession?.comment,
            !expectedComment.isEmpty {
@@ -1573,7 +1719,8 @@ final class BrowserViewModel: ObservableObject {
             // timer ownership.
             canAcceptVisibleResponse = automaticPostAccepted
         case .idle, .preparing, .waitingForSubmitReadiness, .waitingToSubmit,
-             .waitingForCookieRetry, .waitingForIPRetry, .waitingForContinuousRetry,
+             .waitingForCookieRetry, .waitingForCookieRefresh, .waitingForIPRetry,
+             .waitingForContinuousRetry,
              .waitingForContinuousAPRetry, .stopped:
             canAcceptVisibleResponse = false
         }
@@ -2066,6 +2213,73 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    /// Restores the in-memory comment after the bounded timeout recovery's
+    /// Cookie reload. This is intentionally separate from UA handoff and
+    /// multi-thread navigation restoration so those existing paths keep their
+    /// original callback ownership.
+    private func restoreAutomaticDraftAfterCookieRefresh(comment: String,
+                                                         generationID: UInt64,
+                                                         pageURL: URL) {
+        guard automaticPostMachine.generationID == generationID,
+              automaticPostMachine.isActive,
+              let webView,
+              let script = CompactPageModeService.restoreAutomaticDraftScript(
+                  comment: comment
+              ) else {
+            stopAutomaticPost(.preparationFailed, generationID: generationID)
+            return
+        }
+        webView.evaluateJavaScript(script) { [weak self] result, error in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.automaticPostMachine.generationID == generationID,
+                      self.automaticPostMachine.isActive,
+                      Self.sameTargetThreadURL(self.webView?.url, pageURL) else {
+                    return
+                }
+                guard error == nil, Self.javascriptBoolean(result) == true else {
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "PREPARATION",
+                        event: "DRAFT_RESTORE_FAILED",
+                        result: "STOPPED",
+                        fields: [
+                            ("PATH", "TIMEOUT_COOKIE_REFRESH"),
+                            ("REASON", error == nil
+                                ? "SCRIPT_RETURNED_FALSE" : "EVALUATION_ERROR")
+                        ]
+                    )
+                    self.stopAutomaticPost(.preparationFailed,
+                                            generationID: generationID)
+                    return
+                }
+                self.automaticDraftRestorePendingGeneration = nil
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "PREPARATION",
+                    event: "DRAFT_RESTORE_VERIFIED",
+                    result: "READY",
+                    fields: [("PATH", "TIMEOUT_COOKIE_REFRESH")]
+                )
+
+                // If compactReady arrived while the restore script was still
+                // running, replay only that same-page signal with the known
+                // restored comment instead of waiting for another bridge tick.
+                guard case .preparing = self.automaticPostMachine.state,
+                      let compact = self.latestCompactReady,
+                      Self.sameTargetThreadURL(compact.pageURL, pageURL),
+                      compact.canSubmit else { return }
+                self.handleCompactReady(
+                    pageToken: compact.pageToken,
+                    hasComment: compact.hasComment || !comment.isEmpty,
+                    canSubmit: compact.canSubmit,
+                    comment: comment,
+                    pageURL: compact.pageURL ?? pageURL
+                )
+            }
+        }
+    }
+
     func navigationFailed(url: URL?, error: Error) {
         isLoading = false
         if !isIdentityRefreshInProgress {
@@ -2433,7 +2647,8 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private func deleteRelatedCookiesForRefresh(identityRefresh: Bool,
-                                                automaticGenerationID: UInt64?) async {
+                                                automaticGenerationID: UInt64?,
+                                                reloadWhenNoCookie: Bool = false) async {
         guard let webView,
               let host = webView.url?.host?.lowercased() else {
             if identityRefresh {
@@ -2455,6 +2670,17 @@ final class BrowserViewModel: ObservableObject {
 
         if targets.isEmpty, !identityRefresh {
             logCookieRefresh(host: host, before: 0, deleted: 0, after: 0, result: "NO_COOKIE")
+            if let automaticGenerationID, reloadWhenNoCookie {
+                appendAutomaticEvent(
+                    generationID: automaticGenerationID,
+                    phase: "COOKIE",
+                    event: "TIMEOUT_COOKIE_REFRESH_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "NO_COOKIE")]
+                )
+                stopAutomaticPost(.preparationFailed,
+                                  generationID: automaticGenerationID)
+            }
             showToast("Cookieなし", kind: .warning)
             isCookieRefreshing = false
             return
@@ -2613,6 +2839,19 @@ final class BrowserViewModel: ObservableObject {
             guard reloadObserved else {
                 stopAutomaticPost(.preparationFailed, generationID: generationID)
                 return
+            }
+            if automaticDraftRestorePendingGeneration == generationID {
+                if let comment = automaticPostDraft?.comment,
+                   !comment.isEmpty,
+                   let pageURL = webView?.url {
+                    restoreAutomaticDraftAfterCookieRefresh(
+                        comment: comment,
+                        generationID: generationID,
+                        pageURL: pageURL
+                    )
+                } else {
+                    automaticDraftRestorePendingGeneration = nil
+                }
             }
             let effect = automaticPostMachine.handle(.markCookieObserved(generationID: generationID))
             handleAutomaticPostEffect(effect, generationID: generationID)
@@ -3580,6 +3819,16 @@ final class BrowserViewModel: ObservableObject {
             )
         case .scheduleContinuousAPReconnectRetry:
             scheduleContinuousAPReconnectRetry(generationID: generationID)
+        case .startCookieRefreshAfterTimeout:
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "COOKIE",
+                event: "TIMEOUT_COOKIE_REFRESH_REQUESTED",
+                result: "STARTED",
+                fields: [("REASON", "SUBMIT_RESPONSE_RETRY_TIMEOUT")]
+            )
+            setAutomaticPostStatus(.checkingCookie, generationID: generationID)
+            startAutomaticCookieRefreshAfterTimeout(previousGenerationID: generationID)
         case .startNextAutomaticFlow:
             appendAutomaticEvent(
                 generationID: generationID,
@@ -4460,10 +4709,17 @@ final class BrowserViewModel: ObservableObject {
                 )
             )
             let willRetry: Bool
-            if case .startSubmitReadiness = effect {
+            switch effect {
+            case .startSubmitReadiness, .startCookieRefreshAfterTimeout:
                 willRetry = true
-            } else {
+            default:
                 willRetry = false
+            }
+            let timeoutBranch: String
+            if case .startCookieRefreshAfterTimeout = effect {
+                timeoutBranch = "COOKIE_REACQUIRE"
+            } else {
+                timeoutBranch = self.automaticSubmitBranch(attempt: attempt)
             }
             self.appendAutomaticEvent(
                 generationID: generationID,
@@ -4472,7 +4728,7 @@ final class BrowserViewModel: ObservableObject {
                 result: willRetry ? "RETRYING" : "STOPPED",
                 fields: [
                     ("ATTEMPT", String(attempt)),
-                    ("BRANCH", self.automaticSubmitBranch(attempt: attempt)),
+                    ("BRANCH", timeoutBranch),
                     ("PAGE_TOKEN_STATE", "MATCH"),
                     ("EVIDENCE", submissionEvidence),
                     ("TIMEOUT_MS", String(
