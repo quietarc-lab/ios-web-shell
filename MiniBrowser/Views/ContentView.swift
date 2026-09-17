@@ -72,6 +72,8 @@ struct ContentView: View {
                                       onOpenThread: model.openThreadListThread,
                                       sameThreadRepeatEnabled: model.sameThreadRepeatEnabled,
                                       onToggleSameThreadRepeat: model.toggleSameThreadRepeat,
+                                      isolationStopEnabled: model.isolationStopEnabled,
+                                      onToggleIsolationStop: model.toggleIsolationStop,
                                       multiThreadEnabled: model.multiThreadEnabled,
                                       multiThreadSessionActive: model.multiThreadSessionActive,
                                       onToggleMultiThread: model.toggleMultiThread)

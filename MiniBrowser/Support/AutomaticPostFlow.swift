@@ -34,6 +34,9 @@ enum AutomaticPostStopReason: Equatable {
     /// snapshot entry; single-thread flows still treat it as a failure.
     case threadUnavailable
     case catalogRefreshFailed
+    /// The Futapo isolation feed confirmed a thread referenced by the active
+    /// automatic session. This is a terminal session-level safety stop.
+    case isolatedThread
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {

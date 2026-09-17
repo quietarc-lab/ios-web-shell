@@ -12,6 +12,10 @@ final class BrowserViewModel: ObservableObject {
     static let continuousAPRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
     private static let automaticSubmitResponseTimeoutNanoseconds: UInt64 = 15_000_000_000
+    /// Futapo's isolation feed is polled only while the automatic session is
+    /// foreground-active. The first check runs immediately; subsequent checks
+    /// use this bounded interval and conditional HTTP validators.
+    static let isolationMonitorIntervalNanoseconds: UInt64 = 10_000_000_000
 
     private enum Keys {
         static let lastURL = "lastURL"
@@ -35,6 +39,9 @@ final class BrowserViewModel: ObservableObject {
     @Published private(set) var sameThreadRepeatEnabled = false
     @Published private(set) var multiThreadEnabled = false
     @Published private(set) var multiThreadSessionActive = false
+    /// Safety stop is enabled for a fresh process but deliberately not
+    /// persisted. Turning it off only affects the current process/session.
+    @Published private(set) var isolationStopEnabled = true
 
     let bookmarkStore: BookmarkStore
 
@@ -43,6 +50,7 @@ final class BrowserViewModel: ObservableObject {
     private let logStore: DebugLogStore
     private let ipService: IPAddressService
     private let userAgentRestrictionStore: UserAgentRestrictionStore
+    private let isolationThreadMonitor: IsolationThreadMonitor
     private var selectedUAIndex: Int
     private var automaticTriedUAIDs: Set<Int> = []
     /// A session-only shuffled order. It is created once when an automatic
@@ -133,6 +141,18 @@ final class BrowserViewModel: ObservableObject {
     private var automaticAcceptedPageToken: String?
     private var automaticPostVerificationTask: Task<Void, Never>?
     private var appSceneIsActive = false
+    private enum IsolationMonitorMode: Equatable, Sendable {
+        case sameThread
+        case multiThread
+    }
+    private struct IsolationMonitorContext: Equatable, Sendable {
+        let sessionID: UInt64
+        let mode: IsolationMonitorMode
+        let targetThreadIDs: Set<String>
+    }
+    private var isolationMonitorContext: IsolationMonitorContext?
+    private var isolationMonitorTask: Task<Void, Never>?
+    private var isolationMonitorFailureLogged = false
 
     private struct AutomaticPostDraft {
         let hasComment: Bool
@@ -191,12 +211,14 @@ final class BrowserViewModel: ObservableObject {
     }
 
     init(defaults: UserDefaults = .standard,
-         ipService: IPAddressService = IPAddressService()) {
+         ipService: IPAddressService = IPAddressService(),
+         isolationThreadMonitor: IsolationThreadMonitor = IsolationThreadMonitor()) {
         self.defaults = defaults
         self.logStore = DebugLogStore(defaults: defaults)
         self.bookmarkStore = BookmarkStore(defaults: defaults)
         self.ipService = ipService
         self.userAgentRestrictionStore = UserAgentRestrictionStore(defaults: defaults)
+        self.isolationThreadMonitor = isolationThreadMonitor
         let catalogNeedsMigration = defaults.integer(forKey: Keys.userAgentCatalogVersion) !=
             BrowserUserAgent.catalogVersion
         let savedID = defaults.object(forKey: Keys.userAgentID) as? Int
@@ -462,6 +484,7 @@ final class BrowserViewModel: ObservableObject {
         multiThreadSession = session
         multiThreadSessionActive = true
         pendingMultiThreadUnavailable = nil
+        updateIsolationMonitoring()
         updateIdleTimerState()
         automaticPostDraft = AutomaticPostDraft(
             hasComment: comment?.isEmpty == false,
@@ -749,6 +772,19 @@ final class BrowserViewModel: ObservableObject {
                             result: "STOPPED_REPEAT_DISABLED")
     }
 
+    /// Toggles the session-only safety stop driven by Futapo's isolation
+    /// feed. It remains available while an automatic session is running so a
+    /// user can explicitly opt out or opt back in without changing the post
+    /// state machine. Re-enabling performs an immediate foreground check.
+    func toggleIsolationStop() {
+        isolationStopEnabled.toggle()
+        if isolationStopEnabled {
+            updateIsolationMonitoring(forceCheck: true)
+        } else {
+            stopIsolationMonitoring(clearContext: false)
+        }
+    }
+
     func refreshCookies() {
         guard !isCookieRefreshing,
               !isIdentityRefreshInProgress,
@@ -929,6 +965,7 @@ final class BrowserViewModel: ObservableObject {
             setAutomaticPostStatus(.preparingUA, generationID: generationID)
             startAutomaticPostPreparationTimeout(generationID: generationID)
         }
+        updateIsolationMonitoring()
         updateIdleTimerState()
 
         showToast("UA変更後にCookie更新とAP再接続を開始します", kind: .success)
@@ -1081,7 +1118,191 @@ final class BrowserViewModel: ObservableObject {
     /// background execution service.
     func setAppSceneActive(_ isActive: Bool) {
         appSceneIsActive = isActive
+        if isActive {
+            updateIsolationMonitoring(forceCheck: true)
+        } else {
+            // iOS may suspend a background scene; keeping a sleeping polling
+            // task alive would not provide reliable monitoring and would hold
+            // unnecessary state. The session context itself is retained so a
+            // foreground resume can perform an immediate fresh check.
+            stopIsolationMonitoring(clearContext: false)
+        }
         updateIdleTimerState()
+    }
+
+    private func currentIsolationMonitorContext() -> IsolationMonitorContext? {
+        if let session = multiThreadSession {
+            let threadIDs = IsolationThreadURLParser.threadIDs(
+                inPostBody: session.comment ?? ""
+            )
+            guard !threadIDs.isEmpty else { return nil }
+            return IsolationMonitorContext(
+                sessionID: session.sessionID,
+                mode: .multiThread,
+                targetThreadIDs: threadIDs
+            )
+        }
+        if let session = automaticPostRepeatSession,
+           let threadID = IsolationThreadURLParser.threadID(from: session.pageURL) {
+            return IsolationMonitorContext(
+                sessionID: session.sessionID,
+                mode: .sameThread,
+                targetThreadIDs: [threadID]
+            )
+        }
+        return nil
+    }
+
+    private func updateIsolationMonitoring(forceCheck: Bool = false) {
+        let context = currentIsolationMonitorContext()
+        guard isolationStopEnabled,
+              appSceneIsActive,
+              let context,
+              !context.targetThreadIDs.isEmpty else {
+            isolationMonitorTask?.cancel()
+            isolationMonitorTask = nil
+            if context == nil {
+                isolationMonitorContext = nil
+                isolationMonitorFailureLogged = false
+            }
+            return
+        }
+
+        let contextChanged = isolationMonitorContext != context
+        guard contextChanged || forceCheck || isolationMonitorTask == nil else {
+            return
+        }
+
+        isolationMonitorTask?.cancel()
+        isolationMonitorContext = context
+        isolationMonitorFailureLogged = false
+        let monitor = isolationThreadMonitor
+        isolationMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                await self.checkIsolationOnce(context: context, monitor: monitor)
+                guard !Task.isCancelled else { return }
+                do {
+                    try await Task.sleep(
+                        nanoseconds: Self.isolationMonitorIntervalNanoseconds
+                    )
+                } catch {
+                    return
+                }
+                guard let self,
+                      self.isolationStopEnabled,
+                      self.appSceneIsActive,
+                      self.isolationMonitorContext == context,
+                      self.currentIsolationMonitorContext() == context else {
+                    return
+                }
+            }
+        }
+    }
+
+    private func stopIsolationMonitoring(clearContext: Bool) {
+        isolationMonitorTask?.cancel()
+        isolationMonitorTask = nil
+        if clearContext {
+            isolationMonitorContext = nil
+            isolationMonitorFailureLogged = false
+        }
+    }
+
+    private func checkIsolationOnce(context: IsolationMonitorContext,
+                                    monitor: IsolationThreadMonitor) async {
+        guard isolationStopEnabled,
+              appSceneIsActive,
+              isolationMonitorContext == context,
+              currentIsolationMonitorContext() == context else {
+            return
+        }
+        do {
+            let isolatedIDs = try await monitor.fetchIsolatedThreadIDs(
+                userAgent: effectiveUserAgent
+            )
+            guard isolationStopEnabled,
+                  appSceneIsActive,
+                  isolationMonitorContext == context,
+                  currentIsolationMonitorContext() == context else {
+                return
+            }
+            guard let matchedID = context.targetThreadIDs
+                .intersection(isolatedIDs)
+                .sorted()
+                .first else {
+                isolationMonitorFailureLogged = false
+                return
+            }
+            handleIsolationDetected(context: context, threadID: matchedID)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !isolationMonitorFailureLogged else { return }
+            isolationMonitorFailureLogged = true
+            guard let generationID = automaticPostMachine.generationID,
+                  automaticPostMachine.isActive else { return }
+            let nsError = error as NSError
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "ISOLATION",
+                event: "MONITOR_FAILED",
+                result: "RETRYING",
+                fields: [
+                    ("ERROR_DOMAIN", nsError.domain),
+                    ("ERROR_CODE", String(nsError.code))
+                ]
+            )
+        }
+    }
+
+    private func handleIsolationDetected(context: IsolationMonitorContext,
+                                         threadID: String) {
+        guard isolationStopEnabled,
+              isolationMonitorContext == context,
+              currentIsolationMonitorContext() == context else {
+            return
+        }
+        let mode = context.mode == .multiThread ? "MULTI_THREAD" : "SAME_THREAD"
+        if let generationID = automaticPostMachine.generationID {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "ISOLATION",
+                event: "ISOLATED_THREAD_DETECTED",
+                result: "STOPPED",
+                fields: [
+                    ("THREAD_ID", threadID),
+                    ("MODE", mode)
+                ]
+            )
+        }
+        stopIsolationMonitoring(clearContext: true)
+        let result = "STOPPED_ISOLATED_THREAD"
+
+        if multiThreadSession != nil {
+            if let generationID = automaticPostMachine.generationID,
+               automaticPostMachine.isActive {
+                stopAutomaticPost(.isolatedThread, generationID: generationID)
+            } else {
+                finishMultiThreadSession(
+                    generationID: automaticPostMachine.generationID,
+                    result: result
+                )
+            }
+            return
+        }
+
+        guard automaticPostRepeatSession != nil else { return }
+        if let generationID = automaticPostMachine.generationID,
+           automaticPostMachine.isActive {
+            stopAutomaticPost(.isolatedThread, generationID: generationID)
+        } else if let generationID = automaticPostMachine.generationID {
+            setAutomaticPostStatus(.stopped, generationID: generationID)
+            finishAutomaticPost(generationID: generationID, result: result)
+        } else {
+            cancelAutomaticRepeatSession()
+            setAutomaticPostStatusWithoutGeneration(.stopped)
+        }
     }
 
     func updateSitePostStatus(_ rawStatus: String?) {
@@ -3717,6 +3938,7 @@ final class BrowserViewModel: ObservableObject {
         pendingMultiThreadAvailabilityProbe = nil
         pendingMultiThreadUnavailable = nil
         pendingHandwritingRestore = nil
+        stopIsolationMonitoring(clearContext: true)
         multiThreadSession = nil
         multiThreadSessionActive = false
         multiThreadEnabled = false
@@ -4869,6 +5091,7 @@ final class BrowserViewModel: ObservableObject {
         logStore.append(action: "Automatic Post", fields: finalFields)
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
+        stopIsolationMonitoring(clearContext: true)
         if pendingUAChangeGeneration == generationID {
             pendingUAChangeGeneration = nil
             isUAChanging = false
@@ -4909,6 +5132,9 @@ final class BrowserViewModel: ObservableObject {
         automaticPostRepeatDelayTask?.cancel()
         automaticPostRepeatDelayTask = nil
         automaticPostRepeatSession = nil
+        if multiThreadSession == nil {
+            stopIsolationMonitoring(clearContext: true)
+        }
         cancelAutomaticContinuousAPRetryDelay()
         updateIdleTimerState()
     }
@@ -5246,6 +5472,9 @@ final class BrowserViewModel: ObservableObject {
         }
         if reason == .threadUnavailable {
             return "STOPPED_THREAD_UNAVAILABLE"
+        }
+        if reason == .isolatedThread {
+            return "STOPPED_ISOLATED_THREAD"
         }
         return "STOPPED_\(String(describing: reason).uppercased())"
     }

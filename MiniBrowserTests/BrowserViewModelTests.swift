@@ -133,6 +133,20 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(BrowserViewModel.sameThreadRepeatSubmitDelayNanoseconds, 0)
     }
 
+    func testIsolationStopStartsOnAndIsNotPersisted() {
+        let suiteName = "BrowserViewModelTests.isolationStopToggle.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = BrowserViewModel(defaults: defaults)
+        XCTAssertTrue(model.isolationStopEnabled)
+
+        model.toggleIsolationStop()
+
+        XCTAssertFalse(model.isolationStopEnabled)
+        XCTAssertNil(defaults.object(forKey: "isolationStopEnabled"))
+    }
+
     func testMultiThreadSuccessAndContinuousAPRetryUseOneSecondBuffers() {
         XCTAssertEqual(BrowserViewModel.multiThreadSuccessWaitNanoseconds,
                        1_000_000_000)

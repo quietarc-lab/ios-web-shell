@@ -6,6 +6,8 @@ struct ThreadListView: View {
     let onOpenThread: (URL) -> Void
     let sameThreadRepeatEnabled: Bool
     let onToggleSameThreadRepeat: () -> Void
+    let isolationStopEnabled: Bool
+    let onToggleIsolationStop: () -> Void
     let multiThreadEnabled: Bool
     let multiThreadSessionActive: Bool
     let onToggleMultiThread: () -> Void
@@ -15,6 +17,8 @@ struct ThreadListView: View {
         onOpenThread: @escaping (URL) -> Void,
         sameThreadRepeatEnabled: Bool,
         onToggleSameThreadRepeat: @escaping () -> Void,
+        isolationStopEnabled: Bool = true,
+        onToggleIsolationStop: @escaping () -> Void = {},
         multiThreadEnabled: Bool = false,
         multiThreadSessionActive: Bool = false,
         onToggleMultiThread: @escaping () -> Void = {}
@@ -23,6 +27,8 @@ struct ThreadListView: View {
         self.onOpenThread = onOpenThread
         self.sameThreadRepeatEnabled = sameThreadRepeatEnabled
         self.onToggleSameThreadRepeat = onToggleSameThreadRepeat
+        self.isolationStopEnabled = isolationStopEnabled
+        self.onToggleIsolationStop = onToggleIsolationStop
         self.multiThreadEnabled = multiThreadEnabled
         self.multiThreadSessionActive = multiThreadSessionActive
         self.onToggleMultiThread = onToggleMultiThread
@@ -54,6 +60,19 @@ struct ThreadListView: View {
             }
 
             Spacer(minLength: 2)
+
+            Button(action: onToggleIsolationStop) {
+                Image(systemName: isolationStopEnabled
+                      ? "checkmark.square.fill"
+                      : "square")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(isolationStopEnabled ? Color.blue : Color.secondary)
+                    .frame(width: 22, height: 26)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("隔離検知時に自動停止")
+            .accessibilityValue(isolationStopEnabled ? "オン" : "オフ")
+            .accessibilityAddTraits(isolationStopEnabled ? .isSelected : [])
 
             Button(action: onToggleSameThreadRepeat) {
                 Text("同スレ連続")
