@@ -174,6 +174,7 @@ final class BrowserViewModel: ObservableObject {
         let snapshot: CatalogPostSnapshot
         let pageURL: URL
         let imageAvailable: Bool
+        let retainedPostThreadIDs: Set<String>
     }
 
     private struct AutomaticLogContext {
@@ -355,19 +356,6 @@ final class BrowserViewModel: ObservableObject {
         let oldPageToken = latestCompactReady?.pageToken
         let imageAvailable = handwritingImageAvailable
 
-        let multiBootstrap: PendingMultiThreadBootstrap?
-        if multiThreadEnabled,
-           let provider = automaticCatalogProvider {
-            let snapshot = provider.currentPostSnapshot(limit: 60)
-            multiBootstrap = snapshot.targets.isEmpty
-                ? nil
-                : PendingMultiThreadBootstrap(snapshot: snapshot,
-                                               pageURL: pageURL,
-                                               imageAvailable: imageAvailable)
-        } else {
-            multiBootstrap = nil
-        }
-
         // Read the current draft before changing the UA. This is deliberately
         // read-only: it never submits or mutates the page.
         webView.evaluateJavaScript(CompactPageModeService.currentPostStateScript) {
@@ -380,6 +368,25 @@ final class BrowserViewModel: ObservableObject {
             let canSubmit = state?.canSubmit ?? false
             let isTarget = Self.isTargetThreadURL(pageURL)
             let hasContent = hasComment || imageAvailable
+            let retainedPostThreadIDs = IsolationThreadURLParser.threadIDs(
+                inPostBody: comment ?? ""
+            )
+            let multiBootstrap: PendingMultiThreadBootstrap?
+            if self.multiThreadEnabled,
+               let provider = self.automaticCatalogProvider {
+                let snapshot = provider.currentPostSnapshot(limit: 60)
+                    .excludingThreadIDs(retainedPostThreadIDs)
+                multiBootstrap = snapshot.targets.isEmpty
+                    ? nil
+                    : PendingMultiThreadBootstrap(
+                        snapshot: snapshot,
+                        pageURL: pageURL,
+                        imageAvailable: imageAvailable,
+                        retainedPostThreadIDs: retainedPostThreadIDs
+                    )
+            } else {
+                multiBootstrap = nil
+            }
             let shouldStartMulti = self.multiThreadEnabled &&
                 multiBootstrap != nil && isTarget && canSubmit && hasContent
             if shouldStartMulti,
@@ -388,7 +395,8 @@ final class BrowserViewModel: ObservableObject {
                     snapshot: multiBootstrap.snapshot,
                     comment: comment,
                     hasImage: imageAvailable,
-                    currentPageURL: pageURL
+                    currentPageURL: pageURL,
+                    retainedPostThreadIDs: multiBootstrap.retainedPostThreadIDs
                 )
                 if self.multiThreadSession?.currentTarget?.threadURL.path != pageURL.path {
                     return
@@ -470,7 +478,8 @@ final class BrowserViewModel: ObservableObject {
     private func beginMultiThreadSession(snapshot: CatalogPostSnapshot,
                                          comment: String?,
                                          hasImage: Bool,
-                                         currentPageURL: URL) {
+                                         currentPageURL: URL,
+                                         retainedPostThreadIDs: Set<String> = []) {
         guard !snapshot.targets.isEmpty else { return }
         multiThreadSessionID &+= 1
         multiThreadTransitionTask?.cancel()
@@ -479,7 +488,8 @@ final class BrowserViewModel: ObservableObject {
             sessionID: multiThreadSessionID,
             snapshot: snapshot,
             comment: comment,
-            hasImage: hasImage
+            hasImage: hasImage,
+            retainedPostThreadIDs: retainedPostThreadIDs
         )
         multiThreadSession = session
         multiThreadSessionActive = true
@@ -3483,7 +3493,9 @@ final class BrowserViewModel: ObservableObject {
             ]
         )
         let sessionID = session.sessionID
-        let processed = session.processedThreadIDs
+        let processed = session.processedThreadIDs.union(
+            session.retainedPostThreadIDs
+        )
         guard let provider = automaticCatalogProvider else {
             appendAutomaticEvent(
                 generationID: generationID,
@@ -3503,13 +3515,16 @@ final class BrowserViewModel: ObservableObject {
                     excludingIDs: processed,
                     limit: 60
                 )
+                let filtered = refreshed.excludingThreadIDs(
+                    session.retainedPostThreadIDs
+                )
                 guard let self,
                       self.multiThreadSession?.sessionID == sessionID,
                       self.multiThreadSession?.currentGenerationID == generationID,
                       self.multiThreadEnabled else { return }
                 var current = self.multiThreadSession!
                 let beforeCount = current.snapshot.targets.count
-                current.appendUnprocessedTargets(from: refreshed)
+                current.appendUnprocessedTargets(from: filtered)
                 self.multiThreadSession = current
                 self.appendAutomaticEvent(
                     generationID: generationID,
@@ -3785,7 +3800,9 @@ final class BrowserViewModel: ObservableObject {
         session.catalogRefreshUsed = true
         multiThreadSession = session
         setMultiThreadStatusWithoutGeneration(.refreshingCatalog)
-        let processed = session.processedThreadIDs
+        let processed = session.processedThreadIDs.union(
+            session.retainedPostThreadIDs
+        )
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = Task { @MainActor [weak self] in
             do {
@@ -3793,11 +3810,14 @@ final class BrowserViewModel: ObservableObject {
                     excludingIDs: processed,
                     limit: 60
                 )
+                let filtered = refreshed.excludingThreadIDs(
+                    session.retainedPostThreadIDs
+                )
                 guard let self,
                       self.multiThreadEnabled,
                       var current = self.multiThreadSession,
                       current.sessionID == sessionID else { return }
-                current.appendUnprocessedTargets(from: refreshed)
+                current.appendUnprocessedTargets(from: filtered)
                 self.multiThreadSession = current
                 self.multiThreadTransitionTask = nil
                 let nextResult = self.nextMultiThreadPostableTarget(session: &current)

@@ -35,6 +35,17 @@ struct CatalogPostSnapshot: Equatable, Sendable {
             return true
         }
     }
+
+    /// Returns a copy with targets referenced by the retained post body
+    /// removed.  The catalog order and sort are preserved so this filtering
+    /// can be applied both to the initial snapshot and to the one-shot refresh.
+    func excludingThreadIDs(_ excludedIDs: Set<String>) -> CatalogPostSnapshot {
+        guard !excludedIDs.isEmpty else { return self }
+        return CatalogPostSnapshot(
+            sort: sort,
+            targets: targets.filter { !excludedIDs.contains($0.id) }
+        )
+    }
 }
 
 /// Main-actor boundary used by BrowserViewModel. Keeping this as a small
@@ -69,6 +80,9 @@ struct MultiThreadPostSession: Equatable, Sendable {
     var processedThreadIDs: Set<String>
     let comment: String?
     let hasImage: Bool
+    /// Thread IDs found in the retained post body. These targets are never
+    /// selected by this multi-thread session, including its one-shot refresh.
+    let retainedPostThreadIDs: Set<String>
     var catalogRefreshUsed: Bool
     var stopRequested: Bool
     var currentGenerationID: UInt64?
@@ -85,13 +99,15 @@ struct MultiThreadPostSession: Equatable, Sendable {
     init(sessionID: UInt64,
          snapshot: CatalogPostSnapshot,
          comment: String?,
-         hasImage: Bool) {
+         hasImage: Bool,
+         retainedPostThreadIDs: Set<String> = []) {
         self.sessionID = sessionID
         self.snapshot = snapshot
         self.currentIndex = 0
         self.processedThreadIDs = []
         self.comment = comment?.isEmpty == false ? comment : nil
         self.hasImage = hasImage
+        self.retainedPostThreadIDs = retainedPostThreadIDs
         self.catalogRefreshUsed = false
         self.stopRequested = false
         self.currentGenerationID = nil
@@ -145,7 +161,9 @@ struct MultiThreadPostSession: Equatable, Sendable {
     mutating func appendUnprocessedTargets(from refreshed: CatalogPostSnapshot) {
         let existing = Set(snapshot.targets.map(\.id))
         let additions = refreshed.targets.filter {
-            !existing.contains($0.id) && !processedThreadIDs.contains($0.id)
+            !existing.contains($0.id) &&
+            !processedThreadIDs.contains($0.id) &&
+            !retainedPostThreadIDs.contains($0.id)
         }
         guard !additions.isEmpty else { return }
         snapshot = CatalogPostSnapshot(sort: snapshot.sort,

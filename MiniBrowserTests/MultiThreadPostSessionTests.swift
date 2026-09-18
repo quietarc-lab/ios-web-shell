@@ -16,6 +16,22 @@ final class MultiThreadPostSessionTests: XCTestCase {
         XCTAssertEqual(snapshot.targets.map(\.id), ["1", "2"])
     }
 
+    func testSnapshotCanExcludeThreadIDsRetainedInPostBody() {
+        let targets = (1...3).map { id in
+            CatalogPostTarget(
+                id: String(id),
+                threadURL: URL(string: "https://img.2chan.net/b/res/\(id).htm")!
+            )
+        }
+        let snapshot = CatalogPostSnapshot(sort: .momentum, targets: targets)
+
+        XCTAssertEqual(
+            snapshot.excludingThreadIDs(["2"]).targets.map(\.id),
+            ["1", "3"]
+        )
+        XCTAssertEqual(snapshot.excludingThreadIDs([]), snapshot)
+    }
+
     func testSessionAdvancesOnlyToUnprocessedTargets() {
         let targets = (1...3).map { id in
             CatalogPostTarget(
@@ -59,6 +75,35 @@ final class MultiThreadPostSessionTests: XCTestCase {
         ))
         XCTAssertEqual(session.snapshot.targets.map(\.id), ["1", "2"])
         XCTAssertEqual(session.advanceToNextUnprocessed()?.id, "2")
+    }
+
+    func testRefreshedSnapshotDoesNotReintroduceRetainedPostThreadIDs() {
+        let first = CatalogPostTarget(
+            id: "1",
+            threadURL: URL(string: "https://img.2chan.net/b/res/1.htm")!
+        )
+        let retained = CatalogPostTarget(
+            id: "2",
+            threadURL: URL(string: "https://img.2chan.net/b/res/2.htm")!
+        )
+        let newTarget = CatalogPostTarget(
+            id: "3",
+            threadURL: URL(string: "https://img.2chan.net/b/res/3.htm")!
+        )
+        var session = MultiThreadPostSession(
+            sessionID: 1,
+            snapshot: CatalogPostSnapshot(sort: .momentum, targets: [first]),
+            comment: "https://img.2chan.net/b/res/2.htm",
+            hasImage: false,
+            retainedPostThreadIDs: ["2"]
+        )
+
+        session.appendUnprocessedTargets(from: CatalogPostSnapshot(
+            sort: .momentum,
+            targets: [retained, newTarget]
+        ))
+
+        XCTAssertEqual(session.snapshot.targets.map(\.id), ["1", "3"])
     }
 
     func testTwoAcceptedPostsRequestUserAgentRotationAndSkippedTargetsDoNotCount() {
