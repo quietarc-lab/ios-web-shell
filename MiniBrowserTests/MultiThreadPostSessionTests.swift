@@ -96,4 +96,25 @@ final class MultiThreadPostSessionTests: XCTestCase {
         XCTAssertTrue(target.isReplyLimitReached)
         XCTAssertEqual(target.replyCount, 1_000)
     }
+
+    func testContinuousRestrictionHandoffIsPerTargetAndResetsOnAdvance() {
+        let targets = (1...2).map { id in
+            CatalogPostTarget(
+                id: String(id),
+                threadURL: URL(string: "https://img.2chan.net/b/res/\(id).htm")!
+            )
+        }
+        var session = MultiThreadPostSession(
+            sessionID: 3,
+            snapshot: CatalogPostSnapshot(sort: .momentum, targets: targets),
+            comment: "draft",
+            hasImage: false
+        )
+
+        XCTAssertFalse(session.continuousRestrictionHandoffUsed)
+        session.continuousRestrictionHandoffUsed = true
+        session.markCurrentProcessed()
+        XCTAssertEqual(session.advanceToNextUnprocessed()?.id, "2")
+        XCTAssertFalse(session.continuousRestrictionHandoffUsed)
+    }
 }

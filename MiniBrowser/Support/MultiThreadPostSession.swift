@@ -76,6 +76,11 @@ struct MultiThreadPostSession: Equatable, Sendable {
     /// Number of targets whose site completion marker was accepted since the
     /// current UA was selected. Skipped targets do not consume this quota.
     var postsSinceUserAgentChange: Int
+    /// A short continuous-posting restriction is allowed one UA handoff for
+    /// the current target. If that same target reports the restriction again
+    /// under the next UA generation, only the target is skipped and the
+    /// session continues with the remaining snapshot.
+    var continuousRestrictionHandoffUsed: Bool
 
     init(sessionID: UInt64,
          snapshot: CatalogPostSnapshot,
@@ -92,6 +97,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
         self.currentGenerationID = nil
         self.currentTargetID = snapshot.targets.first?.id
         self.postsSinceUserAgentChange = 0
+        self.continuousRestrictionHandoffUsed = false
     }
 
     var currentTarget: CatalogPostTarget? {
@@ -128,6 +134,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
             if !processedThreadIDs.contains(target.id) {
                 currentIndex = index
                 currentTargetID = target.id
+                continuousRestrictionHandoffUsed = false
                 return target
             }
             index += 1

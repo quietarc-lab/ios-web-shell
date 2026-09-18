@@ -30,7 +30,8 @@ struct SitePostStatusView: View {
             case .stopped: return .red
             case .preparingUA, .checkingCookie, .sending, .cookieRetry,
                  .reconnectingAfterIPLimit, .finalSendAfterIPChange,
-                 .switchingAfterAccessRestriction, .reconnectingAfterContinuousLimit,
+                 .switchingAfterAccessRestriction, .switchingAfterContinuousLimit,
+                 .reconnectingAfterContinuousLimit,
                  .finalSendAfterContinuousLimit, .waitingForRepeat,
                  .waitingForNextThread, .navigatingToNextThread,
                  .switchingAfterThreadBatch,

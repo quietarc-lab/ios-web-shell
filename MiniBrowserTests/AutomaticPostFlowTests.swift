@@ -760,6 +760,35 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .startSubmitReadiness(attempt: 2, reason: .continuousRetry))
     }
 
+    func testMultiThreadRepeatedContinuousPostingRequestsUAHandoffAfterLimit() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.begin(generationID: generation,
+                          oldPageToken: nil,
+                          hasComment: true,
+                          hasImage: false,
+                          multiThread: true)
+        _ = machine.handle(.markAPCompleted(generationID: generation))
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCookieObserved(generationID: generation))
+        _ = machine.handle(.markCompactReady(generationID: generation,
+                                              pageToken: "page",
+                                              hasComment: true,
+                                              canSubmit: true))
+        _ = submitAfterReadiness(&machine)
+
+        _ = machine.handleAlert(.continuousPosting, generationID: generation)
+        _ = machine.handle(.continuousAlertDismissed(generationID: generation))
+        _ = submitAfterReadiness(&machine)
+
+        let result = machine.handleAlert(.continuousPosting,
+                                         generationID: generation)
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .handoffAfterContinuousLimit)
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .knownAlertAfterLimit))
+    }
+
     private func readyForReadinessMachine() -> AutomaticPostFlowMachine {
         var machine = AutomaticPostFlowMachine()
         _ = machine.begin(generationID: generation,

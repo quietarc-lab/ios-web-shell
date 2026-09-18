@@ -76,6 +76,10 @@ enum AutomaticPostFlowEffect: Equatable {
     case scheduleContinuousAPReconnectRetry
     case startCookieRefreshAfterTimeout
     case startNextAutomaticFlow
+    /// Multi-thread-only terminal recovery for a repeated short
+    /// continuous-posting restriction. The coordinator decides whether this
+    /// is the first UA handoff for the target or a per-target skip.
+    case handoffAfterContinuousLimit
     case skipCurrentThread
     case succeeded
     case stopped(AutomaticPostStopReason)
@@ -584,6 +588,12 @@ struct AutomaticPostFlowMachine {
         case .continuousPosting:
             guard !continuousRetryUsed,
                   attempt < Self.maximumAttempts else {
+                if isMultiThread {
+                    state = .stopped(generationID: generationID,
+                                     reason: .knownAlertAfterLimit)
+                    awaitingSubmitResponseRetry = false
+                    return (true, .handoffAfterContinuousLimit)
+                }
                 return (true, stop(.knownAlertAfterLimit))
             }
             continuousRetryUsed = true

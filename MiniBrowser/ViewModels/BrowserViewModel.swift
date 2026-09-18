@@ -3421,7 +3421,8 @@ final class BrowserViewModel: ObservableObject {
         if afterSkippedThread,
            case let .stopped(_, reason) = automaticPostMachine.state,
            reason == .threadPostingUnavailable ||
-           reason == .threadUnavailable {
+           reason == .threadUnavailable ||
+           reason == .knownAlertAfterLimit {
             canContinueAfterSkip = true
         } else {
             canContinueAfterSkip = false
@@ -3639,8 +3640,13 @@ final class BrowserViewModel: ObservableObject {
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
 
-    private func invalidateAutomaticGenerationForThreadSkip(generationID: UInt64) {
-        automaticFinishedGenerations.insert(generationID)
+    private func invalidateAutomaticGenerationForThreadSkip(
+        generationID: UInt64,
+        markFinished: Bool = true
+    ) {
+        if markFinished {
+            automaticFinishedGenerations.insert(generationID)
+        }
         automaticPostPreparationTimer?.cancel()
         automaticPostPreparationTimer = nil
         automaticSubmitReadinessTask?.cancel()
@@ -3880,12 +3886,16 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
-    private func skipCurrentMultiThreadThread(generationID: UInt64,
-                                              reason: String = "THREAD_POSTING_UNAVAILABLE") {
+    private func skipCurrentMultiThreadThread(
+        generationID: UInt64,
+        reason: String = "THREAD_POSTING_UNAVAILABLE",
+        excludeFromCatalog: Bool = true
+    ) {
         guard var session = multiThreadSession,
               session.currentGenerationID == generationID else { return }
         session.markCurrentProcessed()
-        if let targetID = session.currentTarget?.id {
+        if excludeFromCatalog,
+           let targetID = session.currentTarget?.id {
             automaticCatalogProvider?.excludeThread(id: targetID)
         }
         multiThreadSession = session
@@ -4060,6 +4070,50 @@ final class BrowserViewModel: ObservableObject {
             setAutomaticPostStatus(.switchingAfterAccessRestriction,
                                    generationID: generationID)
             startNextAutomaticFlow(previousGenerationID: generationID)
+        case .handoffAfterContinuousLimit:
+            guard var session = multiThreadSession,
+                  session.currentGenerationID == generationID else {
+                let stopEffect = automaticPostMachine.stop(.knownAlertAfterLimit)
+                handleAutomaticPostEffect(stopEffect, generationID: generationID)
+                return
+            }
+            if !session.continuousRestrictionHandoffUsed {
+                session.continuousRestrictionHandoffUsed = true
+                multiThreadSession = session
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "FLOW",
+                    event: "CONTINUOUS_UA_HANDOFF",
+                    result: "NEXT_UA_REQUESTED",
+                    fields: [
+                        ("TARGET_INDEX", String(session.currentIndex)),
+                        ("REASON", "CONTINUOUS_POSTING_AFTER_LIMIT")
+                    ]
+                )
+                setAutomaticPostStatus(.switchingAfterContinuousLimit,
+                                       generationID: generationID)
+                startNextAutomaticFlow(previousGenerationID: generationID)
+            } else {
+                // The same target has already received its one bounded UA
+                // handoff. Do not terminate the whole batch for a repeated
+                // short restriction; settle this target and continue with
+                // the remaining snapshot entries under the current session.
+                // The generation is already terminal, so no late callback can
+                // advance it. Keep it out of the finished tombstone set when
+                // the session may still need to finalize through this same
+                // generation after the target is skipped.
+                invalidateAutomaticGenerationForThreadSkip(
+                    generationID: generationID,
+                    markFinished: false
+                )
+                setAutomaticPostStatus(.waitingForNextThread,
+                                       generationID: generationID)
+                skipCurrentMultiThreadThread(
+                    generationID: generationID,
+                    reason: "CONTINUOUS_POSTING_AFTER_UA_HANDOFF",
+                    excludeFromCatalog: false
+                )
+            }
         case .skipCurrentThread:
             guard multiThreadSession != nil else {
                 let stopEffect = automaticPostMachine.stop(.threadPostingUnavailable)

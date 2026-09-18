@@ -20,6 +20,8 @@ final class SitePostStatusTests: XCTestCase {
                        "IP変更後に最終送信")
         XCTAssertEqual(AutomaticPostStatus.switchingAfterAccessRestriction.rawValue,
                        "アクセス規制 → 次のUAへ")
+        XCTAssertEqual(AutomaticPostStatus.switchingAfterContinuousLimit.rawValue,
+                       "連続制限 → 次のUAへ")
         XCTAssertEqual(AutomaticPostStatus.reconnectingAfterContinuousLimit.rawValue,
                        "連続制限 → AP再接続中")
         XCTAssertEqual(AutomaticPostStatus.finalSendAfterContinuousLimit.rawValue,
