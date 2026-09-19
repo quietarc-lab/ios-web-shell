@@ -48,13 +48,52 @@ struct CatalogPostSnapshot: Equatable, Sendable {
     }
 }
 
-/// Main-actor boundary used by BrowserViewModel. Keeping this as a small
-/// protocol lets the browser coordinate a one-shot refresh without coupling
-/// its posting state machine to catalog cell presentation state.
+enum MultiThreadPostPhase: String, CaseIterable, Hashable, Sendable {
+    case momentum
+    case catalog
+
+    var sort: ThreadListSort {
+        switch self {
+        case .momentum: .momentum
+        case .catalog: .list
+        }
+    }
+
+    var batchSize: Int {
+        switch self {
+        case .momentum: 20
+        case .catalog: 10
+        }
+    }
+
+    var phaseLimit: Int {
+        switch self {
+        case .momentum: 60
+        case .catalog: 30
+        }
+    }
+
+    var next: MultiThreadPostPhase {
+        switch self {
+        case .momentum: .catalog
+        case .catalog: .momentum
+        }
+    }
+}
+
+/// Main-actor boundary used by BrowserViewModel. The compatibility overloads
+/// keep lightweight test providers source-compatible while the coordinator can
+/// request a specific sort for each alternating batch.
 @MainActor
 protocol AutomaticCatalogProvider: AnyObject {
     func currentPostSnapshot(limit: Int) -> CatalogPostSnapshot
     func refreshPostSnapshot(excludingIDs: Set<String>, limit: Int) async throws -> CatalogPostSnapshot
+    func currentPostSnapshot(sort: ThreadListSort, limit: Int) -> CatalogPostSnapshot
+    func refreshPostSnapshot(sort: ThreadListSort,
+                             excludingIDs: Set<String>,
+                             limit: Int) async throws -> CatalogPostSnapshot
+    func beginAutomaticSortDisplay(_ sort: ThreadListSort)
+    func endAutomaticSortDisplay()
     func excludeThread(id: String)
     func markThreadRead(id: String)
 }
@@ -64,6 +103,19 @@ protocol AutomaticCatalogProvider: AnyObject {
 /// to reflect successful continuous posts in the catalog's read history.
 @MainActor
 extension AutomaticCatalogProvider {
+    func currentPostSnapshot(sort: ThreadListSort,
+                             limit: Int) -> CatalogPostSnapshot {
+        currentPostSnapshot(limit: limit)
+    }
+
+    func refreshPostSnapshot(sort: ThreadListSort,
+                             excludingIDs: Set<String>,
+                             limit: Int) async throws -> CatalogPostSnapshot {
+        try await refreshPostSnapshot(excludingIDs: excludingIDs, limit: limit)
+    }
+
+    func beginAutomaticSortDisplay(_ sort: ThreadListSort) {}
+    func endAutomaticSortDisplay() {}
     func excludeThread(id: String) {}
     func markThreadRead(id: String) {}
 }
@@ -83,7 +135,12 @@ struct MultiThreadPostSession: Equatable, Sendable {
     /// Thread IDs found in the retained post body. These targets are never
     /// selected by this multi-thread session, including its one-shot refresh.
     let retainedPostThreadIDs: Set<String>
-    var catalogRefreshUsed: Bool
+    var phase: MultiThreadPostPhase
+    /// Number of selected targets in the current phase. Selection includes
+    /// successful posts and every supported skip disposition.
+    var phaseProcessedCount: Int
+    var phaseBatchNumber: Int
+    var emptyPhases: Set<MultiThreadPostPhase>
     var stopRequested: Bool
     var currentGenerationID: UInt64?
     var currentTargetID: String?
@@ -108,7 +165,10 @@ struct MultiThreadPostSession: Equatable, Sendable {
         self.comment = comment?.isEmpty == false ? comment : nil
         self.hasImage = hasImage
         self.retainedPostThreadIDs = retainedPostThreadIDs
-        self.catalogRefreshUsed = false
+        self.phase = .momentum
+        self.phaseProcessedCount = 0
+        self.phaseBatchNumber = 1
+        self.emptyPhases = []
         self.stopRequested = false
         self.currentGenerationID = nil
         self.currentTargetID = snapshot.targets.first?.id
@@ -129,6 +189,10 @@ struct MultiThreadPostSession: Equatable, Sendable {
         postsSinceUserAgentChange >= Self.userAgentPostBatchLimit
     }
 
+    var phaseLimitReached: Bool {
+        phaseProcessedCount >= phase.phaseLimit
+    }
+
     mutating func recordAcceptedPost() {
         postsSinceUserAgentChange += 1
     }
@@ -139,7 +203,15 @@ struct MultiThreadPostSession: Equatable, Sendable {
 
     mutating func markCurrentProcessed() {
         guard let target = currentTarget else { return }
-        processedThreadIDs.insert(target.id)
+        guard processedThreadIDs.insert(target.id).inserted else { return }
+        phaseProcessedCount += 1
+    }
+
+    /// Marks the currently selected target once. A target is selected before
+    /// navigation/availability checks, so a later skip cannot consume a
+    /// second phase slot.
+    mutating func selectCurrentTarget() {
+        markCurrentProcessed()
     }
 
     mutating func advanceToNextUnprocessed() -> CatalogPostTarget? {
@@ -156,6 +228,28 @@ struct MultiThreadPostSession: Equatable, Sendable {
             index += 1
         }
         return nil
+    }
+
+    mutating func replaceSnapshot(with refreshed: CatalogPostSnapshot) {
+        snapshot = CatalogPostSnapshot(sort: phase.sort,
+                                       targets: refreshed.targets.filter {
+                                           !processedThreadIDs.contains($0.id) &&
+                                           !retainedPostThreadIDs.contains($0.id)
+                                       })
+        currentIndex = 0
+        currentTargetID = snapshot.targets.first?.id
+        continuousRestrictionHandoffUsed = false
+        phaseBatchNumber += 1
+    }
+
+    mutating func switchToNextPhase() {
+        phase = phase.next
+        phaseProcessedCount = 0
+        phaseBatchNumber = 0
+        currentIndex = 0
+        currentTargetID = nil
+        snapshot = CatalogPostSnapshot(sort: phase.sort, targets: [])
+        continuousRestrictionHandoffUsed = false
     }
 
     mutating func appendUnprocessedTargets(from refreshed: CatalogPostSnapshot) {

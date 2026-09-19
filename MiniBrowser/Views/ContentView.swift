@@ -48,6 +48,15 @@ struct ContentView: View {
             listModel.setUserAgent(model.effectiveUserAgent)
             listModel.setNetworkActivityAllowed(!isInProgress)
         }
+        .alert(item: $model.isolationStopNotice) { notice in
+            Alert(
+                title: Text("隔離検知"),
+                message: Text("隔離検知のため自動投稿を停止しました\nスレッド: \(notice.threadID)"),
+                dismissButton: .default(Text("OK")) {
+                    model.acknowledgeIsolationStop()
+                }
+            )
+        }
         .sheet(isPresented: $showingBookmarks) {
             BookmarkListView(store: model.bookmarkStore,
                              currentURL: model.currentURL,

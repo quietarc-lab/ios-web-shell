@@ -3,6 +3,18 @@ import Foundation
 import UIKit
 import WebKit
 
+struct IsolationStopNotice: Identifiable, Equatable {
+    let id: String
+    let threadID: String
+    let mode: String
+
+    init(threadID: String, mode: String) {
+        self.threadID = threadID
+        self.mode = mode
+        self.id = "\(mode):\(threadID)"
+    }
+}
+
 @MainActor
 final class BrowserViewModel: ObservableObject {
     private static let standardSubmitDelayNanoseconds: UInt64 = 2_000_000_000
@@ -42,6 +54,9 @@ final class BrowserViewModel: ObservableObject {
     /// Safety stop is enabled for a fresh process but deliberately not
     /// persisted. Turning it off only affects the current process/session.
     @Published private(set) var isolationStopEnabled = true
+    /// Kept until the user confirms the native alert. A new automatic run is
+    /// never started from this notice; the user must explicitly start again.
+    @Published var isolationStopNotice: IsolationStopNotice?
 
     let bookmarkStore: BookmarkStore
 
@@ -65,6 +80,7 @@ final class BrowserViewModel: ObservableObject {
     private var multiThreadSession: MultiThreadPostSession?
     private var multiThreadSessionID: UInt64 = 0
     private var multiThreadTransitionTask: Task<Void, Never>?
+    private var multiThreadBootstrapTask: Task<Void, Never>?
     private var pendingMultiThreadNavigation: (sessionID: UInt64, target: CatalogPostTarget)?
     /// Monotonically identifies each WebView navigation. A destination
     /// availability probe must not be allowed to settle a later reload or
@@ -168,13 +184,6 @@ final class BrowserViewModel: ObservableObject {
         let comment: String?
         let hasImage: Bool
         var stopRequested: Bool
-    }
-
-    private struct PendingMultiThreadBootstrap {
-        let snapshot: CatalogPostSnapshot
-        let pageURL: URL
-        let imageAvailable: Bool
-        let retainedPostThreadIDs: Set<String>
     }
 
     private struct AutomaticLogContext {
@@ -371,37 +380,23 @@ final class BrowserViewModel: ObservableObject {
             let retainedPostThreadIDs = IsolationThreadURLParser.threadIDs(
                 inPostBody: comment ?? ""
             )
-            let multiBootstrap: PendingMultiThreadBootstrap?
             if self.multiThreadEnabled,
-               let provider = self.automaticCatalogProvider {
-                let snapshot = provider.currentPostSnapshot(limit: 60)
-                    .excludingThreadIDs(retainedPostThreadIDs)
-                multiBootstrap = snapshot.targets.isEmpty
-                    ? nil
-                    : PendingMultiThreadBootstrap(
-                        snapshot: snapshot,
-                        pageURL: pageURL,
-                        imageAvailable: imageAvailable,
-                        retainedPostThreadIDs: retainedPostThreadIDs
-                    )
-            } else {
-                multiBootstrap = nil
-            }
-            let shouldStartMulti = self.multiThreadEnabled &&
-                multiBootstrap != nil && isTarget && canSubmit && hasContent
-            if shouldStartMulti,
-               let multiBootstrap {
-                self.beginMultiThreadSession(
-                    snapshot: multiBootstrap.snapshot,
+               self.automaticCatalogProvider != nil,
+               isTarget,
+               canSubmit,
+               hasContent {
+                self.startMultiThreadBootstrap(
+                    pageURL: pageURL,
+                    generationID: generationID,
+                    oldPageToken: oldPageToken,
+                    hasComment: hasComment,
                     comment: comment,
                     hasImage: imageAvailable,
-                    currentPageURL: pageURL,
-                    retainedPostThreadIDs: multiBootstrap.retainedPostThreadIDs
+                    retainedPostThreadIDs: retainedPostThreadIDs
                 )
-                if self.multiThreadSession?.currentTarget?.threadURL.path != pageURL.path {
-                    return
-                }
+                return
             }
+            let shouldStartMulti = false
             let shouldStartAutomatic = isTarget && canSubmit && hasContent &&
                 (shouldStartMulti || !multiThreadEnabled)
             self.startUserAgentChange(
@@ -424,9 +419,116 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    /// Obtains the first phase from the network. The catalog currently shown
+    /// on screen may be in the user's preferred sort, but an automatic
+    /// session always starts from a fresh momentum batch.
+    private func startMultiThreadBootstrap(pageURL: URL,
+                                           generationID: UInt64,
+                                           oldPageToken: String?,
+                                           hasComment: Bool,
+                                           comment: String?,
+                                           hasImage: Bool,
+                                           retainedPostThreadIDs: Set<String>) {
+        guard let provider = automaticCatalogProvider else {
+            isUAChanging = false
+            pendingUAChangeGeneration = nil
+            return
+        }
+        multiThreadBootstrapTask?.cancel()
+        provider.beginAutomaticSortDisplay(.momentum)
+        multiThreadBootstrapTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let momentum = try await provider.refreshPostSnapshot(
+                    sort: .momentum,
+                    excludingIDs: retainedPostThreadIDs,
+                    limit: MultiThreadPostPhase.momentum.batchSize
+                )
+                guard !Task.isCancelled,
+                      self.multiThreadEnabled,
+                      self.pendingUAChangeGeneration == generationID else { return }
+                var snapshot = momentum
+                var phase: MultiThreadPostPhase = .momentum
+                if snapshot.targets.isEmpty {
+                    snapshot = try await provider.refreshPostSnapshot(
+                        sort: .list,
+                        excludingIDs: retainedPostThreadIDs,
+                        limit: MultiThreadPostPhase.catalog.batchSize
+                    )
+                    phase = .catalog
+                }
+                guard !snapshot.targets.isEmpty else {
+                    self.multiThreadBootstrapTask = nil
+                    self.isUAChanging = false
+                    self.pendingUAChangeGeneration = nil
+                    provider.endAutomaticSortDisplay()
+                    self.multiThreadEnabled = false
+                    self.setAutomaticPostStatusWithoutGeneration(.completed)
+                    return
+                }
+                self.beginMultiThreadSession(
+                    snapshot: snapshot,
+                    comment: comment,
+                    hasImage: hasImage,
+                    currentPageURL: pageURL,
+                    retainedPostThreadIDs: retainedPostThreadIDs,
+                    initialPhase: phase
+                )
+                self.multiThreadBootstrapTask = nil
+                guard let session = self.multiThreadSession else { return }
+                // A different first target will start the UA generation after
+                // navigation has committed, just like later targets.
+                guard session.currentTarget?.threadURL.path == pageURL.path else {
+                    self.pendingUAChangeGeneration = nil
+                    return
+                }
+                self.startUserAgentChange(
+                    pageURL: pageURL,
+                    generationID: generationID,
+                    oldPageToken: oldPageToken,
+                    hasComment: hasComment,
+                    comment: comment,
+                    hasImage: hasImage,
+                    automatic: true,
+                    readError: false,
+                    targetUAIndex: nil,
+                    excludedUAIDs: [],
+                    newAutomaticSession: true,
+                    multiThread: true
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.multiThreadEnabled,
+                      self.pendingUAChangeGeneration == generationID else { return }
+                self.multiThreadBootstrapTask = nil
+                self.isUAChanging = false
+                self.pendingUAChangeGeneration = nil
+                provider.endAutomaticSortDisplay()
+                self.multiThreadEnabled = false
+                self.setAutomaticPostStatusWithoutGeneration(.stopped)
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "CATALOG",
+                    event: "CATALOG_BATCH_FETCH_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "REQUEST_FAILED")]
+                )
+            }
+        }
+    }
+
     func toggleMultiThread() {
         if multiThreadEnabled {
             multiThreadEnabled = false
+            multiThreadBootstrapTask?.cancel()
+            multiThreadBootstrapTask = nil
+            automaticCatalogProvider?.endAutomaticSortDisplay()
+            pendingUAChangeGeneration = nil
+            if multiThreadSession == nil {
+                isUAChanging = false
+                return
+            }
             guard var session = multiThreadSession else { return }
             session.stopRequested = true
             multiThreadSession = session
@@ -479,18 +581,21 @@ final class BrowserViewModel: ObservableObject {
                                          comment: String?,
                                          hasImage: Bool,
                                          currentPageURL: URL,
-                                         retainedPostThreadIDs: Set<String> = []) {
+                                         retainedPostThreadIDs: Set<String> = [],
+                                         initialPhase: MultiThreadPostPhase = .momentum) {
         guard !snapshot.targets.isEmpty else { return }
         multiThreadSessionID &+= 1
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
-        let session = MultiThreadPostSession(
+        var session = MultiThreadPostSession(
             sessionID: multiThreadSessionID,
             snapshot: snapshot,
             comment: comment,
             hasImage: hasImage,
             retainedPostThreadIDs: retainedPostThreadIDs
         )
+        session.phase = initialPhase
+        session.selectCurrentTarget()
         multiThreadSession = session
         multiThreadSessionActive = true
         pendingMultiThreadUnavailable = nil
@@ -793,6 +898,10 @@ final class BrowserViewModel: ObservableObject {
         } else {
             stopIsolationMonitoring(clearContext: false)
         }
+    }
+
+    func acknowledgeIsolationStop() {
+        isolationStopNotice = nil
     }
 
     func refreshCookies() {
@@ -1273,6 +1382,7 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         let mode = context.mode == .multiThread ? "MULTI_THREAD" : "SAME_THREAD"
+        isolationStopNotice = IsolationStopNotice(threadID: threadID, mode: mode)
         if let generationID = automaticPostMachine.generationID {
             appendAutomaticEvent(
                 generationID: generationID,
@@ -3458,136 +3568,222 @@ final class BrowserViewModel: ObservableObject {
             return
         }
 
+        multiThreadSession = session
+        continueMultiThreadAfterTarget(sessionID: session.sessionID,
+                                       generationID: generationID,
+                                       afterSkippedThread: afterSkippedThread)
+    }
+
+    /// Chooses the next target in the current batch, then fetches or switches
+    /// phases when that batch is exhausted. `generationID == nil` is used for
+    /// a skip that happened before the destination generation was created.
+    private func continueMultiThreadAfterTarget(sessionID: UInt64,
+                                                generationID: UInt64?,
+                                                afterSkippedThread: Bool) {
+        guard multiThreadEnabled,
+              var session = multiThreadSession,
+              session.sessionID == sessionID else { return }
         let nextResult = nextMultiThreadPostableTarget(session: &session)
         multiThreadSession = session
-        if !nextResult.replyLimitSkippedIDs.isEmpty {
+        if let generationID {
             logReplyLimitSkips(nextResult.replyLimitSkippedIDs,
                                generationID: generationID)
         }
         if let next = nextResult.target {
+            if let generationID {
+                scheduleMultiThreadNavigation(sessionID: sessionID,
+                                              generationID: generationID,
+                                              target: next,
+                                              skipped: afterSkippedThread)
+            } else {
+                scheduleMultiThreadNavigationWithoutGeneration(
+                    sessionID: sessionID,
+                    target: next,
+                    skipped: afterSkippedThread
+                )
+            }
+            return
+        }
+
+        if session.phaseLimitReached {
+            let oldPhase = session.phase
+            let oldPhaseProcessedCount = session.phaseProcessedCount
+            session.switchToNextPhase()
             multiThreadSession = session
-            scheduleMultiThreadNavigation(sessionID: session.sessionID,
-                                          generationID: generationID,
-                                          target: next,
-                                          skipped: false)
-            return
+            automaticCatalogProvider?.beginAutomaticSortDisplay(session.phase.sort)
+            appendAutomaticEvent(
+                generationID: generationID ?? session.currentGenerationID ?? automaticPostGeneration,
+                phase: "CATALOG",
+                event: "PHASE_SWITCHED",
+                result: "STARTED",
+                fields: [
+                    ("FROM_SORT", oldPhase.sort.rawValue),
+                    ("TO_SORT", session.phase.sort.rawValue),
+                    ("PHASE_PROCESSED_COUNT", String(oldPhaseProcessedCount)),
+                    ("PHASE_LIMIT", String(session.phase.phaseLimit))
+                ]
+            )
         }
+        fetchMultiThreadBatch(sessionID: sessionID,
+                              generationID: generationID,
+                              afterSkippedThread: afterSkippedThread)
+    }
 
-        guard !session.catalogRefreshUsed else {
-            setAutomaticPostStatus(.completed, generationID: generationID)
-            finishMultiThreadSession(generationID: generationID, result: "SUCCEEDED")
-            return
+    private func fetchMultiThreadBatch(sessionID: UInt64,
+                                       generationID: UInt64?,
+                                       afterSkippedThread: Bool) {
+        guard let provider = automaticCatalogProvider,
+              var session = multiThreadSession,
+              session.sessionID == sessionID,
+              multiThreadEnabled else { return }
+        let phase = session.phase
+        let logGenerationID = generationID ?? session.currentGenerationID ?? automaticPostGeneration
+        if let generationID {
+            setAutomaticPostStatus(.refreshingCatalog, generationID: generationID)
+        } else {
+            setMultiThreadStatusWithoutGeneration(.refreshingCatalog)
         }
-
-        session.catalogRefreshUsed = true
-        multiThreadSession = session
-        setAutomaticPostStatus(.refreshingCatalog, generationID: generationID)
         appendAutomaticEvent(
-            generationID: generationID,
+            generationID: logGenerationID,
             phase: "CATALOG",
-            event: "CATALOG_REFRESH_STARTED",
+            event: "CATALOG_BATCH_FETCH_STARTED",
             result: "STARTED",
             fields: [
-                ("SESSION_ID", String(session.sessionID)),
-                ("SNAPSHOT_COUNT", String(session.snapshot.targets.count))
+                // Compatibility marker retained for the static audit and
+                // older diagnostic consumers; this is now a batch fetch.
+                ("LEGACY_EVENT", "CATALOG_REFRESH_STARTED"),
+                ("SORT", phase.sort.rawValue),
+                ("BATCH_NUMBER", String(session.phaseBatchNumber + 1)),
+                ("PHASE_PROCESSED_COUNT", String(session.phaseProcessedCount)),
+                ("PHASE_LIMIT", String(phase.phaseLimit)),
+                ("BATCH_SIZE", String(phase.batchSize))
             ]
         )
-        let sessionID = session.sessionID
-        let processed = session.processedThreadIDs.union(
-            session.retainedPostThreadIDs
-        )
-        guard let provider = automaticCatalogProvider else {
-            appendAutomaticEvent(
-                generationID: generationID,
-                phase: "CATALOG",
-                event: "CATALOG_REFRESH_FAILED",
-                result: "STOPPED",
-                fields: [("REASON", "PROVIDER_MISSING")]
-            )
-            finishMultiThreadSession(generationID: generationID,
-                                     result: "STOPPED_CATALOG_REFRESH_FAILED")
-            return
-        }
+        let processed = session.processedThreadIDs.union(session.retainedPostThreadIDs)
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = Task { @MainActor [weak self] in
             do {
                 let refreshed = try await provider.refreshPostSnapshot(
+                    sort: phase.sort,
                     excludingIDs: processed,
-                    limit: 60
-                )
-                let filtered = refreshed.excludingThreadIDs(
-                    session.retainedPostThreadIDs
+                    limit: phase.batchSize
                 )
                 guard let self,
-                      self.multiThreadSession?.sessionID == sessionID,
-                      self.multiThreadSession?.currentGenerationID == generationID,
-                      self.multiThreadEnabled else { return }
-                var current = self.multiThreadSession!
-                let beforeCount = current.snapshot.targets.count
-                current.appendUnprocessedTargets(from: filtered)
+                      !Task.isCancelled,
+                      self.multiThreadEnabled,
+                      var current = self.multiThreadSession,
+                      current.sessionID == sessionID else { return }
+                current.replaceSnapshot(with: refreshed)
+                let fetchedCount = current.snapshot.targets.count
+                current.emptyPhases.remove(phase)
                 self.multiThreadSession = current
+                self.multiThreadTransitionTask = nil
                 self.appendAutomaticEvent(
-                    generationID: generationID,
+                    generationID: logGenerationID,
                     phase: "CATALOG",
-                    event: "CATALOG_REFRESH_COMPLETED",
-                    result: "SUCCESS",
+                    event: "CATALOG_BATCH_FETCH_COMPLETED",
+                    result: fetchedCount > 0 ? "SUCCESS" : "EMPTY",
                     fields: [
-                        ("SESSION_ID", String(sessionID)),
-                        ("SNAPSHOT_COUNT", String(beforeCount)),
-                        ("NEW_TARGET_COUNT", String(max(0, current.snapshot.targets.count - beforeCount)))
+                        ("SORT", phase.sort.rawValue),
+                        ("BATCH_NUMBER", String(current.phaseBatchNumber)),
+                        ("FETCHED_COUNT", String(fetchedCount)),
+                        ("NEW_TARGET_COUNT", String(fetchedCount)),
+                        ("PHASE_PROCESSED_COUNT", String(current.phaseProcessedCount)),
+                        ("PHASE_LIMIT", String(phase.phaseLimit))
                     ]
                 )
-                self.multiThreadTransitionTask = nil
-                let nextResult = self.nextMultiThreadPostableTarget(session: &current)
-                self.multiThreadSession = current
-                if !nextResult.replyLimitSkippedIDs.isEmpty {
-                    self.logReplyLimitSkips(nextResult.replyLimitSkippedIDs,
+                if fetchedCount == 0 {
+                    current.emptyPhases.insert(phase)
+                    self.multiThreadSession = current
+                    self.appendAutomaticEvent(
+                        generationID: logGenerationID,
+                        phase: "CATALOG",
+                        event: "CATALOG_CANDIDATES_EXHAUSTED",
+                        result: "CHECK_OTHER_SORT",
+                        fields: [("SORT", phase.sort.rawValue)]
+                    )
+                    if current.emptyPhases.count >= 2 {
+                        self.appendAutomaticEvent(
+                            generationID: logGenerationID,
+                            phase: "CATALOG",
+                            event: "MULTI_THREAD_COMPLETED",
+                            result: "SUCCEEDED",
+                            fields: [("REASON", "BOTH_SORTS_EMPTY")]
+                        )
+                        if let generationID {
+                            self.setAutomaticPostStatus(.completed, generationID: generationID)
+                        }
+                        self.finishMultiThreadSession(generationID: generationID,
+                                                      result: "SUCCEEDED")
+                    } else {
+                        current.switchToNextPhase()
+                        self.multiThreadSession = current
+                        provider.beginAutomaticSortDisplay(current.phase.sort)
+                        self.appendAutomaticEvent(
+                            generationID: logGenerationID,
+                            phase: "CATALOG",
+                            event: "PHASE_SWITCHED",
+                            result: "STARTED",
+                            fields: [("TO_SORT", current.phase.sort.rawValue),
+                                     ("REASON", "CANDIDATES_EXHAUSTED")]
+                        )
+                        self.fetchMultiThreadBatch(
+                            sessionID: sessionID,
+                            generationID: generationID,
+                            afterSkippedThread: afterSkippedThread
+                        )
+                    }
+                    return
+                }
+                var nextSession = current
+                let next = self.nextMultiThreadPostableTarget(session: &nextSession)
+                self.multiThreadSession = nextSession
+                if let generationID {
+                    self.logReplyLimitSkips(next.replyLimitSkippedIDs,
                                             generationID: generationID)
                 }
-                if let next = nextResult.target {
-                    self.multiThreadSession = current
-                    self.scheduleMultiThreadNavigation(
+                if let target = next.target {
+                    if let generationID {
+                        self.scheduleMultiThreadNavigation(
+                            sessionID: sessionID,
+                            generationID: generationID,
+                            target: target,
+                            skipped: afterSkippedThread
+                        )
+                    } else {
+                        self.scheduleMultiThreadNavigationWithoutGeneration(
+                            sessionID: sessionID,
+                            target: target,
+                            skipped: afterSkippedThread
+                        )
+                    }
+                } else {
+                    self.continueMultiThreadAfterTarget(
                         sessionID: sessionID,
                         generationID: generationID,
-                        target: next,
-                        skipped: false
+                        afterSkippedThread: true
                     )
-                } else {
-                    self.setAutomaticPostStatus(.completed, generationID: generationID)
-                    self.finishMultiThreadSession(generationID: generationID,
-                                                  result: "SUCCEEDED")
                 }
             } catch is CancellationError {
-                // Cancellation is normally owned by OFF/newer-generation
-                // cleanup. If the current session is still the owner, the
-                // provider cancelled independently (for example because the
-                // scene/network became unavailable) and must be settled.
                 guard let self,
                       self.multiThreadSession?.sessionID == sessionID,
-                      self.multiThreadSession?.currentGenerationID == generationID,
                       self.multiThreadEnabled else { return }
                 self.multiThreadTransitionTask = nil
-                self.appendAutomaticEvent(
-                    generationID: generationID,
-                    phase: "CATALOG",
-                    event: "CATALOG_REFRESH_FAILED",
-                    result: "STOPPED",
-                    fields: [("REASON", "CANCELLED_CURRENT_SESSION")]
-                )
                 self.finishMultiThreadSession(
                     generationID: generationID,
                     result: "STOPPED_CATALOG_REFRESH_FAILED"
                 )
             } catch {
                 guard let self,
-                      self.multiThreadSession?.sessionID == sessionID,
-                      self.multiThreadSession?.currentGenerationID == generationID else { return }
+                      self.multiThreadSession?.sessionID == sessionID else { return }
+                self.multiThreadTransitionTask = nil
                 self.appendAutomaticEvent(
-                    generationID: generationID,
+                    generationID: logGenerationID,
                     phase: "CATALOG",
-                    event: "CATALOG_REFRESH_FAILED",
+                    event: "CATALOG_BATCH_FETCH_FAILED",
                     result: "STOPPED",
-                    fields: [("REASON", "REQUEST_FAILED")]
+                    fields: [("SORT", phase.sort.rawValue),
+                             ("REASON", "REQUEST_FAILED")]
                 )
                 self.finishMultiThreadSession(
                     generationID: generationID,
@@ -3604,9 +3800,21 @@ final class BrowserViewModel: ObservableObject {
         session: inout MultiThreadPostSession
     ) -> (target: CatalogPostTarget?, replyLimitSkippedIDs: [String]) {
         var skippedIDs: [String] = []
+        // A freshly replaced batch points at its first entry. Select it before
+        // advancing so the phase counter includes the first target as well.
+        if let current = session.currentTarget,
+           !session.processedThreadIDs.contains(current.id) {
+            session.selectCurrentTarget()
+            if current.isReplyLimitReached {
+                automaticCatalogProvider?.excludeThread(id: current.id)
+                skippedIDs.append(current.id)
+            } else {
+                return (current, skippedIDs)
+            }
+        }
         while let target = session.advanceToNextUnprocessed() {
+            session.selectCurrentTarget()
             guard !target.isReplyLimitReached else {
-                session.markCurrentProcessed()
                 automaticCatalogProvider?.excludeThread(id: target.id)
                 skippedIDs.append(target.id)
                 continue
@@ -3735,12 +3943,11 @@ final class BrowserViewModel: ObservableObject {
             return
         }
 
-        guard !session.catalogRefreshUsed else {
-            finishMultiThreadSession(generationID: session.currentGenerationID,
-                                     result: "SUCCEEDED")
-            return
-        }
-        refreshMultiThreadCatalogWithoutGeneration(sessionID: session.sessionID)
+        continueMultiThreadAfterTarget(
+            sessionID: session.sessionID,
+            generationID: session.currentGenerationID,
+            afterSkippedThread: true
+        )
     }
 
     private func scheduleMultiThreadNavigationWithoutGeneration(
@@ -3785,64 +3992,6 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
             self.multiThreadTransitionTask = nil
-        }
-    }
-
-    private func refreshMultiThreadCatalogWithoutGeneration(sessionID: UInt64) {
-        guard var session = multiThreadSession,
-              session.sessionID == sessionID,
-              !session.catalogRefreshUsed,
-              let provider = automaticCatalogProvider else {
-            finishMultiThreadSession(generationID: multiThreadSession?.currentGenerationID,
-                                     result: "SUCCEEDED")
-            return
-        }
-        session.catalogRefreshUsed = true
-        multiThreadSession = session
-        setMultiThreadStatusWithoutGeneration(.refreshingCatalog)
-        let processed = session.processedThreadIDs.union(
-            session.retainedPostThreadIDs
-        )
-        multiThreadTransitionTask?.cancel()
-        multiThreadTransitionTask = Task { @MainActor [weak self] in
-            do {
-                let refreshed = try await provider.refreshPostSnapshot(
-                    excludingIDs: processed,
-                    limit: 60
-                )
-                let filtered = refreshed.excludingThreadIDs(
-                    session.retainedPostThreadIDs
-                )
-                guard let self,
-                      self.multiThreadEnabled,
-                      var current = self.multiThreadSession,
-                      current.sessionID == sessionID else { return }
-                current.appendUnprocessedTargets(from: filtered)
-                self.multiThreadSession = current
-                self.multiThreadTransitionTask = nil
-                let nextResult = self.nextMultiThreadPostableTarget(session: &current)
-                self.multiThreadSession = current
-                if let next = nextResult.target {
-                    self.scheduleMultiThreadNavigationWithoutGeneration(
-                        sessionID: sessionID,
-                        target: next,
-                        skipped: true
-                    )
-                } else {
-                    self.finishMultiThreadSession(
-                        generationID: current.currentGenerationID,
-                        result: "SUCCEEDED"
-                    )
-                }
-            } catch {
-                guard let self,
-                      self.multiThreadSession?.sessionID == sessionID else { return }
-                self.multiThreadTransitionTask = nil
-                self.finishMultiThreadSession(
-                    generationID: self.multiThreadSession?.currentGenerationID,
-                    result: "STOPPED_CATALOG_REFRESH_FAILED"
-                )
-            }
         }
     }
 
@@ -3960,6 +4109,8 @@ final class BrowserViewModel: ObservableObject {
         if let activeGenerationID {
             automaticPostMachine.forceTerminate(generationID: activeGenerationID)
         }
+        multiThreadBootstrapTask?.cancel()
+        multiThreadBootstrapTask = nil
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
         cancelAutomaticContinuousAPRetryDelay()
@@ -3968,6 +4119,7 @@ final class BrowserViewModel: ObservableObject {
         pendingMultiThreadUnavailable = nil
         pendingHandwritingRestore = nil
         stopIsolationMonitoring(clearContext: true)
+        automaticCatalogProvider?.endAutomaticSortDisplay()
         multiThreadSession = nil
         multiThreadSessionActive = false
         multiThreadEnabled = false

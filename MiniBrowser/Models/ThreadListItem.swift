@@ -1,6 +1,6 @@
 import Foundation
 
-enum ThreadListSort: String, CaseIterable, Identifiable, Sendable {
+enum ThreadListSort: String, CaseIterable, Hashable, Identifiable, Sendable {
     case momentum
     case list
 

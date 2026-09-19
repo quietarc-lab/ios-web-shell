@@ -29,6 +29,11 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
     private var hasStarted = false
     private var loadTask: Task<Void, Never>?
     private var refreshLoopTask: Task<Void, Never>?
+    /// Non-persisted sort used while a multi-thread session follows its
+    /// alternating phases. The user's saved sort is restored when the session
+    /// ends.
+    private var automaticSortBeforeSession: ThreadListSort?
+    private var automaticSortDisplay: ThreadListSort?
     // A slow/failed request must not permanently starve cells later in the
     // grid: the next automatic refresh starts after the last attempted cell.
     private var nextThumbnailRetryID: String?
@@ -108,9 +113,14 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
     }
 
     func currentPostSnapshot(limit: Int = 60) -> CatalogPostSnapshot {
+        currentPostSnapshot(sort: selectedSort, limit: limit)
+    }
+
+    func currentPostSnapshot(sort: ThreadListSort,
+                             limit: Int) -> CatalogPostSnapshot {
         purgeExpiredThreadExclusions()
         return CatalogPostSnapshot(
-            sort: selectedSort,
+            sort: sort,
             targets: Self.postTargets(from: items,
                                       openCounts: openCounts,
                                       excludedIDs: excludedThreadIDs,
@@ -123,13 +133,27 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
     /// request exactly one deterministic end-of-catalog refresh.
     func refreshPostSnapshot(excludingIDs: Set<String>,
                              limit: Int = 60) async throws -> CatalogPostSnapshot {
+        try await refreshPostSnapshot(sort: selectedSort,
+                                      excludingIDs: excludingIDs,
+                                      limit: limit)
+    }
+
+    func refreshPostSnapshot(sort: ThreadListSort,
+                             excludingIDs: Set<String>,
+                             limit: Int = 60) async throws -> CatalogPostSnapshot {
         guard isSceneActive, isNetworkActivityAllowed else {
             throw CancellationError()
         }
         purgeExpiredThreadExclusions()
         loadTask?.cancel()
         loadTask = nil
-        let sort = selectedSort
+        if automaticSortDisplay != sort {
+            if automaticSortDisplay == nil {
+                automaticSortBeforeSession = selectedSort
+            }
+            automaticSortDisplay = sort
+            selectedSort = sort
+        }
         let currentUA = userAgent
         let excluded = excludedThreadIDs.union(excludingIDs)
         isRefreshing = true
@@ -157,6 +181,30 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
         )
     }
 
+    func beginAutomaticSortDisplay(_ sort: ThreadListSort) {
+        if automaticSortBeforeSession == nil {
+            automaticSortBeforeSession = selectedSort
+        }
+        automaticSortDisplay = sort
+        guard selectedSort != sort else { return }
+        loadTask?.cancel()
+        loadTask = nil
+        isRefreshing = false
+        selectedSort = sort
+    }
+
+    func endAutomaticSortDisplay() {
+        let restore = automaticSortBeforeSession
+        automaticSortBeforeSession = nil
+        automaticSortDisplay = nil
+        guard let restore, selectedSort != restore else {
+            if hasStarted, isExpanded { refresh() }
+            return
+        }
+        selectedSort = restore
+        if hasStarted, isExpanded { refresh() }
+    }
+
     func toggleExpanded() {
         isExpanded.toggle()
         defaults.set(isExpanded, forKey: Keys.expanded)
@@ -170,6 +218,7 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
     }
 
     func selectSort(_ sort: ThreadListSort) {
+        guard automaticSortDisplay == nil else { return }
         guard selectedSort != sort else { return }
         selectedSort = sort
         defaults.set(sort.rawValue, forKey: Keys.sort)
@@ -177,7 +226,10 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
     }
 
     func refresh() {
-        guard isExpanded, isSceneActive, isNetworkActivityAllowed else { return }
+        guard automaticSortDisplay == nil,
+              isExpanded,
+              isSceneActive,
+              isNetworkActivityAllowed else { return }
         purgeExpiredThreadExclusions()
         loadTask?.cancel()
         let sort = selectedSort

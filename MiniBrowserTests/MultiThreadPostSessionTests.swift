@@ -162,4 +162,62 @@ final class MultiThreadPostSessionTests: XCTestCase {
         XCTAssertEqual(session.advanceToNextUnprocessed()?.id, "2")
         XCTAssertFalse(session.continuousRestrictionHandoffUsed)
     }
+
+    func testPhaseBatchSizingAndAlternation() {
+        XCTAssertEqual(MultiThreadPostPhase.momentum.batchSize, 20)
+        XCTAssertEqual(MultiThreadPostPhase.momentum.phaseLimit, 60)
+        XCTAssertEqual(MultiThreadPostPhase.catalog.batchSize, 10)
+        XCTAssertEqual(MultiThreadPostPhase.catalog.phaseLimit, 30)
+        XCTAssertEqual(MultiThreadPostPhase.momentum.next, .catalog)
+        XCTAssertEqual(MultiThreadPostPhase.catalog.next, .momentum)
+    }
+
+    func testSelectingTargetCountsOnceAndReplacingBatchResetsCursor() {
+        let first = CatalogPostTarget(
+            id: "1",
+            threadURL: URL(string: "https://img.2chan.net/b/res/1.htm")!
+        )
+        let second = CatalogPostTarget(
+            id: "2",
+            threadURL: URL(string: "https://img.2chan.net/b/res/2.htm")!
+        )
+        var session = MultiThreadPostSession(
+            sessionID: 4,
+            snapshot: CatalogPostSnapshot(sort: .momentum, targets: [first]),
+            comment: nil,
+            hasImage: false
+        )
+        session.selectCurrentTarget()
+        session.selectCurrentTarget()
+        XCTAssertEqual(session.phaseProcessedCount, 1)
+
+        session.replaceSnapshot(with: CatalogPostSnapshot(
+            sort: .momentum,
+            targets: [second]
+        ))
+        XCTAssertEqual(session.currentTarget?.id, "2")
+        XCTAssertEqual(session.phaseBatchNumber, 2)
+        XCTAssertEqual(session.advanceToNextUnprocessed(), nil)
+        session.selectCurrentTarget()
+        XCTAssertEqual(session.phaseProcessedCount, 2)
+    }
+
+    func testSwitchingPhaseResetsPhaseCountAndBatch() {
+        let target = CatalogPostTarget(
+            id: "1",
+            threadURL: URL(string: "https://img.2chan.net/b/res/1.htm")!
+        )
+        var session = MultiThreadPostSession(
+            sessionID: 5,
+            snapshot: CatalogPostSnapshot(sort: .momentum, targets: [target]),
+            comment: nil,
+            hasImage: false
+        )
+        session.selectCurrentTarget()
+        session.switchToNextPhase()
+        XCTAssertEqual(session.phase, .catalog)
+        XCTAssertEqual(session.phaseProcessedCount, 0)
+        XCTAssertEqual(session.phaseBatchNumber, 0)
+        XCTAssertNil(session.currentTarget)
+    }
 }
