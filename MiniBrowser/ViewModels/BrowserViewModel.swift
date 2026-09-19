@@ -3,15 +3,51 @@ import Foundation
 import UIKit
 import WebKit
 
+enum ModerationStopKind: String, Equatable, Sendable {
+    case isolated
+    case deleted
+
+    var alertTitle: String {
+        switch self {
+        case .isolated:
+            return "隔離検知"
+        case .deleted:
+            return "削除検知"
+        }
+    }
+
+    var alertMessage: String {
+        switch self {
+        case .isolated:
+            return "隔離検知のため自動投稿を停止しました"
+        case .deleted:
+            return "削除検知のため自動投稿を停止しました"
+        }
+    }
+
+    var automaticStopReason: AutomaticPostStopReason {
+        switch self {
+        case .isolated:
+            return .isolatedThread
+        case .deleted:
+            return .deletedThread
+        }
+    }
+}
+
 struct IsolationStopNotice: Identifiable, Equatable {
     let id: String
     let threadID: String
     let mode: String
+    let kind: ModerationStopKind
 
-    init(threadID: String, mode: String) {
+    init(threadID: String,
+         mode: String,
+         kind: ModerationStopKind = .isolated) {
         self.threadID = threadID
         self.mode = mode
-        self.id = "\(mode):\(threadID)"
+        self.kind = kind
+        self.id = "\(kind.rawValue):\(mode):\(threadID)"
     }
 }
 
@@ -1336,7 +1372,7 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         do {
-            let isolatedIDs = try await monitor.fetchIsolatedThreadIDs(
+            let moderationSnapshot = try await monitor.fetchModerationSnapshot(
                 userAgent: effectiveUserAgent
             )
             guard isolationStopEnabled,
@@ -1345,14 +1381,25 @@ final class BrowserViewModel: ObservableObject {
                   currentIsolationMonitorContext() == context else {
                 return
             }
-            guard let matchedID = context.targetThreadIDs
-                .intersection(isolatedIDs)
+            guard let matchedDeletedID = context.targetThreadIDs
+                .intersection(moderationSnapshot.deletedIDs)
                 .sorted()
                 .first else {
-                isolationMonitorFailureLogged = false
+                if let matchedIsolatedID = context.targetThreadIDs
+                    .intersection(moderationSnapshot.isolatedIDs)
+                    .sorted()
+                    .first {
+                    handleModerationDetected(context: context,
+                                             threadID: matchedIsolatedID,
+                                             kind: .isolated)
+                } else {
+                    isolationMonitorFailureLogged = false
+                }
                 return
             }
-            handleIsolationDetected(context: context, threadID: matchedID)
+            handleModerationDetected(context: context,
+                                     threadID: matchedDeletedID,
+                                     kind: .deleted)
         } catch is CancellationError {
             return
         } catch {
@@ -1374,34 +1421,43 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
-    private func handleIsolationDetected(context: IsolationMonitorContext,
-                                         threadID: String) {
+    private func handleModerationDetected(context: IsolationMonitorContext,
+                                          threadID: String,
+                                          kind: ModerationStopKind) {
         guard isolationStopEnabled,
               isolationMonitorContext == context,
               currentIsolationMonitorContext() == context else {
             return
         }
         let mode = context.mode == .multiThread ? "MULTI_THREAD" : "SAME_THREAD"
-        isolationStopNotice = IsolationStopNotice(threadID: threadID, mode: mode)
+        isolationStopNotice = IsolationStopNotice(threadID: threadID,
+                                                   mode: mode,
+                                                   kind: kind)
+        let stopReason = kind.automaticStopReason
+        let event = kind == .isolated
+            ? "ISOLATED_THREAD_DETECTED"
+            : "DELETED_THREAD_DETECTED"
         if let generationID = automaticPostMachine.generationID {
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "ISOLATION",
-                event: "ISOLATED_THREAD_DETECTED",
+                event: event,
                 result: "STOPPED",
                 fields: [
                     ("THREAD_ID", threadID),
-                    ("MODE", mode)
+                    ("MODE", mode),
+                    ("MODERATION_KIND", kind.rawValue),
+                    ("STOP_REASON", Self.automaticStopResult(for: stopReason))
                 ]
             )
         }
         stopIsolationMonitoring(clearContext: true)
-        let result = "STOPPED_ISOLATED_THREAD"
+        let result = Self.automaticStopResult(for: stopReason)
 
         if multiThreadSession != nil {
             if let generationID = automaticPostMachine.generationID,
                automaticPostMachine.isActive {
-                stopAutomaticPost(.isolatedThread, generationID: generationID)
+                stopAutomaticPost(stopReason, generationID: generationID)
             } else {
                 finishMultiThreadSession(
                     generationID: automaticPostMachine.generationID,
@@ -1414,7 +1470,7 @@ final class BrowserViewModel: ObservableObject {
         guard automaticPostRepeatSession != nil else { return }
         if let generationID = automaticPostMachine.generationID,
            automaticPostMachine.isActive {
-            stopAutomaticPost(.isolatedThread, generationID: generationID)
+            stopAutomaticPost(stopReason, generationID: generationID)
         } else if let generationID = automaticPostMachine.generationID {
             setAutomaticPostStatus(.stopped, generationID: generationID)
             finishAutomaticPost(generationID: generationID, result: result)
@@ -1422,6 +1478,13 @@ final class BrowserViewModel: ObservableObject {
             cancelAutomaticRepeatSession()
             setAutomaticPostStatusWithoutGeneration(.stopped)
         }
+    }
+
+    private func handleIsolationDetected(context: IsolationMonitorContext,
+                                         threadID: String) {
+        handleModerationDetected(context: context,
+                                 threadID: threadID,
+                                 kind: .isolated)
     }
 
     func updateSitePostStatus(_ rawStatus: String?) {
@@ -5700,6 +5763,9 @@ final class BrowserViewModel: ObservableObject {
         }
         if reason == .isolatedThread {
             return "STOPPED_ISOLATED_THREAD"
+        }
+        if reason == .deletedThread {
+            return "STOPPED_DELETED_THREAD"
         }
         return "STOPPED_\(String(describing: reason).uppercased())"
     }

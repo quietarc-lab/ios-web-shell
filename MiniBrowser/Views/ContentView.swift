@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: BrowserViewModel
     @StateObject private var listModel: ThreadListViewModel
+    @StateObject private var stopAlertFeedback = StopAlertFeedbackController()
     @State private var showingBookmarks = false
     @Environment(\.scenePhase) private var scenePhase
 
@@ -43,15 +44,23 @@ struct ContentView: View {
         }
         .onDisappear {
             model.setAppSceneActive(false)
+            stopAlertFeedback.stop()
         }
         .onChange(of: model.isIdentityRefreshInProgress) { _, isInProgress in
             listModel.setUserAgent(model.effectiveUserAgent)
             listModel.setNetworkActivityAllowed(!isInProgress)
         }
+        .onChange(of: model.isolationStopNotice, initial: true) { _, notice in
+            if notice == nil {
+                stopAlertFeedback.stop()
+            } else {
+                stopAlertFeedback.startIfNeeded()
+            }
+        }
         .alert(item: $model.isolationStopNotice) { notice in
             Alert(
-                title: Text("隔離検知"),
-                message: Text("隔離検知のため自動投稿を停止しました\nスレッド: \(notice.threadID)"),
+                title: Text(notice.kind.alertTitle),
+                message: Text("\(notice.kind.alertMessage)\nスレッド: \(notice.threadID)"),
                 dismissButton: .default(Text("OK")) {
                     model.acknowledgeIsolationStop()
                 }

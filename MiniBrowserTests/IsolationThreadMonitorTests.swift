@@ -3,13 +3,63 @@ import XCTest
 @testable import MiniBrowser
 
 final class IsolationThreadMonitorTests: XCTestCase {
-    func testIsolationFeedParserUsesFirstFieldAndIgnoresMetadata() {
+    func testModerationFeedParserClassifiesStateFieldAndIgnoresMetadata() {
+        func row(_ url: String, state: String) -> String {
+            ([url] + Array(repeating: "metadata", count: 14) + [state]).joined(separator: "<>")
+        }
+
         let feed = """
-        http://img.2chan.net/b/res/1234567890.htm<>対象<>理由
-        https://img.2chan.net/b/res/9876543210.htm?x=1<>対象<>理由
+        \(row("http://img.2chan.net/b/res/1234567890.htm", state: "2"))
+        \(row("https://img.2chan.net/b/res/9876543210.htm?x=1", state: "1"))
+        \(row("https://img.2chan.net/b/res/1111111111.htm", state: "9"))
         boardStatus<>ok
         <EOF>
         https://example.com/b/res/111.htm<>対象<>理由
+        """
+
+        XCTAssertEqual(
+            IsolationThreadURLParser.moderationSnapshot(inIsolationFeed: feed),
+            ModerationThreadSnapshot(
+                isolatedIDs: ["1234567890"],
+                deletedIDs: ["9876543210"]
+            )
+        )
+        XCTAssertEqual(
+            IsolationThreadURLParser.threadIDs(inIsolationFeed: feed),
+            ["1234567890"]
+        )
+    }
+
+    func testModerationFeedParserHandlesDuplicateAndMalformedRows() {
+        func row(_ url: String, state: String) -> String {
+            ([url] + Array(repeating: "metadata", count: 14) + [state]).joined(separator: "<>")
+        }
+
+        let feed = """
+        \(row("https://img.2chan.net/b/res/123.htm", state: "2"))
+        \(row("https://img.2chan.net/b/res/123.htm", state: "2"))
+        \(row("https://img.2chan.net/b/res/456.htm", state: "1"))
+        https://img.2chan.net/b/res/not-a-number.htm<>x
+        \(row("https://example.com/b/res/789.htm", state: "2"))
+        <EOF>
+        """
+
+        XCTAssertEqual(
+            IsolationThreadURLParser.moderationSnapshot(inIsolationFeed: feed),
+            ModerationThreadSnapshot(isolatedIDs: ["123"], deletedIDs: ["456"])
+        )
+    }
+
+    func testIsolationFeedParserUsesFirstFieldAndIgnoresMetadata() {
+        func row(_ url: String) -> String {
+            ([url] + Array(repeating: "metadata", count: 14) + ["2"]).joined(separator: "<>")
+        }
+
+        let feed = """
+        \(row("https://img.2chan.net/b/res/1234567890.htm"))
+        \(row("https://img.2chan.net/b/res/9876543210.htm"))
+        boardStatus<>ok
+        <EOF>
         """
 
         XCTAssertEqual(

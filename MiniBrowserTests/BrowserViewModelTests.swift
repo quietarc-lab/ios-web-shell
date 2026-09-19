@@ -147,6 +147,22 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertNil(defaults.object(forKey: "isolationStopEnabled"))
     }
 
+    func testModerationStopNoticeUsesReasonSpecificMessages() {
+        let isolated = IsolationStopNotice(threadID: "123", mode: "SAME_THREAD")
+        XCTAssertEqual(isolated.kind, .isolated)
+        XCTAssertEqual(isolated.kind.alertMessage,
+                       "隔離検知のため自動投稿を停止しました")
+        XCTAssertEqual(isolated.kind.automaticStopReason, .isolatedThread)
+
+        let deleted = IsolationStopNotice(threadID: "456",
+                                          mode: "MULTI_THREAD",
+                                          kind: .deleted)
+        XCTAssertEqual(deleted.kind.alertTitle, "削除検知")
+        XCTAssertEqual(deleted.kind.alertMessage,
+                       "削除検知のため自動投稿を停止しました")
+        XCTAssertEqual(deleted.kind.automaticStopReason, .deletedThread)
+    }
+
     func testMultiThreadSuccessAndContinuousAPRetryUseOneSecondBuffers() {
         XCTAssertEqual(BrowserViewModel.multiThreadSuccessWaitNanoseconds,
                        1_000_000_000)

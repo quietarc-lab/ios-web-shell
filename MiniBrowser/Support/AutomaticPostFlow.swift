@@ -37,6 +37,9 @@ enum AutomaticPostStopReason: Equatable {
     /// The Futapo isolation feed confirmed a thread referenced by the active
     /// automatic session. This is a terminal session-level safety stop.
     case isolatedThread
+    /// The Futapo moderation feed confirmed that a referenced thread was
+    /// deleted. This is a terminal session-level safety stop.
+    case deletedThread
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {

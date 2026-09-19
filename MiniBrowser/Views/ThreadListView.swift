@@ -70,7 +70,7 @@ struct ThreadListView: View {
                     .frame(width: 22, height: 26)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("隔離検知時に自動停止")
+            .accessibilityLabel("隔離・削除時に自動停止")
             .accessibilityValue(isolationStopEnabled ? "オン" : "オフ")
             .accessibilityAddTraits(isolationStopEnabled ? .isSelected : [])
 
