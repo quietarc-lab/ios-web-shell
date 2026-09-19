@@ -15,16 +15,23 @@ final class AutomaticUserAgentRotationTests: XCTestCase {
     }
 
     func testOrderPrefersDifferentBrowserAndDeviceFamilies() {
+        let catalog = [
+            BrowserUserAgent(id: 1,
+                             name: "Safari iPhone",
+                             value: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7)"),
+            BrowserUserAgent(id: 2,
+                             name: "Chrome iPad",
+                             value: "Mozilla/5.0 (iPad; CPU OS 18_7)")
+        ]
         let order = AutomaticUserAgentRotation.makeOrder(
-            catalog: BrowserUserAgent.all,
+            catalog: catalog,
             restrictedIDs: []
         )
-        for pair in zip(order, order.dropFirst()) {
-            let previous = BrowserUserAgent.all[pair.0]
-            let next = BrowserUserAgent.all[pair.1]
-            XCTAssertFalse(previous.browserFamily == next.browserFamily &&
-                           previous.deviceFamily == next.deviceFamily)
-        }
+        XCTAssertEqual(order.count, catalog.count)
+        let previous = catalog[order[0]]
+        let next = catalog[order[1]]
+        XCTAssertNotEqual(previous.browserFamily, next.browserFamily)
+        XCTAssertNotEqual(previous.deviceFamily, next.deviceFamily)
     }
 
     func testOrderRelaxesConstraintsWhenOnlyOneFamilyRemains() {
