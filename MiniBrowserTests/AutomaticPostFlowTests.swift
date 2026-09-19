@@ -718,7 +718,7 @@ final class AutomaticPostFlowTests: XCTestCase {
         var continuousMachine = readyMachine(hasComment: true, hasImage: false)
         let continuousAlert = continuousMachine.handleAlert(.continuousPosting,
                                                             generationID: generation)
-        XCTAssertFalse(continuousAlert.autoDismiss)
+        XCTAssertTrue(continuousAlert.autoDismiss)
         XCTAssertTrue(continuousMachine.suspendForScene(generationID: generation))
         XCTAssertEqual(continuousMachine.resumeForScene(generationID: generation),
                        .restartReadiness(attempt: 2, reason: .continuousRetry))
