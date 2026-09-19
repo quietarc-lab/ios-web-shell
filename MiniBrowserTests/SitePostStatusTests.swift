@@ -34,6 +34,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertEqual(AutomaticPostStatus.refreshingCatalog.rawValue, "カタログ再取得中")
         XCTAssertEqual(AutomaticPostStatus.acceptedPendingVerification.rawValue,
                        "受付済み・反映確認中")
+        XCTAssertEqual(AutomaticPostStatus.scenePaused.rawValue, "一時停止中")
         XCTAssertEqual(AutomaticPostStatus.completed.rawValue, "完了")
         XCTAssertEqual(AutomaticPostStatus.completedUnconfirmed.rawValue,
                        "完了（反映未確認）")
@@ -46,6 +47,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertFalse(AutomaticPostStatus.waitingForRepeat.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterThreadBatch.isFinal)
         XCTAssertFalse(AutomaticPostStatus.acceptedPendingVerification.isFinal)
+        XCTAssertFalse(AutomaticPostStatus.scenePaused.isFinal)
     }
 
     func testOverlayDimensionsStayFixed() {

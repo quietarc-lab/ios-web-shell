@@ -88,6 +88,16 @@ enum AutomaticPostFlowEffect: Equatable {
     case stopped(AutomaticPostStopReason)
 }
 
+/// The coordinator uses this value to restart only the gate that was active
+/// when the scene became inactive. It deliberately contains no page data.
+enum AutomaticPostSceneResumeAction: Equatable {
+    case none
+    case restartPreparation
+    case restartReadiness(attempt: Int, reason: AutomaticPostReadinessReason)
+    case restartSubmitDelay
+    case restartResponseMonitoring(attempt: Int, submissionID: UInt64)
+}
+
 enum AutomaticPostFlowEvent: Equatable {
     case markAPCompleted(generationID: UInt64)
     case markReloadCompleted(generationID: UInt64)
@@ -152,6 +162,7 @@ struct AutomaticPostFlowMachine {
     private(set) var awaitingSubmitResponseRetry = false
     private(set) var lastSubmitReadinessReason: AutomaticPostReadinessReason = .initial
     private(set) var submitResponseRetryOrigin: AutomaticPostReadinessReason?
+    private(set) var isSceneSuspended = false
 
     private var stalePageToken: String?
     private var apCompleted = false
@@ -246,6 +257,7 @@ struct AutomaticPostFlowMachine {
         }
 
         self.generationID = generationID
+        isSceneSuspended = false
         // A UA handoff starts a fresh generation, but it can still belong to
         // the same-thread repeat session. Preserve that mode so image-limit
         // and continuous-post alerts keep their session-specific recovery
@@ -293,6 +305,7 @@ struct AutomaticPostFlowMachine {
             return .stopped(.noContent)
         }
         self.generationID = generationID
+        isSceneSuspended = false
         isSameThreadRepeat = false
         isMultiThread = true
         stalePageToken = oldPageToken
@@ -336,6 +349,7 @@ struct AutomaticPostFlowMachine {
         }
 
         self.generationID = generationID
+        isSceneSuspended = false
         isSameThreadRepeat = true
         isMultiThread = false
         stalePageToken = nil
@@ -367,6 +381,52 @@ struct AutomaticPostFlowMachine {
         return .none
     }
 
+    /// Suspends generation-local bridge and timer effects while the app scene
+    /// is inactive. AP callbacks are still allowed to settle the external
+    /// shortcut operation; the coordinator defers any resulting effect until
+    /// the scene is active again.
+    @discardableResult
+    mutating func suspendForScene(generationID: UInt64) -> Bool {
+        guard self.generationID == generationID, isActive else { return false }
+        isSceneSuspended = true
+        return true
+    }
+
+    /// Reconnects the state machine to the coordinator without advancing the
+    /// generation or creating a new submission identity.
+    mutating func resumeForScene(generationID: UInt64) -> AutomaticPostSceneResumeAction {
+        guard self.generationID == generationID, isSceneSuspended else {
+            return .none
+        }
+        isSceneSuspended = false
+        switch state {
+        case .preparing:
+            return .restartPreparation
+        case let .waitingForSubmitReadiness(_, attempt, reason):
+            return .restartReadiness(attempt: attempt, reason: reason)
+        case .waitingToSubmit:
+            return .restartSubmitDelay
+        case let .submitting(_, attempt):
+            guard let submissionID = currentSubmissionID else { return .none }
+            return .restartResponseMonitoring(attempt: attempt,
+                                              submissionID: submissionID)
+        case let .waitingForCookieRetry(_, attempt):
+            let nextAttempt = attempt + 1
+            guard nextAttempt <= Self.regularAttemptLimit else { return .none }
+            _ = beginSubmitReadiness(attempt: nextAttempt, reason: .cookieRetry)
+            return .restartReadiness(attempt: nextAttempt, reason: .cookieRetry)
+        case let .waitingForContinuousRetry(_, attempt):
+            let nextAttempt = attempt + 1
+            guard nextAttempt <= Self.maximumAttempts else { return .none }
+            _ = beginSubmitReadiness(attempt: nextAttempt, reason: .continuousRetry)
+            return .restartReadiness(attempt: nextAttempt, reason: .continuousRetry)
+        case .idle, .waitingForCookieRefresh,
+             .waitingForIPRetry,
+             .waitingForContinuousAPRetry, .succeeded, .stopped:
+            return .none
+        }
+    }
+
     mutating func handle(_ event: AutomaticPostFlowEvent) -> AutomaticPostFlowEffect {
         if case .reset = event {
             reset()
@@ -376,6 +436,17 @@ struct AutomaticPostFlowMachine {
         guard let eventGenerationID = event.generationID,
               eventGenerationID == generationID else {
             return .none
+        }
+
+        if isSceneSuspended {
+            switch event {
+            case .markAPCompleted, .markReloadCompleted, .markCookieObserved,
+                 .ipReconnectCompleted, .continuousAPReconnectUnchanged,
+                 .continuousAPReconnectCompleted, .submitObserved, .postCompleted:
+                break
+            default:
+                return .none
+            }
         }
 
         switch event {
@@ -637,6 +708,7 @@ struct AutomaticPostFlowMachine {
     mutating func stop(_ reason: AutomaticPostStopReason) -> AutomaticPostFlowEffect {
         guard let generationID else { return .none }
         awaitingSubmitResponseRetry = false
+        isSceneSuspended = false
         state = .stopped(generationID: generationID, reason: reason)
         return .stopped(reason)
     }
@@ -652,6 +724,7 @@ struct AutomaticPostFlowMachine {
             return .none
         }
         awaitingSubmitResponseRetry = false
+        isSceneSuspended = false
         state = .stopped(generationID: generationID, reason: reason)
         return .skipCurrentThread
     }
@@ -663,6 +736,7 @@ struct AutomaticPostFlowMachine {
     mutating func forceTerminate(generationID: UInt64) {
         guard self.generationID == generationID, isActive else { return }
         awaitingSubmitResponseRetry = false
+        isSceneSuspended = false
         state = .stopped(generationID: generationID, reason: .communicationFailure)
     }
 
@@ -685,6 +759,7 @@ struct AutomaticPostFlowMachine {
         awaitingSubmitResponseRetry = false
         lastSubmitReadinessReason = .initial
         submitResponseRetryOrigin = nil
+        isSceneSuspended = false
         isSameThreadRepeat = false
         isMultiThread = false
         apCompleted = false

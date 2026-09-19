@@ -143,6 +143,13 @@ final class BrowserViewModel: ObservableObject {
     private weak var automaticCatalogProvider: AutomaticCatalogProvider?
     private var pendingCookieRefresh: PendingCookieRefresh?
     private var pendingAP: PendingAP?
+    private var pendingAPCallbackReceived = false
+    private var automaticScenePauseContext: AutomaticScenePauseContext?
+    private var automaticSceneBootstrapContext: AutomaticSceneBootstrapContext?
+    private var deferredSceneAutomaticEffect: (effect: AutomaticPostFlowEffect,
+                                                generationID: UInt64)?
+    private var sceneAPResumeRetryTask: Task<Void, Never>?
+    private var sceneAPResumeRetryUsedGenerations: Set<UInt64> = []
     private var lastRelatedCookieCountByHost: [String: Int] = [:]
     private var automaticPostMachine = AutomaticPostFlowMachine()
     private var automaticPostGeneration: UInt64 = 0
@@ -243,17 +250,44 @@ final class BrowserViewModel: ObservableObject {
         let automaticGenerationID: UInt64?
     }
 
-    private enum APPurpose {
+    private enum APPurpose: Equatable {
         case manual
         case identityRefresh(generationID: UInt64)
         case automaticIPRetry(generationID: UInt64)
         case automaticContinuousRetry(generationID: UInt64)
     }
 
-    private struct PendingAP {
+    private struct PendingAP: Equatable {
         let beforeIPv4: String?
         let reloadAfterCompletion: Bool
         let purpose: APPurpose
+    }
+
+    /// In-memory identity used to validate a foreground resume. The page URL
+    /// is the document that was visible when the scene left; targetURL/ID are
+    /// the pending catalog destination when a multi-thread transition had
+    /// already advanced its coordinator.
+    private struct AutomaticScenePauseContext: Equatable {
+        let generationID: UInt64?
+        let sessionID: UInt64?
+        let pageURL: URL?
+        let targetID: String?
+        let targetURL: URL?
+        let wasVerificationPending: Bool
+    }
+
+    /// The first multi-thread catalog request can be the only active work
+    /// before a page generation exists. Retain its inputs so a scene resume
+    /// can restart that request without creating a second session or losing
+    /// the captured draft.
+    private struct AutomaticSceneBootstrapContext: Equatable {
+        let pageURL: URL
+        let generationID: UInt64
+        let oldPageToken: String?
+        let hasComment: Bool
+        let comment: String?
+        let hasImage: Bool
+        let retainedPostThreadIDs: Set<String>
     }
 
     init(defaults: UserDefaults = .standard,
@@ -471,6 +505,15 @@ final class BrowserViewModel: ObservableObject {
             return
         }
         multiThreadBootstrapTask?.cancel()
+        automaticSceneBootstrapContext = AutomaticSceneBootstrapContext(
+            pageURL: pageURL,
+            generationID: generationID,
+            oldPageToken: oldPageToken,
+            hasComment: hasComment,
+            comment: comment,
+            hasImage: hasImage,
+            retainedPostThreadIDs: retainedPostThreadIDs
+        )
         provider.beginAutomaticSortDisplay(.momentum)
         multiThreadBootstrapTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -494,6 +537,7 @@ final class BrowserViewModel: ObservableObject {
                     phase = .catalog
                 }
                 guard !snapshot.targets.isEmpty else {
+                    self.automaticSceneBootstrapContext = nil
                     self.multiThreadBootstrapTask = nil
                     self.isUAChanging = false
                     self.pendingUAChangeGeneration = nil
@@ -510,6 +554,7 @@ final class BrowserViewModel: ObservableObject {
                     retainedPostThreadIDs: retainedPostThreadIDs,
                     initialPhase: phase
                 )
+                self.automaticSceneBootstrapContext = nil
                 self.multiThreadBootstrapTask = nil
                 guard let session = self.multiThreadSession else { return }
                 // A different first target will start the UA generation after
@@ -537,6 +582,7 @@ final class BrowserViewModel: ObservableObject {
             } catch {
                 guard self.multiThreadEnabled,
                       self.pendingUAChangeGeneration == generationID else { return }
+                self.automaticSceneBootstrapContext = nil
                 self.multiThreadBootstrapTask = nil
                 self.isUAChanging = false
                 self.pendingUAChangeGeneration = nil
@@ -559,6 +605,7 @@ final class BrowserViewModel: ObservableObject {
             multiThreadEnabled = false
             multiThreadBootstrapTask?.cancel()
             multiThreadBootstrapTask = nil
+            automaticSceneBootstrapContext = nil
             automaticCatalogProvider?.endAutomaticSortDisplay()
             pendingUAChangeGeneration = nil
             if multiThreadSession == nil {
@@ -1162,6 +1209,7 @@ final class BrowserViewModel: ObservableObject {
                                         purpose: APPurpose) {
         guard !isAPRunning else { return }
         isAPRunning = true
+        pendingAPCallbackReceived = false
 
         Task { [weak self] in
             guard let self else { return }
@@ -1169,6 +1217,14 @@ final class BrowserViewModel: ObservableObject {
             self.pendingAP = PendingAP(beforeIPv4: before,
                                        reloadAfterCompletion: reloadAfterCompletion,
                                        purpose: purpose)
+            if let generationID = Self.appPurposeGenerationID(purpose),
+               self.appSceneIsActive,
+               self.sceneAPResumeRetryUsedGenerations.contains(generationID) {
+                // The one allowed scene-resume AP restart has now created its
+                // new pending callback context. Arm the second and final
+                // missing-callback check from this exact generation.
+                self.scheduleAPResumeRetryIfNeeded(generationID: generationID)
+            }
 
             guard let shortcutURL = Self.cellularReconnectURL(),
                   await Self.openExternalURL(shortcutURL) else {
@@ -1231,6 +1287,14 @@ final class BrowserViewModel: ObservableObject {
 
     func navigationStarted() {
         multiThreadNavigationSequence &+= 1
+        if !appSceneIsActive, automaticScenePauseContext != nil {
+            // A navigation that was already in flight may finish while iOS
+            // has suspended the scene. Keep the automatic context intact and
+            // let the foreground resume validate the final URL.
+            isLoading = true
+            refreshNavigationState()
+            return
+        }
         if multiThreadSession != nil,
            pendingMultiThreadNavigation == nil,
            let generationID = automaticPostMachine.generationID {
@@ -1272,17 +1336,422 @@ final class BrowserViewModel: ObservableObject {
     /// idle timer so this does not attempt to turn an iOS app into a
     /// background execution service.
     func setAppSceneActive(_ isActive: Bool) {
+        let wasActive = appSceneIsActive
         appSceneIsActive = isActive
-        if isActive {
-            updateIsolationMonitoring(forceCheck: true)
-        } else {
-            // iOS may suspend a background scene; keeping a sleeping polling
-            // task alive would not provide reliable monitoring and would hold
-            // unnecessary state. The session context itself is retained so a
-            // foreground resume can perform an immediate fresh check.
+        if !isActive {
+            pauseAutomaticPostForScene()
             stopIsolationMonitoring(clearContext: false)
+        } else if !wasActive {
+            resumeAutomaticPostAfterSceneActivation()
+            updateIsolationMonitoring(forceCheck: true)
         }
         updateIdleTimerState()
+    }
+
+    private func pauseAutomaticPostForScene() {
+        guard automaticScenePauseContext == nil else { return }
+        let generationID = automaticPostMachine.generationID ??
+            automaticSceneBootstrapContext?.generationID
+        let hasAutomaticWork = automaticPostMachine.isActive ||
+            multiThreadSession != nil ||
+            automaticPostRepeatSession != nil ||
+            automaticPostVerificationTask != nil ||
+            automaticSceneBootstrapContext != nil ||
+            (pendingAP.flatMap { Self.appPurposeGenerationID($0.purpose) } != nil)
+        guard hasAutomaticWork else { return }
+
+        let pageURL = webView?.url ?? currentURL
+        let target = multiThreadSession?.currentTarget
+        automaticScenePauseContext = AutomaticScenePauseContext(
+            generationID: generationID,
+            sessionID: multiThreadSession?.sessionID,
+            pageURL: pageURL,
+            targetID: target?.id,
+            targetURL: target?.threadURL,
+            wasVerificationPending: automaticPostVerificationTask != nil
+        )
+        if let generationID {
+            _ = automaticPostMachine.suspendForScene(generationID: generationID)
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "SCENE",
+                event: "SCENE_DEACTIVATED",
+                result: "PAUSED",
+                fields: [
+                    ("STATE", String(describing: automaticPostMachine.state)),
+                    ("ATTEMPT", String(automaticPostMachine.lastAttempt))
+                ]
+            )
+            setAutomaticPostStatus(.scenePaused, generationID: generationID)
+        } else if multiThreadSessionActive {
+            setMultiThreadStatusWithoutGeneration(.scenePaused)
+        } else {
+            setAutomaticPostStatusWithoutGeneration(.scenePaused)
+        }
+
+        automaticPostPreparationTimer?.cancel()
+        automaticPostPreparationTimer = nil
+        automaticSubmitReadinessTask?.cancel()
+        automaticSubmitReadinessTask = nil
+        automaticSubmitResponseTimer?.cancel()
+        automaticSubmitResponseTimer = nil
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = nil
+        multiThreadTransitionTask?.cancel()
+        multiThreadTransitionTask = nil
+        automaticContinuousAPRetryDelayTask?.cancel()
+        automaticContinuousAPRetryDelayTask = nil
+        automaticPostVerificationTask?.cancel()
+        automaticPostVerificationTask = nil
+        automaticPostStatusTask?.cancel()
+        automaticPostStatusTask = nil
+        automaticSubmitReadinessDeadline = nil
+        automaticSubmitReadinessStableSince = nil
+        multiThreadBootstrapTask?.cancel()
+        multiThreadBootstrapTask = nil
+        sceneAPResumeRetryTask?.cancel()
+        sceneAPResumeRetryTask = nil
+    }
+
+    private func resumeAutomaticPostAfterSceneActivation() {
+        guard let context = automaticScenePauseContext else { return }
+        guard sceneResumeContextIsValid(context) else {
+            stopAfterSceneResumeFailure(context: context, reason: "URL_OR_TARGET_MISMATCH")
+            return
+        }
+
+        automaticScenePauseContext = nil
+        appendSceneResumeEvent(context: context,
+                               event: "SCENE_ACTIVATED",
+                               result: "RESUMED")
+
+        // Complete a page reload that WebKit may have settled while this
+        // scene was inactive. Navigation to a multi-thread destination is
+        // resumed below only after its URL is checked; feeding the old page
+        // into navigationFinished would incorrectly skip that target.
+        if automaticReloadGeneration != nil {
+            navigationFinished(url: webView?.url ?? currentURL)
+        }
+
+        if let bootstrap = automaticSceneBootstrapContext {
+            guard multiThreadEnabled,
+                  pendingUAChangeGeneration == bootstrap.generationID else {
+                stopAfterSceneResumeFailure(context: context,
+                                             reason: "BOOTSTRAP_CONTEXT_MISMATCH")
+                return
+            }
+            setAutomaticPostStatusWithoutGeneration(.preparingUA)
+            startMultiThreadBootstrap(
+                pageURL: bootstrap.pageURL,
+                generationID: bootstrap.generationID,
+                oldPageToken: bootstrap.oldPageToken,
+                hasComment: bootstrap.hasComment,
+                comment: bootstrap.comment,
+                hasImage: bootstrap.hasImage,
+                retainedPostThreadIDs: bootstrap.retainedPostThreadIDs
+            )
+            updateIsolationMonitoring(forceCheck: true)
+            return
+        }
+
+        if let generationID = context.generationID,
+           automaticPostMachine.generationID == generationID {
+            let action = automaticPostMachine.resumeForScene(generationID: generationID)
+            let deferred = deferredSceneAutomaticEffect
+            deferredSceneAutomaticEffect = nil
+            if let deferred,
+               deferred.generationID == generationID {
+                handleAutomaticPostEffect(deferred.effect, generationID: generationID)
+            } else {
+                resumeAutomaticGeneration(action: action, generationID: generationID)
+            }
+            if context.wasVerificationPending,
+               automaticPostMachine.state == .succeeded(generationID: generationID),
+               automaticPostAccepted,
+               !automaticOwnResponseConfirmed {
+                scheduleAutomaticPostVerificationTimeout(generationID: generationID)
+            }
+            scheduleAPResumeRetryIfNeeded(generationID: generationID)
+        } else if let session = multiThreadSession,
+                  session.sessionID == context.sessionID {
+            resumeMultiThreadTransitionIfNeeded(session: session)
+        } else if automaticPostRepeatSession != nil {
+            resumeAutomaticRepeatDelayIfNeeded()
+        }
+        updateIsolationMonitoring(forceCheck: true)
+    }
+
+    private func sceneResumeContextIsValid(_ context: AutomaticScenePauseContext) -> Bool {
+        guard let currentURL = webView?.url ?? currentURL,
+              let expectedPageURL = context.pageURL,
+              Self.isTargetThreadURL(currentURL) else {
+            return false
+        }
+        let pageMatches = Self.sameTargetThreadURL(currentURL, expectedPageURL)
+        let targetMatches = context.targetURL.map {
+            Self.sameTargetThreadURL(currentURL, $0)
+        } ?? false
+        guard pageMatches || targetMatches else { return false }
+
+        if let sessionID = context.sessionID {
+            guard let session = multiThreadSession,
+                  session.sessionID == sessionID,
+                  session.currentTarget?.id == context.targetID else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func resumeAutomaticGeneration(
+        action: AutomaticPostSceneResumeAction,
+        generationID: UInt64
+    ) {
+        guard automaticPostMachine.generationID == generationID else { return }
+        appendSceneResumeEvent(
+            context: automaticScenePauseContext,
+            event: "SCENE_RESUME_GATE",
+            result: String(describing: action)
+        )
+        switch action {
+        case .none:
+            if automaticPostMachine.state == .succeeded(generationID: generationID) {
+                if multiThreadSession != nil {
+                    resumeMultiThreadTransitionIfNeeded(session: multiThreadSession!)
+                } else if automaticPostRepeatSession != nil {
+                    resumeAutomaticRepeatDelayIfNeeded()
+                }
+            } else {
+                switch automaticPostMachine.state {
+                case .waitingForIPRetry:
+                    if pendingAP == nil {
+                        handleAutomaticPostEffect(.startIPReconnect,
+                                                  generationID: generationID)
+                    }
+                case .waitingForContinuousAPRetry:
+                    if pendingAP == nil {
+                        if automaticPostMachine.continuousAPReconnectAttempts > 1 {
+                            scheduleContinuousAPReconnectRetry(generationID: generationID)
+                        } else {
+                            handleAutomaticPostEffect(.startContinuousAPReconnect,
+                                                      generationID: generationID)
+                        }
+                    }
+                default:
+                    break
+                }
+            }
+        case .restartPreparation:
+            setAutomaticPostStatus(
+                automaticPostMachine.isSameThreadRepeat ? .waitingForRepeat : .checkingCookie,
+                generationID: generationID
+            )
+            startAutomaticPostPreparationTimeout(generationID: generationID)
+            replayAutomaticPreparationSignals(generationID: generationID)
+        case let .restartReadiness(attempt, reason):
+            setAutomaticPostStatus(
+                reason == .sameThreadRepeat ? .waitingForRepeat : .checkingCookie,
+                generationID: generationID
+            )
+            startAutomaticSubmitReadiness(generationID: generationID,
+                                          attempt: attempt,
+                                          reason: reason)
+        case .restartSubmitDelay:
+            scheduleSubmitDelay(generationID: generationID)
+        case let .restartResponseMonitoring(attempt, submissionID):
+            guard let pageToken = automaticPostMachine.pageToken else {
+                stopAutomaticPost(.communicationFailure, generationID: generationID)
+                return
+            }
+            startAutomaticSubmitResponseTimeout(generationID: generationID,
+                                                attempt: attempt,
+                                                submissionID: submissionID,
+                                                pageToken: pageToken)
+        }
+    }
+
+    private func replayAutomaticPreparationSignals(generationID: UInt64) {
+        guard automaticPostMachine.generationID == generationID,
+              let currentURL = webView?.url ?? currentURL else { return }
+        if let compact = latestCompactReady,
+           Self.sameTargetThreadURL(compact.pageURL, currentURL) {
+            handleCompactReady(pageToken: compact.pageToken,
+                               hasComment: compact.hasComment,
+                               canSubmit: compact.canSubmit,
+                               pageURL: compact.pageURL)
+        }
+        if let handwriting = pendingHandwritingReady,
+           Self.sameTargetThreadURL(handwriting.pageURL, currentURL) {
+            handleHandwritingReady(pageToken: handwriting.pageToken,
+                                   ready: handwriting.ready,
+                                   generationID: generationID,
+                                   pageURL: handwriting.pageURL)
+        }
+    }
+
+    private func resumeMultiThreadTransitionIfNeeded(session: MultiThreadPostSession) {
+        guard multiThreadEnabled,
+              multiThreadSession?.sessionID == session.sessionID,
+              let generationID = session.currentGenerationID else { return }
+        if let pending = pendingMultiThreadNavigation,
+           pending.sessionID == session.sessionID {
+            resumePendingMultiThreadNavigationIfNeeded()
+            return
+        }
+        guard let target = session.currentTarget else { return }
+        if Self.sameTargetThreadURL(webView?.url ?? currentURL, target.threadURL),
+           automaticPostMachine.state != .succeeded(generationID: generationID) {
+            return
+        }
+        scheduleMultiThreadNavigation(sessionID: session.sessionID,
+                                      generationID: generationID,
+                                      target: target,
+                                      skipped: false)
+    }
+
+    private func resumePendingMultiThreadNavigationIfNeeded() {
+        guard appSceneIsActive,
+              let pending = pendingMultiThreadNavigation,
+              let session = multiThreadSession,
+              pending.sessionID == session.sessionID,
+              session.currentTarget?.id == pending.target.id else {
+            return
+        }
+        let loadedURL = webView?.url ?? currentURL
+        guard Self.sameTargetThreadURL(loadedURL, pending.target.threadURL) else {
+            // The transition was scheduled before suspension but the target
+            // document has not committed. Re-arm the same target instead of
+            // treating the still-visible source page as a mismatch.
+            pendingMultiThreadNavigation = nil
+            pendingMultiThreadAvailabilityProbe = nil
+            pendingMultiThreadUnavailable = nil
+            if let generationID = session.currentGenerationID {
+                scheduleMultiThreadNavigation(sessionID: session.sessionID,
+                                              generationID: generationID,
+                                              target: pending.target,
+                                              skipped: false)
+            } else {
+                scheduleMultiThreadNavigationWithoutGeneration(
+                    sessionID: session.sessionID,
+                    target: pending.target,
+                    skipped: false
+                )
+            }
+            return
+        }
+        navigationFinished(url: loadedURL)
+    }
+
+    private func resumeAutomaticRepeatDelayIfNeeded() {
+        guard sameThreadRepeatEnabled,
+              let generationID = automaticPostMachine.generationID,
+              case .succeeded = automaticPostMachine.state,
+              let session = automaticPostRepeatSession,
+              !session.stopRequested else { return }
+        setAutomaticPostStatus(.waitingForRepeat, generationID: generationID)
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.sameThreadRepeatMinimumDelayNanoseconds)
+            guard let self, !Task.isCancelled, self.appSceneIsActive,
+                  self.automaticPostMachine.generationID == generationID,
+                  case .succeeded = self.automaticPostMachine.state else { return }
+            self.automaticPostRepeatDelayTask = nil
+            self.beginAutomaticPostRepeat(previousGenerationID: generationID)
+        }
+    }
+
+    private func scheduleAPResumeRetryIfNeeded(generationID: UInt64) {
+        guard let pendingAP,
+              Self.appPurposeGenerationID(pendingAP.purpose) == generationID,
+              isAPRunning,
+              !pendingAPCallbackReceived else { return }
+        sceneAPResumeRetryTask?.cancel()
+        sceneAPResumeRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let self, !Task.isCancelled, self.appSceneIsActive,
+                  self.automaticPostMachine.generationID == generationID,
+                  let current = self.pendingAP,
+                  self.isAPRunning,
+                  !self.pendingAPCallbackReceived,
+                  Self.appPurposeGenerationID(current.purpose) == generationID else { return }
+            self.sceneAPResumeRetryTask = nil
+            if self.sceneAPResumeRetryUsedGenerations.contains(generationID) {
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "AP",
+                    event: "SCENE_RESUME_AP_RETRY_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "CALLBACK_MISSING_AFTER_RETRY")]
+                )
+                self.stopAutomaticPost(.communicationFailure, generationID: generationID)
+                return
+            }
+            self.sceneAPResumeRetryUsedGenerations.insert(generationID)
+            self.appendAutomaticEvent(
+                generationID: generationID,
+                phase: "AP",
+                event: "SCENE_RESUME_AP_RETRY",
+                result: "STARTED",
+                fields: [("AP_PURPOSE", "SAME_GENERATION")]
+            )
+            let purpose = current.purpose
+            let reload = current.reloadAfterCompletion
+            self.pendingAP = nil
+            self.pendingAPCallbackReceived = false
+            self.isAPRunning = false
+            self.startCellularReconnect(reloadAfterCompletion: reload,
+                                        purpose: purpose)
+        }
+    }
+
+    private func stopAfterSceneResumeFailure(context: AutomaticScenePauseContext,
+                                             reason: String) {
+        if let generationID = context.generationID {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "SCENE",
+                event: "SCENE_RESUME_FAILED",
+                result: "STOPPED",
+                fields: [("REASON", reason)]
+            )
+        }
+        automaticScenePauseContext = nil
+        automaticSceneBootstrapContext = nil
+        deferredSceneAutomaticEffect = nil
+        sceneAPResumeRetryTask?.cancel()
+        sceneAPResumeRetryTask = nil
+        multiThreadBootstrapTask?.cancel()
+        multiThreadBootstrapTask = nil
+        if multiThreadSession != nil {
+            finishMultiThreadSession(generationID: context.generationID,
+                                     result: "STOPPED_SCENE_RESUME_FAILED")
+        } else if multiThreadEnabled {
+            pendingUAChangeGeneration = nil
+            isUAChanging = false
+            multiThreadEnabled = false
+            automaticCatalogProvider?.endAutomaticSortDisplay()
+            setAutomaticPostStatusWithoutGeneration(.stopped)
+        } else if let generationID = context.generationID {
+            setAutomaticPostStatus(.stopped, generationID: generationID)
+            finishAutomaticPost(generationID: generationID,
+                                result: "STOPPED_SCENE_RESUME_FAILED")
+        } else {
+            setAutomaticPostStatusWithoutGeneration(.stopped)
+        }
+    }
+
+    private func appendSceneResumeEvent(context: AutomaticScenePauseContext?,
+                                        event: String,
+                                        result: String) {
+        guard let generationID = context?.generationID ?? automaticPostMachine.generationID,
+              automaticPostMachine.generationID == generationID else { return }
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "SCENE",
+            event: event,
+            result: result,
+            fields: [("ATTEMPT", String(automaticPostMachine.lastAttempt))]
+        )
     }
 
     private func currentIsolationMonitorContext() -> IsolationMonitorContext? {
@@ -1609,6 +2078,13 @@ final class BrowserViewModel: ObservableObject {
             latestCompactReady = (candidateURL, pageToken, hasComment, canSubmit)
             return
         }
+        if !appSceneIsActive, automaticScenePauseContext != nil {
+            latestCompactReady = (pageURL ?? webView?.url,
+                                  pageToken,
+                                  hasComment,
+                                  canSubmit)
+            return
+        }
         if let pageURL,
            let currentURL = webView?.url,
            !Self.sameTargetThreadURL(pageURL, currentURL) {
@@ -1875,6 +2351,10 @@ final class BrowserViewModel: ObservableObject {
             let candidateURL = pageURL ?? webView?.url
             guard Self.isTargetThreadURL(candidateURL) else { return }
             pendingHandwritingReady = (candidateURL, pageToken, ready)
+            return
+        }
+        if !appSceneIsActive, automaticScenePauseContext != nil {
+            pendingHandwritingReady = (pageURL ?? webView?.url, pageToken, ready)
             return
         }
         if let pageURL,
@@ -2235,6 +2715,9 @@ final class BrowserViewModel: ObservableObject {
         }
         updateCurrentURL(url)
         refreshNavigationState()
+        if !appSceneIsActive, automaticScenePauseContext != nil {
+            return
+        }
         runAutomaticBookmarklets(for: url)
 
         if let pending = pendingMultiThreadNavigation,
@@ -2300,7 +2783,8 @@ final class BrowserViewModel: ObservableObject {
                 [weak self] result, error in
                 guard let self else { return }
                 Task { @MainActor in
-                    guard self.pendingMultiThreadAvailabilityProbe == probe,
+                    guard self.appSceneIsActive,
+                          self.pendingMultiThreadAvailabilityProbe == probe,
                           self.multiThreadNavigationSequence == probe.navigationSequence,
                           let currentPending = self.pendingMultiThreadNavigation,
                           currentPending.sessionID == probe.sessionID,
@@ -2690,6 +3174,9 @@ final class BrowserViewModel: ObservableObject {
         }
         updateCurrentURL(url)
         refreshNavigationState()
+        if !appSceneIsActive, automaticScenePauseContext != nil {
+            return
+        }
         showToast("読み込み失敗", kind: .failure)
         logStore.append(action: "Web Load Failure", fields: [
             ("URL", LogSanitizer.url(url)),
@@ -2730,6 +3217,9 @@ final class BrowserViewModel: ObservableObject {
         }
         updateCurrentURL(url)
         refreshNavigationState()
+        if !appSceneIsActive, automaticScenePauseContext != nil {
+            return
+        }
         showToast("読み込みタイムアウト", kind: .failure)
         logStore.append(action: "Web Load Timeout", fields: [
             ("URL", LogSanitizer.url(url)),
@@ -2777,9 +3267,14 @@ final class BrowserViewModel: ObservableObject {
             return
         }
 
+        pendingAPCallbackReceived = true
+        sceneAPResumeRetryTask?.cancel()
+        sceneAPResumeRetryTask = nil
+
         Task { [weak self] in
             guard let self else { return }
             let after = await self.fetchIPv4AfterRecovery()
+            guard self.pendingAP == context else { return }
             self.completeAP(before: context.beforeIPv4,
                             after: after,
                             reloadAfterCompletion: context.reloadAfterCompletion,
@@ -3354,6 +3849,7 @@ final class BrowserViewModel: ObservableObject {
             automaticFinishedGenerations.contains(generationID)) {
             if Self.appPurposeGenerationID(pendingAP?.purpose ?? .manual) == generationID {
                 pendingAP = nil
+                pendingAPCallbackReceived = false
                 isAPRunning = false
             }
             return
@@ -3405,6 +3901,7 @@ final class BrowserViewModel: ObservableObject {
         }
         logStore.append(action: "Cellular Reconnect", fields: apFields)
         pendingAP = nil
+        pendingAPCallbackReceived = false
         isAPRunning = false
 
         switch purpose {
@@ -3519,6 +4016,7 @@ final class BrowserViewModel: ObservableObject {
             automaticFinishedGenerations.contains(generationID)) {
             if Self.appPurposeGenerationID(pendingAP?.purpose ?? .manual) == generationID {
                 pendingAP = nil
+                pendingAPCallbackReceived = false
                 isAPRunning = false
             }
             return
@@ -3558,6 +4056,7 @@ final class BrowserViewModel: ObservableObject {
         }
         logStore.append(action: "Cellular Reconnect", fields: apFields)
         pendingAP = nil
+        pendingAPCallbackReceived = false
         isAPRunning = false
         switch purpose {
         case .manual:
@@ -3949,6 +4448,7 @@ final class BrowserViewModel: ObservableObject {
         if let pendingAP,
            Self.appPurposeGenerationID(pendingAP.purpose) == generationID {
             self.pendingAP = nil
+            pendingAPCallbackReceived = false
             isAPRunning = false
         }
         isIdentityRefreshInProgress = false
@@ -4028,6 +4528,7 @@ final class BrowserViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: delayNanoseconds)
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.multiThreadEnabled,
                   self.multiThreadSession?.sessionID == sessionID,
                   self.multiThreadSession?.currentTarget?.id == target.id else {
@@ -4082,6 +4583,7 @@ final class BrowserViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: delayNanoseconds)
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.multiThreadEnabled,
                   self.multiThreadSession?.sessionID == sessionID,
                   self.multiThreadSession?.currentGenerationID == generationID else { return }
@@ -4174,6 +4676,7 @@ final class BrowserViewModel: ObservableObject {
         }
         multiThreadBootstrapTask?.cancel()
         multiThreadBootstrapTask = nil
+        automaticSceneBootstrapContext = nil
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
         cancelAutomaticContinuousAPRetryDelay()
@@ -4210,6 +4713,13 @@ final class BrowserViewModel: ObservableObject {
     private func handleAutomaticPostEffect(_ effect: AutomaticPostFlowEffect,
                                            generationID: UInt64) {
         guard automaticPostMachine.generationID == generationID else {
+            updateIdleTimerState()
+            return
+        }
+        if !appSceneIsActive,
+           automaticScenePauseContext != nil,
+           effect != .none {
+            deferredSceneAutomaticEffect = (effect, generationID)
             updateIdleTimerState()
             return
         }
@@ -4449,6 +4959,7 @@ final class BrowserViewModel: ObservableObject {
         automaticSubmitReadinessTask = Task { @MainActor [weak self] in
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.automaticPostMachine.generationID == generationID,
                   case .waitingForSubmitReadiness = self.automaticPostMachine.state,
                   self.automaticPostMachine.currentAttempt == attempt else {
@@ -4463,7 +4974,8 @@ final class BrowserViewModel: ObservableObject {
     private func requestAutomaticSubmitReadiness(generationID: UInt64,
                                                  attempt: Int,
                                                  reason: AutomaticPostReadinessReason) {
-        guard automaticPostMachine.generationID == generationID,
+        guard appSceneIsActive,
+              automaticPostMachine.generationID == generationID,
               case .waitingForSubmitReadiness = automaticPostMachine.state,
               automaticPostMachine.currentAttempt == attempt else {
             return
@@ -4551,6 +5063,7 @@ final class BrowserViewModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 250_000_000)
                     guard let self,
                           !Task.isCancelled,
+                          self.appSceneIsActive,
                           self.automaticPostMachine.generationID == generationID,
                           case .waitingForSubmitReadiness = self.automaticPostMachine.state,
                           self.automaticPostMachine.currentAttempt == attempt else {
@@ -4863,6 +5376,7 @@ final class BrowserViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.automaticPostMachine.generationID == generationID,
                   case .preparing = self.automaticPostMachine.state else { return }
             webView.evaluateJavaScript(CanvasImageSessionService.canvasVisibilityScript) {
@@ -4989,6 +5503,7 @@ final class BrowserViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: Self.continuousAPRetryDelayNanoseconds)
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.automaticPostMachine.generationID == generationID,
                   self.automaticPostMachine.isActive,
                   case .waitingForContinuousAPRetry = self.automaticPostMachine.state,
@@ -5038,6 +5553,7 @@ final class BrowserViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: delayNanoseconds)
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.automaticPostMachine.generationID == generationID,
                   case .waitingToSubmit = self.automaticPostMachine.state else {
                 return
@@ -5196,6 +5712,7 @@ final class BrowserViewModel: ObservableObject {
             )
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.automaticPostMachine.generationID == generationID,
                   self.automaticPostMachine.pageToken == pageToken,
                   self.automaticPostMachine.currentSubmissionID == submissionID,
@@ -5279,6 +5796,7 @@ final class BrowserViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 30_000_000_000)
             guard let self,
                   !Task.isCancelled,
+                  self.appSceneIsActive,
                   self.automaticPostMachine.generationID == generationID,
                   case .preparing = self.automaticPostMachine.state else { return }
             self.appendAutomaticEvent(
@@ -5320,6 +5838,15 @@ final class BrowserViewModel: ObservableObject {
         guard !automaticFinishedGenerations.contains(generationID) else { return }
         automaticFinishedGenerations.insert(generationID)
         automaticPostMachine.forceTerminate(generationID: generationID)
+        if automaticScenePauseContext?.generationID == generationID {
+            automaticScenePauseContext = nil
+        }
+        if deferredSceneAutomaticEffect?.generationID == generationID {
+            deferredSceneAutomaticEffect = nil
+        }
+        sceneAPResumeRetryTask?.cancel()
+        sceneAPResumeRetryTask = nil
+        sceneAPResumeRetryUsedGenerations.remove(generationID)
         defer { updateIdleTimerState() }
         automaticPostPreparationTimer?.cancel()
         automaticPostPreparationTimer = nil
@@ -5394,6 +5921,7 @@ final class BrowserViewModel: ObservableObject {
         if let pendingAP,
            Self.appPurposeGenerationID(pendingAP.purpose) == generationID {
             self.pendingAP = nil
+            pendingAPCallbackReceived = false
             isAPRunning = false
         }
         automaticPostStatusTask?.cancel()

@@ -651,6 +651,83 @@ final class AutomaticPostFlowTests: XCTestCase {
         )), .startSubmitReadiness(attempt: 1, reason: .sameThreadRepeat))
     }
 
+    func testSceneSuspendAndResumeKeepsGenerationAndReadinessState() throws {
+        var machine = readyForReadinessMachine()
+        XCTAssertEqual(machine.handle(.submitReadinessObserved(
+            generationID: generation,
+            pageToken: "page",
+            ready: true,
+            stableForMilliseconds: 499
+        )), .none)
+        XCTAssertTrue(machine.suspendForScene(generationID: generation))
+        XCTAssertTrue(machine.isSceneSuspended)
+        XCTAssertEqual(machine.handle(.submitReadinessTimedOut(generationID: generation)), .none)
+        XCTAssertEqual(machine.resumeForScene(generationID: generation),
+                       .restartReadiness(attempt: 1, reason: .initial))
+        XCTAssertFalse(machine.isSceneSuspended)
+        XCTAssertEqual(machine.generationID, generation)
+        XCTAssertEqual(machine.currentAttempt, 1)
+    }
+
+    func testSceneResumeWhileSubmittingOnlyRestoresResponseMonitoring() throws {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let submissionID = try XCTUnwrap(machine.currentSubmissionID)
+        XCTAssertTrue(machine.suspendForScene(generationID: generation))
+        XCTAssertEqual(machine.handle(.submitObserved(generationID: generation,
+                                                       submissionID: submissionID)),
+                       .none)
+        XCTAssertEqual(machine.handle(.postCompleted(generationID: generation)),
+                       .succeeded)
+        XCTAssertEqual(machine.resumeForScene(generationID: generation), .none)
+        XCTAssertEqual(machine.currentSubmissionID, submissionID)
+        XCTAssertEqual(machine.state, .succeeded(generationID: generation))
+
+        var monitoringMachine = readyMachine(hasComment: true, hasImage: false)
+        let monitoringSubmissionID = try XCTUnwrap(
+            monitoringMachine.currentSubmissionID
+        )
+        XCTAssertTrue(monitoringMachine.suspendForScene(generationID: generation))
+        XCTAssertEqual(monitoringMachine.resumeForScene(generationID: generation),
+                       .restartResponseMonitoring(attempt: 1,
+                                                  submissionID: monitoringSubmissionID))
+    }
+
+    func testSceneResumeRequiresMatchingGenerationAndIsIdempotent() {
+        var machine = readyForReadinessMachine()
+        XCTAssertFalse(machine.suspendForScene(generationID: generation + 1))
+        XCTAssertTrue(machine.suspendForScene(generationID: generation))
+        XCTAssertEqual(machine.resumeForScene(generationID: generation + 1), .none)
+        XCTAssertEqual(machine.resumeForScene(generationID: generation),
+                       .restartReadiness(attempt: 1, reason: .initial))
+        XCTAssertEqual(machine.resumeForScene(generationID: generation), .none)
+    }
+
+    func testSceneResumeConvertsDeferredCookieAndContinuousAlertsToReadiness() {
+        var cookieMachine = readyMachine(hasComment: true, hasImage: false)
+        let cookieAlert = cookieMachine.handleAlert(.cookieRetryRequired,
+                                                    generationID: generation)
+        XCTAssertTrue(cookieAlert.autoDismiss)
+        XCTAssertTrue(cookieMachine.suspendForScene(generationID: generation))
+        XCTAssertEqual(cookieMachine.resumeForScene(generationID: generation),
+                       .restartReadiness(attempt: 2, reason: .cookieRetry))
+        XCTAssertEqual(cookieMachine.state,
+                       .waitingForSubmitReadiness(generationID: generation,
+                                                  attempt: 2,
+                                                  reason: .cookieRetry))
+
+        var continuousMachine = readyMachine(hasComment: true, hasImage: false)
+        let continuousAlert = continuousMachine.handleAlert(.continuousPosting,
+                                                            generationID: generation)
+        XCTAssertFalse(continuousAlert.autoDismiss)
+        XCTAssertTrue(continuousMachine.suspendForScene(generationID: generation))
+        XCTAssertEqual(continuousMachine.resumeForScene(generationID: generation),
+                       .restartReadiness(attempt: 2, reason: .continuousRetry))
+        XCTAssertEqual(continuousMachine.state,
+                       .waitingForSubmitReadiness(generationID: generation,
+                                                  attempt: 2,
+                                                  reason: .continuousRetry))
+    }
+
     func testEmptyCandidateStopsWithoutSubmitting() {
         var machine = AutomaticPostFlowMachine()
         XCTAssertEqual(machine.begin(generationID: generation,

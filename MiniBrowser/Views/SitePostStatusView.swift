@@ -36,7 +36,8 @@ struct SitePostStatusView: View {
                  .waitingForNextThread, .navigatingToNextThread,
                  .switchingAfterThreadBatch,
                  .refreshingCatalog,
-                 .acceptedPendingVerification:
+                 .acceptedPendingVerification,
+                 .scenePaused:
                 return .blue
             }
         }
