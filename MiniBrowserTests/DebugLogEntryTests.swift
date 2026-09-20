@@ -52,4 +52,32 @@ final class DebugLogEntryTests: XCTestCase {
         XCTAssertTrue(store.plainText(limit: 1).contains("ACTION: Third"))
         XCTAssertFalse(store.plainText(limit: 1).contains("Second"))
     }
+
+    func testUserAgentCatalogDiagnosticShowsRestrictionsAndAvailableIDsWithoutRawValues() {
+        let catalog = [
+            BrowserUserAgent(id: 1, name: "Safari iPhone", value: "raw-ua-one"),
+            BrowserUserAgent(id: 2, name: "Chrome iPad", value: "raw-ua-two"),
+            BrowserUserAgent(id: 3, name: "Firefox iPhone", value: "raw-ua-three")
+        ]
+        let snapshot = UserAgentCatalogDiagnostic.snapshot(
+            catalog: catalog,
+            restrictedKeys: ["2", "generated:legacy", "999"],
+            expiryByID: [2: Date(timeIntervalSince1970: 1_000_000)],
+            selectedID: 1
+        )
+
+        XCTAssertTrue(snapshot.contains("TOTAL_COUNT: 3"))
+        XCTAssertTrue(snapshot.contains("AVAILABLE_COUNT: 2"))
+        XCTAssertTrue(snapshot.contains("RESTRICTED_COUNT: 1"))
+        XCTAssertTrue(snapshot.contains("UNKNOWN_RESTRICTION_COUNT: 2"))
+        XCTAssertTrue(snapshot.contains("RESTRICTED_IDS: 2"))
+        XCTAssertTrue(snapshot.contains("2=Chrome iPad@"))
+        XCTAssertTrue(snapshot.contains("AVAILABLE_IDS: 1,3"))
+        XCTAssertTrue(snapshot.contains("AVAILABLE: 1=Safari iPhone;3=Firefox iPhone"))
+        XCTAssertTrue(snapshot.contains("SELECTED_ID: 1"))
+        XCTAssertTrue(snapshot.contains("SELECTED_NAME: Safari iPhone"))
+        XCTAssertFalse(snapshot.contains("raw-ua-one"))
+        XCTAssertFalse(snapshot.contains("raw-ua-two"))
+        XCTAssertFalse(snapshot.contains("raw-ua-three"))
+    }
 }

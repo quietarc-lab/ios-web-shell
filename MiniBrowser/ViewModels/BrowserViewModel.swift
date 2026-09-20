@@ -1266,13 +1266,36 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func copyDebugLog() {
-        let text = logStore.plainText(limit: 50)
+        let logText = logStore.plainText(limit: 50)
+        let catalogSnapshot = userAgentCatalogSnapshotText()
+        let text = [logText, catalogSnapshot]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
         guard !text.isEmpty else {
             showToast("ログなし", kind: .warning)
             return
         }
         UIPasteboard.general.string = text
-        showToast("ログをコピーしました", kind: .success)
+        showToast("ログとUA状態をコピーしました", kind: .success)
+    }
+
+    private func userAgentCatalogSnapshotText() -> String {
+        let restrictedKeys = userAgentRestrictionStore.restrictedKeys()
+        let catalogIDs = Set(BrowserUserAgent.all.map(\.id))
+        var expiryByID: [Int: Date] = [:]
+        for key in restrictedKeys {
+            guard let id = Int(key), catalogIDs.contains(id),
+                  let expiry = userAgentRestrictionStore.expiry(for: id) else {
+                continue
+            }
+            expiryByID[id] = expiry
+        }
+        return UserAgentCatalogDiagnostic.snapshot(
+            catalog: BrowserUserAgent.all,
+            restrictedKeys: restrictedKeys,
+            expiryByID: expiryByID,
+            selectedID: currentUserAgent.id
+        )
     }
 
     func contentBlockerFailed(error: Error) {

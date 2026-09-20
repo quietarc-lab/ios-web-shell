@@ -29,7 +29,7 @@ MiniBrowser is a lightweight iPhone browser built with SwiftUI and `WKWebView`. 
 - A collapsible native two-column official TargetPage list with momentum/catalog sorting, up to 60 active threads, thumbnail retry on refresh, reply counts, and high-contrast visited state
 - An exact `このスレッドには書けません` TargetPage alert removes that thread from the native list for six hours; expired exclusions are purged on load and the normal site alert remains visible
 - Input-focus auto zoom prevention for small form fields while preserving manual pinch zoom
-- A 500-entry redacted debug log; long-press the bottom toolbar and choose `ログをコピー` to copy the latest 50 entries
+- A 500-entry redacted debug log; long-press the bottom toolbar and choose `ログをコピー` to copy the latest 50 entries together with a bounded, copy-time UA catalog snapshot (available/restricted IDs and names, restriction expiries, and the selected profile; raw UA values are never included)
 - Reusable GitHub Actions unsigned IPA build and Windows/iCloud Drive delivery
 
 To conserve the private repository's GitHub-hosted macOS allowance, the IPA workflow is started manually after a verified change set instead of on every push. Windows static checks should be run before dispatching it.
