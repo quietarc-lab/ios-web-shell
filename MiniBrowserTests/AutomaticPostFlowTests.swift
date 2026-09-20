@@ -770,6 +770,30 @@ final class AutomaticPostFlowTests: XCTestCase {
                                 reason: .threadPostingUnavailable))
     }
 
+    func testMultiThreadNavigationUsesDedicatedSameUserAgentReadinessReason() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.beginMultiThreadNavigation(
+            generationID: generation,
+            oldPageToken: "old-page",
+            hasComment: true,
+            hasImage: false
+        )
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        let readiness = machine.handle(.markCompactReady(
+            generationID: generation,
+            pageToken: "new-page",
+            hasComment: true,
+            canSubmit: true
+        ))
+
+        XCTAssertEqual(
+            readiness,
+            .startSubmitReadiness(attempt: 1, reason: .sameUserAgentMultiThread)
+        )
+        XCTAssertEqual(machine.lastSubmitReadinessReason,
+                       .sameUserAgentMultiThread)
+    }
+
     func testMultiThreadSkipsUnavailableTargetDuringPreparation() {
         var machine = AutomaticPostFlowMachine()
         _ = machine.beginMultiThreadNavigation(

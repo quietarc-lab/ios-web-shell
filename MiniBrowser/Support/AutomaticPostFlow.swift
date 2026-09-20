@@ -122,6 +122,7 @@ enum AutomaticPostReadinessReason: String, Equatable {
     case continuousRetry = "CONTINUOUS_RETRY"
     case continuousAPRetry = "CONTINUOUS_AP_RETRY"
     case sameThreadRepeat = "SAME_THREAD_REPEAT"
+    case sameUserAgentMultiThread = "SAME_UA_MULTI_THREAD"
     case submitResponseRetry = "SUBMIT_RESPONSE_RETRY"
 }
 
@@ -395,7 +396,7 @@ struct AutomaticPostFlowMachine {
         submitResponseRetryUsed = false
         cookieRefreshAfterTimeoutUsed = false
         awaitingSubmitResponseRetry = false
-        lastSubmitReadinessReason = .initial
+        lastSubmitReadinessReason = .sameUserAgentMultiThread
         submitResponseRetryOrigin = nil
         // A catalog transition does not delete Cookies or reconnect AP. The
         // navigation itself is the only preparation stage still pending.
@@ -404,7 +405,7 @@ struct AutomaticPostFlowMachine {
         cookieObserved = true
         compactReady = false
         handwritingReady = !hasImage
-        preparationReason = .initial
+        preparationReason = .sameUserAgentMultiThread
         state = .preparing(generationID: generationID)
         return .none
     }

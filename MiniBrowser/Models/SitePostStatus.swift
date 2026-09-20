@@ -8,6 +8,7 @@ enum SitePostStatus: String, Equatable {
 enum AutomaticPostStatus: String, Equatable {
     case preparingUA = "UA準備中"
     case checkingCookie = "Cookie確認中"
+    case preparingNextThread = "次スレ準備中"
     case sending = "投稿中…"
     case cookieRetry = "Cookie確認後に再送"
     case reconnectingAfterIPLimit = "IP制限 → AP再接続中"
@@ -31,7 +32,7 @@ enum AutomaticPostStatus: String, Equatable {
         switch self {
         case .completed, .completedUnconfirmed, .stopped:
             return true
-        case .preparingUA, .checkingCookie, .sending, .cookieRetry,
+        case .preparingUA, .checkingCookie, .preparingNextThread, .sending, .cookieRetry,
              .reconnectingAfterIPLimit, .finalSendAfterIPChange,
              .switchingAfterAccessRestriction, .switchingAfterContinuousLimit,
              .reconnectingAfterContinuousLimit,

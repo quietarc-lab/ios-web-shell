@@ -131,6 +131,8 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(BrowserViewModel.sameThreadRepeatMinimumDelayNanoseconds,
                        250_000_000)
         XCTAssertEqual(BrowserViewModel.sameThreadRepeatSubmitDelayNanoseconds, 0)
+        XCTAssertEqual(BrowserViewModel.sameUserAgentMultiThreadSubmitDelayNanoseconds,
+                       500_000_000)
     }
 
     func testIsolationStopStartsOnAndIsNotPersisted() {

@@ -74,6 +74,7 @@ final class BrowserViewModel: ObservableObject {
     private static let standardSubmitDelayNanoseconds: UInt64 = 2_000_000_000
     static let sameThreadRepeatMinimumDelayNanoseconds: UInt64 = 250_000_000
     static let sameThreadRepeatSubmitDelayNanoseconds: UInt64 = 0
+    static let sameUserAgentMultiThreadSubmitDelayNanoseconds: UInt64 = 500_000_000
     static let multiThreadSuccessWaitNanoseconds: UInt64 = 1_000_000_000
     static let continuousAPRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
@@ -162,6 +163,15 @@ final class BrowserViewModel: ObservableObject {
     private var pendingCookieRefresh: PendingCookieRefresh?
     private var pendingAP: PendingAP?
     private var pendingAPCallbackReceived = false
+    /// Automatic AP opens Shortcuts and therefore causes an expected scene
+    /// transition. Keep that transition separate from a user leaving the app
+    /// so the active posting state is not suspended during the shortcut run.
+    private struct AutomaticAPSceneTransitionContext: Equatable {
+        let purpose: APPurpose
+        var sceneBecameInactive = false
+    }
+    private var automaticAPSceneTransition: AutomaticAPSceneTransitionContext?
+    private var automaticAPCompletionNeedsScenePause = false
     private var automaticScenePauseContext: AutomaticScenePauseContext?
     private var automaticSceneBootstrapContext: AutomaticSceneBootstrapContext?
     private var deferredSceneAutomaticEffect: (effect: AutomaticPostFlowEffect,
@@ -1232,6 +1242,14 @@ final class BrowserViewModel: ObservableObject {
         guard !isAPRunning else { return }
         isAPRunning = true
         pendingAPCallbackReceived = false
+        if case .manual = purpose {
+            automaticAPSceneTransition = nil
+        } else {
+            automaticAPSceneTransition = AutomaticAPSceneTransitionContext(
+                purpose: purpose,
+                sceneBecameInactive: !appSceneIsActive
+            )
+        }
 
         Task { [weak self] in
             guard let self else { return }
@@ -1241,7 +1259,8 @@ final class BrowserViewModel: ObservableObject {
                                        purpose: purpose)
             if let generationID = Self.appPurposeGenerationID(purpose),
                self.appSceneIsActive,
-               self.sceneAPResumeRetryUsedGenerations.contains(generationID) {
+               (self.sceneAPResumeRetryUsedGenerations.contains(generationID) ||
+                self.automaticAPSceneTransition?.sceneBecameInactive == true) {
                 // The one allowed scene-resume AP restart has now created its
                 // new pending callback context. Arm the second and final
                 // missing-callback check from this exact generation.
@@ -1384,13 +1403,49 @@ final class BrowserViewModel: ObservableObject {
         let wasActive = appSceneIsActive
         appSceneIsActive = isActive
         if !isActive {
-            pauseAutomaticPostForScene()
+            if automaticAPSceneTransition != nil {
+                markAutomaticAPSceneBecameInactive(logEvent: wasActive)
+            } else {
+                pauseAutomaticPostForScene()
+            }
             stopIsolationMonitoring(clearContext: false)
         } else if !wasActive {
-            resumeAutomaticPostAfterSceneActivation()
+            if let context = automaticAPSceneTransition,
+               let generationID = Self.appPurposeGenerationID(context.purpose) {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "SCENE",
+                    event: "SCENE_ACTIVATED",
+                    result: "AP_EXPECTED"
+                )
+                scheduleAPResumeRetryIfNeeded(generationID: generationID)
+            } else {
+                resumeAutomaticPostAfterSceneActivation()
+            }
             updateIsolationMonitoring(forceCheck: true)
         }
         updateIdleTimerState()
+    }
+
+    private func markAutomaticAPSceneBecameInactive(logEvent: Bool) {
+        guard var context = automaticAPSceneTransition else { return }
+        let wasAlreadyMarked = context.sceneBecameInactive
+        context.sceneBecameInactive = true
+        automaticAPSceneTransition = context
+        guard logEvent, !wasAlreadyMarked,
+              let generationID = Self.appPurposeGenerationID(context.purpose) else {
+            return
+        }
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "SCENE",
+            event: "SCENE_DEACTIVATED",
+            result: "AP_EXPECTED",
+            fields: [
+                ("STATE", String(describing: automaticPostMachine.state)),
+                ("ATTEMPT", String(automaticPostMachine.lastAttempt))
+            ]
+        )
     }
 
     private func pauseAutomaticPostForScene() {
@@ -1588,14 +1643,22 @@ final class BrowserViewModel: ObservableObject {
             }
         case .restartPreparation:
             setAutomaticPostStatus(
-                automaticPostMachine.isSameThreadRepeat ? .waitingForRepeat : .checkingCookie,
+                automaticPostMachine.isSameThreadRepeat
+                    ? .waitingForRepeat
+                    : automaticPostMachine.lastSubmitReadinessReason == .sameUserAgentMultiThread
+                        ? .preparingNextThread
+                        : .checkingCookie,
                 generationID: generationID
             )
             startAutomaticPostPreparationTimeout(generationID: generationID)
             replayAutomaticPreparationSignals(generationID: generationID)
         case let .restartReadiness(attempt, reason):
             setAutomaticPostStatus(
-                reason == .sameThreadRepeat ? .waitingForRepeat : .checkingCookie,
+                reason == .sameThreadRepeat
+                    ? .waitingForRepeat
+                    : reason == .sameUserAgentMultiThread
+                        ? .preparingNextThread
+                        : .checkingCookie,
                 generationID: generationID
             )
             startAutomaticSubmitReadiness(generationID: generationID,
@@ -3069,7 +3132,7 @@ final class BrowserViewModel: ObservableObject {
         updatedSession.currentTargetID = target.id
         multiThreadSession = updatedSession
         beginAutomaticGenerationLogging(generationID: generationID)
-        setAutomaticPostStatus(.checkingCookie, generationID: generationID)
+        setAutomaticPostStatus(.preparingNextThread, generationID: generationID)
         startAutomaticPostPreparationTimeout(generationID: generationID)
         let reloadEffect = automaticPostMachine.handle(
             .markReloadCompleted(generationID: generationID)
@@ -3894,14 +3957,23 @@ final class BrowserViewModel: ObservableObject {
                             reloadAfterCompletion: Bool,
                             purpose: APPurpose) {
         if let generationID = Self.appPurposeGenerationID(purpose),
-           (automaticPostMachine.generationID != generationID ||
-            automaticFinishedGenerations.contains(generationID)) {
+            (automaticPostMachine.generationID != generationID ||
+             automaticFinishedGenerations.contains(generationID)) {
+            if automaticAPSceneTransition?.purpose == purpose {
+                automaticAPSceneTransition = nil
+            }
             if Self.appPurposeGenerationID(pendingAP?.purpose ?? .manual) == generationID {
                 pendingAP = nil
                 pendingAPCallbackReceived = false
                 isAPRunning = false
             }
             return
+        }
+        let shouldPauseAfterCompletion = automaticAPSceneTransition?.purpose == purpose &&
+            automaticAPSceneTransition?.sceneBecameInactive == true &&
+            !appSceneIsActive
+        if automaticAPSceneTransition?.purpose == purpose {
+            automaticAPSceneTransition = nil
         }
         let result: String
         if let before, let after {
@@ -3961,6 +4033,7 @@ final class BrowserViewModel: ObservableObject {
                 stopAutomaticPost(.preparationFailed, generationID: generationID)
                 return
             }
+            automaticAPCompletionNeedsScenePause = shouldPauseAfterCompletion
             let effect = automaticPostMachine.handle(.markAPCompleted(generationID: generationID))
             handleAutomaticPostEffect(effect, generationID: generationID)
         case let .automaticIPRetry(generationID):
@@ -3970,6 +4043,7 @@ final class BrowserViewModel: ObservableObject {
                 stopAutomaticPost(.communicationFailure, generationID: generationID)
                 return
             }
+            automaticAPCompletionNeedsScenePause = shouldPauseAfterCompletion
             let effect = automaticPostMachine.handle(
                 .ipReconnectCompleted(generationID: generationID, success: true)
             )
@@ -3988,6 +4062,7 @@ final class BrowserViewModel: ObservableObject {
                 stopAutomaticPost(.communicationFailure, generationID: generationID)
                 return
             }
+            automaticAPCompletionNeedsScenePause = shouldPauseAfterCompletion
             let ipChanged = before != after
             automaticAPResult = ipChanged ? "RECONNECTED" : "FAILED"
             guard ipChanged else {
@@ -4060,6 +4135,10 @@ final class BrowserViewModel: ObservableObject {
                                  before: String?,
                                  reloadAfterCompletion: Bool,
                                  purpose: APPurpose) {
+        if automaticAPSceneTransition?.purpose == purpose {
+            automaticAPSceneTransition = nil
+            automaticAPCompletionNeedsScenePause = false
+        }
         if let generationID = Self.appPurposeGenerationID(purpose),
            (automaticPostMachine.generationID != generationID ||
             automaticFinishedGenerations.contains(generationID)) {
@@ -4500,6 +4579,10 @@ final class BrowserViewModel: ObservableObject {
             pendingAPCallbackReceived = false
             isAPRunning = false
         }
+        if Self.appPurposeGenerationID(automaticAPSceneTransition?.purpose ?? .manual) == generationID {
+            automaticAPSceneTransition = nil
+            automaticAPCompletionNeedsScenePause = false
+        }
         isIdentityRefreshInProgress = false
         isUAChanging = false
     }
@@ -4750,7 +4833,11 @@ final class BrowserViewModel: ObservableObject {
         }
         if let activeGenerationID {
             automaticPostMachine.forceTerminate(generationID: activeGenerationID)
+            if Self.appPurposeGenerationID(automaticAPSceneTransition?.purpose ?? .manual) == activeGenerationID {
+                automaticAPSceneTransition = nil
+            }
         }
+        automaticAPCompletionNeedsScenePause = false
         multiThreadBootstrapTask?.cancel()
         multiThreadBootstrapTask = nil
         automaticSceneBootstrapContext = nil
@@ -4794,6 +4881,19 @@ final class BrowserViewModel: ObservableObject {
             updateIdleTimerState()
             return
         }
+        if automaticAPCompletionNeedsScenePause {
+            let shouldPause = !appSceneIsActive && automaticScenePauseContext == nil
+            automaticAPCompletionNeedsScenePause = false
+            let isTerminal: Bool
+            if case .stopped = effect {
+                isTerminal = true
+            } else {
+                isTerminal = false
+            }
+            if shouldPause && !isTerminal {
+                pauseAutomaticPostForScene()
+            }
+        }
         if !appSceneIsActive,
            automaticScenePauseContext != nil,
            effect != .none {
@@ -4812,13 +4912,16 @@ final class BrowserViewModel: ObservableObject {
         case .none:
             break
         case let .startSubmitReadiness(attempt, reason):
-            if reason == .initial || reason == .sameThreadRepeat {
+            if reason == .initial || reason == .sameThreadRepeat ||
+                reason == .sameUserAgentMultiThread {
                 appendAutomaticEvent(
                     generationID: generationID,
                     phase: "PREPARATION",
                     event: reason == .sameThreadRepeat
                         ? "REPEAT_PREPARATION_READY"
-                        : "PREPARATION_READY",
+                        : reason == .sameUserAgentMultiThread
+                            ? "NEXT_THREAD_PREPARATION_READY"
+                            : "PREPARATION_READY",
                     result: "READY",
                     fields: [
                         ("AP_RESULT", automaticAPResult),
@@ -4830,7 +4933,9 @@ final class BrowserViewModel: ObservableObject {
             setAutomaticPostStatus(
                 reason == .sameThreadRepeat
                     ? .waitingForRepeat
-                    : reason == .submitResponseRetry ? .sending : .checkingCookie,
+                    : reason == .sameUserAgentMultiThread
+                        ? .preparingNextThread
+                        : reason == .submitResponseRetry ? .sending : .checkingCookie,
                 generationID: generationID
             )
             startAutomaticSubmitReadiness(generationID: generationID,
@@ -5609,6 +5714,7 @@ final class BrowserViewModel: ObservableObject {
         if let readinessReason,
            readinessReason == .continuousAPRetry ||
            readinessReason == .sameThreadRepeat ||
+           readinessReason == .sameUserAgentMultiThread ||
            readinessReason == .submitResponseRetry {
             var fields = [
                 ("DELAY_MS", String(delayNanoseconds / 1_000_000)),
@@ -5648,6 +5754,9 @@ final class BrowserViewModel: ObservableObject {
     private func submitDelayNanoseconds(for reason: AutomaticPostReadinessReason?) -> UInt64 {
         if reason == .sameThreadRepeat {
             return Self.sameThreadRepeatSubmitDelayNanoseconds
+        }
+        if reason == .sameUserAgentMultiThread {
+            return Self.sameUserAgentMultiThreadSubmitDelayNanoseconds
         }
         guard reason == .continuousAPRetry,
               let completedAt = automaticContinuousAPCompletedUptimeNanoseconds else {
@@ -6013,6 +6122,10 @@ final class BrowserViewModel: ObservableObject {
             pendingAPCallbackReceived = false
             isAPRunning = false
         }
+        if Self.appPurposeGenerationID(automaticAPSceneTransition?.purpose ?? .manual) == generationID {
+            automaticAPSceneTransition = nil
+        }
+        automaticAPCompletionNeedsScenePause = false
         automaticPostStatusTask?.cancel()
         automaticPostStatusTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 5_000_000_000)

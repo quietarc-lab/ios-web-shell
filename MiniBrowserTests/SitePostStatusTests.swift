@@ -12,6 +12,7 @@ final class SitePostStatusTests: XCTestCase {
     func testAutomaticStatusTextAndFinalClassification() {
         XCTAssertEqual(AutomaticPostStatus.preparingUA.rawValue, "UA準備中")
         XCTAssertEqual(AutomaticPostStatus.checkingCookie.rawValue, "Cookie確認中")
+        XCTAssertEqual(AutomaticPostStatus.preparingNextThread.rawValue, "次スレ準備中")
         XCTAssertEqual(AutomaticPostStatus.sending.rawValue, "投稿中…")
         XCTAssertEqual(AutomaticPostStatus.cookieRetry.rawValue, "Cookie確認後に再送")
         XCTAssertEqual(AutomaticPostStatus.reconnectingAfterIPLimit.rawValue,
@@ -43,6 +44,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertTrue(AutomaticPostStatus.completedUnconfirmed.isFinal)
         XCTAssertTrue(AutomaticPostStatus.stopped.isFinal)
         XCTAssertFalse(AutomaticPostStatus.sending.isFinal)
+        XCTAssertFalse(AutomaticPostStatus.preparingNextThread.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterAccessRestriction.isFinal)
         XCTAssertFalse(AutomaticPostStatus.waitingForRepeat.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterThreadBatch.isFinal)

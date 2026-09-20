@@ -28,7 +28,7 @@ struct SitePostStatusView: View {
             switch automaticStatus {
             case .completed, .completedUnconfirmed: return .green
             case .stopped: return .red
-            case .preparingUA, .checkingCookie, .sending, .cookieRetry,
+            case .preparingUA, .checkingCookie, .preparingNextThread, .sending, .cookieRetry,
                  .reconnectingAfterIPLimit, .finalSendAfterIPChange,
                  .switchingAfterAccessRestriction, .switchingAfterContinuousLimit,
                  .reconnectingAfterContinuousLimit,
