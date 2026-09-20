@@ -59,7 +59,7 @@ struct ContentView: View {
         }
         .alert(item: $model.isolationStopNotice) { notice in
             let threadDetail = notice.threadID.map { "\nスレッド: \($0)" } ?? ""
-            Alert(
+            return Alert(
                 title: Text(notice.kind.alertTitle),
                 message: Text("\(notice.kind.alertMessage)\(threadDetail)"),
                 dismissButton: .default(Text("OK")) {
