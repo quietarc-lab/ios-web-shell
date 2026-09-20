@@ -15,7 +15,7 @@ enum TargetPageAlertDisposition: Equatable {
     case autoDismiss
 }
 
-enum AutomaticPostStopReason: Equatable {
+enum AutomaticPostStopReason: Equatable, Sendable {
     case noContent
     case noAvailableUserAgent
     case accessRestricted
@@ -40,6 +40,79 @@ enum AutomaticPostStopReason: Equatable {
     /// The Futapo moderation feed confirmed that a referenced thread was
     /// deleted. This is a terminal session-level safety stop.
     case deletedThread
+    /// The scene could not restore an active automatic session after the app
+    /// returned from another app or Shortcuts.
+    case sceneResumeFailed
+}
+
+extension AutomaticPostStopReason {
+    /// Only unexpected terminal failures should require an explicit user
+    /// acknowledgement. User-requested stops, normal multi-thread skips,
+    /// and moderation stops (which have their own notice) stay silent here.
+    var requiresUserAlert: Bool {
+        switch self {
+        case .repeatDisabled,
+             .threadUnavailable,
+             .isolatedThread,
+             .deletedThread:
+            return false
+        case .noContent,
+             .noAvailableUserAgent,
+             .accessRestricted,
+             .preparationTimeout,
+             .preparationFailed,
+             .communicationFailure,
+             .unknownAlert,
+             .knownAlertAfterLimit,
+             .retryLimit,
+             .imageCountRestricted,
+             .submitResponseTimeout,
+             .threadPostingUnavailable,
+             .catalogRefreshFailed,
+             .sceneResumeFailed:
+            return true
+        }
+    }
+
+    var userAlertMessage: String {
+        switch self {
+        case .noContent:
+            return "投稿内容を準備できなかったため自動投稿を停止しました"
+        case .noAvailableUserAgent:
+            return "利用可能なUAがなくなったため自動投稿を停止しました"
+        case .accessRestricted:
+            return "アクセス規制の切り替えに失敗したため自動投稿を停止しました"
+        case .preparationTimeout:
+            return "投稿準備がタイムアウトしたため自動投稿を停止しました"
+        case .preparationFailed:
+            return "投稿準備に失敗したため自動投稿を停止しました"
+        case .communicationFailure:
+            return "通信に失敗したため自動投稿を停止しました"
+        case .unknownAlert:
+            return "未対応のサイト通知を検知したため自動投稿を停止しました"
+        case .knownAlertAfterLimit:
+            return "投稿制限の上限に達したため自動投稿を停止しました"
+        case .retryLimit:
+            return "再試行上限に達したため自動投稿を停止しました"
+        case .repeatDisabled:
+            return "自動投稿を停止しました"
+        case .imageCountRestricted:
+            return "画像枚数制限のため自動投稿を停止しました"
+        case .submitResponseTimeout:
+            return "投稿結果を確認できなかったため自動投稿を停止しました"
+        case .threadPostingUnavailable:
+            return "このスレッドには書き込めないため自動投稿を停止しました"
+        case .threadUnavailable:
+            return "スレッドを利用できないため自動投稿を停止しました"
+        case .catalogRefreshFailed:
+            return "スレッド一覧の取得に失敗したため自動投稿を停止しました"
+        case .isolatedThread,
+             .deletedThread:
+            return "自動投稿を停止しました"
+        case .sceneResumeFailed:
+            return "復帰処理に失敗したため自動投稿を停止しました"
+        }
+    }
 }
 
 enum AutomaticPostReadinessReason: String, Equatable {

@@ -3,7 +3,7 @@ import Combine
 import Foundation
 import UIKit
 
-/// Repeats a short in-app tone and an error haptic while a moderation stop
+/// Repeats a short in-app tone and an error haptic while an automatic-stop
 /// alert is waiting for confirmation. It deliberately does not configure an
 /// audio session, request notification permissions, or attempt to bypass the
 /// silent/focus modes.

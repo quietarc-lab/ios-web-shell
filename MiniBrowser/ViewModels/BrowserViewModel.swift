@@ -3,9 +3,21 @@ import Foundation
 import UIKit
 import WebKit
 
-enum ModerationStopKind: String, Equatable, Sendable {
+enum ModerationStopKind: Equatable, Sendable {
     case isolated
     case deleted
+    case automaticFailure(AutomaticPostStopReason)
+
+    var rawValue: String {
+        switch self {
+        case .isolated:
+            return "isolated"
+        case .deleted:
+            return "deleted"
+        case .automaticFailure:
+            return "automaticFailure"
+        }
+    }
 
     var alertTitle: String {
         switch self {
@@ -13,6 +25,8 @@ enum ModerationStopKind: String, Equatable, Sendable {
             return "隔離検知"
         case .deleted:
             return "削除検知"
+        case .automaticFailure:
+            return "自動投稿停止"
         }
     }
 
@@ -22,6 +36,8 @@ enum ModerationStopKind: String, Equatable, Sendable {
             return "隔離検知のため自動投稿を停止しました"
         case .deleted:
             return "削除検知のため自動投稿を停止しました"
+        case let .automaticFailure(reason):
+            return reason.userAlertMessage
         }
     }
 
@@ -31,23 +47,25 @@ enum ModerationStopKind: String, Equatable, Sendable {
             return .isolatedThread
         case .deleted:
             return .deletedThread
+        case let .automaticFailure(reason):
+            return reason
         }
     }
 }
 
 struct IsolationStopNotice: Identifiable, Equatable {
     let id: String
-    let threadID: String
+    let threadID: String?
     let mode: String
     let kind: ModerationStopKind
 
-    init(threadID: String,
+    init(threadID: String? = nil,
          mode: String,
          kind: ModerationStopKind = .isolated) {
         self.threadID = threadID
         self.mode = mode
         self.kind = kind
-        self.id = "\(kind.rawValue):\(mode):\(threadID)"
+        self.id = "\(kind.rawValue):\(mode):\(threadID ?? "")"
     }
 }
 
@@ -589,6 +607,10 @@ final class BrowserViewModel: ObservableObject {
                 provider.endAutomaticSortDisplay()
                 self.multiThreadEnabled = false
                 self.setAutomaticPostStatusWithoutGeneration(.stopped)
+                self.presentAutomaticStopNotice(
+                    reason: .catalogRefreshFailed,
+                    mode: "MULTI_THREAD"
+                )
                 self.appendAutomaticEvent(
                     generationID: generationID,
                     phase: "CATALOG",
@@ -1754,12 +1776,16 @@ final class BrowserViewModel: ObservableObject {
             multiThreadEnabled = false
             automaticCatalogProvider?.endAutomaticSortDisplay()
             setAutomaticPostStatusWithoutGeneration(.stopped)
+            presentAutomaticStopNotice(reason: .sceneResumeFailed,
+                                       mode: "MULTI_THREAD")
         } else if let generationID = context.generationID {
             setAutomaticPostStatus(.stopped, generationID: generationID)
             finishAutomaticPost(generationID: generationID,
-                                result: "STOPPED_SCENE_RESUME_FAILED")
+                                result: "STOPPED_SCENE_RESUME_FAILED",
+                                stopReason: .sceneResumeFailed)
         } else {
             setAutomaticPostStatusWithoutGeneration(.stopped)
+            presentAutomaticStopNotice(reason: .sceneResumeFailed)
         }
     }
 
@@ -4684,7 +4710,28 @@ final class BrowserViewModel: ObservableObject {
                                       skipped: true)
     }
 
-    private func finishMultiThreadSession(generationID: UInt64?, result: String) {
+    private func presentAutomaticStopNotice(reason: AutomaticPostStopReason,
+                                            threadID: String? = nil,
+                                            mode: String? = nil) {
+        guard reason.requiresUserAlert,
+              isolationStopNotice == nil else {
+            return
+        }
+        let resolvedThreadID = threadID ??
+            multiThreadSession?.currentTargetID ??
+            webView?.url.flatMap { ThreadListViewModel.threadID(from: $0) }
+        let resolvedMode = mode ??
+            (multiThreadSession != nil ? "MULTI_THREAD" : "SAME_THREAD")
+        isolationStopNotice = IsolationStopNotice(
+            threadID: resolvedThreadID,
+            mode: resolvedMode,
+            kind: .automaticFailure(reason)
+        )
+    }
+
+    private func finishMultiThreadSession(generationID: UInt64?,
+                                          result: String,
+                                          stopReason: AutomaticPostStopReason? = nil) {
         let activeGenerationID = generationID ?? automaticPostMachine.generationID
         let hadSession = multiThreadSession != nil
         let finalLogContext = multiThreadSession.map {
@@ -4692,6 +4739,13 @@ final class BrowserViewModel: ObservableObject {
                 sessionID: $0.sessionID,
                 targetIndex: $0.currentIndex + 1,
                 threadID: $0.currentTargetID
+            )
+        }
+        if let reason = stopReason ?? Self.automaticStopReason(for: result) {
+            presentAutomaticStopNotice(
+                reason: reason,
+                threadID: finalLogContext?.threadID,
+                mode: "MULTI_THREAD"
             )
         }
         if let activeGenerationID {
@@ -4730,7 +4784,8 @@ final class BrowserViewModel: ObservableObject {
         }
         finishAutomaticPost(generationID: activeGenerationID,
                             result: result,
-                            multiThreadContext: finalLogContext)
+                            multiThreadContext: finalLogContext,
+                            stopReason: stopReason)
     }
 
     private func handleAutomaticPostEffect(_ effect: AutomaticPostFlowEffect,
@@ -4946,10 +5001,12 @@ final class BrowserViewModel: ObservableObject {
             automaticPostVerificationTask = nil
             if multiThreadSession != nil {
                 finishMultiThreadSession(generationID: generationID,
-                                         result: Self.automaticStopResult(for: reason))
+                                         result: Self.automaticStopResult(for: reason),
+                                         stopReason: reason)
             } else {
                 finishAutomaticPost(generationID: generationID,
-                                    result: Self.automaticStopResult(for: reason))
+                                    result: Self.automaticStopResult(for: reason),
+                                    stopReason: reason)
             }
         }
     }
@@ -5856,10 +5913,19 @@ final class BrowserViewModel: ObservableObject {
 
     private func finishAutomaticPost(generationID: UInt64,
                                      result: String,
-                                     multiThreadContext: MultiThreadLogContext? = nil) {
+                                     multiThreadContext: MultiThreadLogContext? = nil,
+                                     stopReason: AutomaticPostStopReason? = nil) {
         guard automaticPostMachine.generationID == generationID else { return }
         guard !automaticFinishedGenerations.contains(generationID) else { return }
         automaticFinishedGenerations.insert(generationID)
+        if let reason = stopReason ?? Self.automaticStopReason(for: result) {
+            presentAutomaticStopNotice(
+                reason: reason,
+                threadID: multiThreadContext?.threadID ??
+                    webView?.url.flatMap { ThreadListViewModel.threadID(from: $0) },
+                mode: multiThreadContext == nil ? "SAME_THREAD" : "MULTI_THREAD"
+            )
+        }
         automaticPostMachine.forceTerminate(generationID: generationID)
         if automaticScenePauseContext?.generationID == generationID {
             automaticScenePauseContext = nil
@@ -6302,6 +6368,61 @@ final class BrowserViewModel: ObservableObject {
         case "POST_STATUS": return "POST_STATUS"
         case "POST_COMPLETED": return "POST_COMPLETED"
         default: return "OTHER"
+        }
+    }
+
+    private static func automaticStopReason(for result: String) -> AutomaticPostStopReason? {
+        switch result {
+        case "STOPPED_NO_CONTENT", "STOPPED_NOCONTENT":
+            return .noContent
+        case "STOPPED_NO_AVAILABLE_UA", "STOPPED_NOAVAILABLEUSERAGENT":
+            return .noAvailableUserAgent
+        case "STOPPED_ACCESSRESTRICTED":
+            return .accessRestricted
+        case "STOPPED_PREPARATIONTIMEOUT":
+            return .preparationTimeout
+        case "STOPPED_PREPARATIONFAILED":
+            return .preparationFailed
+        case "STOPPED_NAVIGATION_FAILED":
+            return .preparationFailed
+        case "STOPPED_NAVIGATION_TIMEOUT":
+            return .preparationTimeout
+        case "STOPPED_COMMUNICATIONFAILURE":
+            return .communicationFailure
+        case "STOPPED_WEBVIEW_UNAVAILABLE":
+            return .communicationFailure
+        case "STOPPED_UNKNOWNALERT":
+            return .unknownAlert
+        case "STOPPED_KNOWNALERTAFTERLIMIT":
+            return .knownAlertAfterLimit
+        case "STOPPED_RETRYLIMIT":
+            return .retryLimit
+        case "STOPPED_IMAGECOUNTRESTRICTED":
+            return .imageCountRestricted
+        case "STOPPED_SUBMIT_RESPONSE_TIMEOUT", "STOPPED_SUBMITRESPONSETIMEOUT":
+            return .submitResponseTimeout
+        case "STOPPED_THREADPOSTINGUNAVAILABLE":
+            return .threadPostingUnavailable
+        case "STOPPED_THREAD_UNAVAILABLE", "STOPPED_THREADUNAVAILABLE":
+            return .threadUnavailable
+        case "STOPPED_CATALOG_REFRESH_FAILED", "STOPPED_CATALOGREFRESHFAILED":
+            return .catalogRefreshFailed
+        case "STOPPED_SCENE_RESUME_FAILED", "STOPPED_SCENERESUMEFAILED":
+            return .sceneResumeFailed
+        case "STOPPED_ISOLATED_THREAD", "STOPPED_ISOLATEDTHREAD":
+            return .isolatedThread
+        case "STOPPED_DELETED_THREAD", "STOPPED_DELETEDTHREAD":
+            return .deletedThread
+        case "STOPPED_REPEAT_DISABLED", "STOPPED_REPEATDISABLED",
+             "STOPPED_MULTI_THREAD_DISABLED":
+            return .repeatDisabled
+        case "STOPPED_PAGE_NAVIGATION":
+            return .repeatDisabled
+        default:
+            // Keep future terminal red statuses observable instead of
+            // silently losing the alarm path. Explicit user-requested and
+            // ordinary skip results are listed above and remain quiet.
+            return result.hasPrefix("STOPPED_") ? .unknownAlert : nil
         }
     }
 

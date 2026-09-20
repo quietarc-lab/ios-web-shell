@@ -163,6 +163,29 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(deleted.kind.automaticStopReason, .deletedThread)
     }
 
+    func testAutomaticFailureStopNoticeUsesPersistentAlertPath() {
+        let failure = IsolationStopNotice(
+            mode: "SAME_THREAD",
+            kind: .automaticFailure(.communicationFailure)
+        )
+
+        XCTAssertEqual(failure.kind.alertTitle, "自動投稿停止")
+        XCTAssertEqual(failure.kind.alertMessage,
+                       "通信に失敗したため自動投稿を停止しました")
+        XCTAssertEqual(failure.kind.automaticStopReason, .communicationFailure)
+        XCTAssertNil(failure.threadID)
+    }
+
+    func testOnlyUnexpectedTerminalStopsRequireUserAlert() {
+        XCTAssertTrue(AutomaticPostStopReason.communicationFailure.requiresUserAlert)
+        XCTAssertTrue(AutomaticPostStopReason.sceneResumeFailed.requiresUserAlert)
+        XCTAssertTrue(AutomaticPostStopReason.unknownAlert.requiresUserAlert)
+        XCTAssertFalse(AutomaticPostStopReason.repeatDisabled.requiresUserAlert)
+        XCTAssertFalse(AutomaticPostStopReason.threadUnavailable.requiresUserAlert)
+        XCTAssertFalse(AutomaticPostStopReason.isolatedThread.requiresUserAlert)
+        XCTAssertFalse(AutomaticPostStopReason.deletedThread.requiresUserAlert)
+    }
+
     func testMultiThreadSuccessAndContinuousAPRetryUseOneSecondBuffers() {
         XCTAssertEqual(BrowserViewModel.multiThreadSuccessWaitNanoseconds,
                        1_000_000_000)
