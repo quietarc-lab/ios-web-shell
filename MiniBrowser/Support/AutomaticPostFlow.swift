@@ -7,6 +7,7 @@ enum AutomaticPostAlert: Equatable {
     case continuousPosting
     case imageContinuousPosting
     case threadPostingUnavailable
+    case replyLimitReached
     case imageCountRestricted
 }
 
@@ -720,6 +721,12 @@ struct AutomaticPostFlowMachine {
                 return (false, stop(.unknownAlert))
             }
             return (true, skipCurrentThread(reason: .threadPostingUnavailable))
+
+        case .replyLimitReached:
+            guard isMultiThread else {
+                return (false, stop(.knownAlertAfterLimit))
+            }
+            return (true, skipCurrentThread(reason: .knownAlertAfterLimit))
 
         case .imageCountRestricted, .imageContinuousPosting:
             guard isSameThreadRepeat || isMultiThread else {

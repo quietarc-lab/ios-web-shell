@@ -95,6 +95,20 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertEqual(
             TargetPageAlertClassifier.category(
                 host: "img.2chan.net",
+                message: "上限1000レスに達しました"
+            ),
+            .replyLimitReached
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "上限1000レスに達しました。"
+            ),
+            .replyLimitReached
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
                 message: "画像の投稿が多すぎます(11枚)."
             ),
             .imageCountRestricted
@@ -141,6 +155,14 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
             message: "このスレッドには書けません"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "example.com",
+            message: "上限1000レスに達しました"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "img.2chan.net",
+            message: "上限1000レスに達しました（再試行）"
         ))
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "img.2chan.net",

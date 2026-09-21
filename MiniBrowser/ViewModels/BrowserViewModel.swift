@@ -3453,6 +3453,8 @@ final class BrowserViewModel: ObservableObject {
             alert = .imageContinuousPosting
         case .threadPostingUnavailable:
             alert = .threadPostingUnavailable
+        case .replyLimitReached:
+            alert = .replyLimitReached
         case .imageCountRestricted:
             alert = .imageCountRestricted
         }
@@ -3516,6 +3518,8 @@ final class BrowserViewModel: ObservableObject {
                 // generation and started the next eligible-UA handoff.
                 break
             case .threadPostingUnavailable:
+                break
+            case .replyLimitReached:
                 break
             case .imageCountRestricted:
                 appendAutomaticEvent(
@@ -5056,6 +5060,8 @@ final class BrowserViewModel: ObservableObject {
                     skipReason = "THREAD_UNAVAILABLE"
                 case .threadPostingUnavailable:
                     skipReason = "THREAD_POSTING_UNAVAILABLE"
+                case .knownAlertAfterLimit:
+                    skipReason = "REPLY_LIMIT"
                 default:
                     skipReason = "THREAD_UNAVAILABLE"
                 }

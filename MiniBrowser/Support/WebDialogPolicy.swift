@@ -7,6 +7,7 @@ enum TargetPageAlertCategory: String, Equatable {
     case continuousPosting = "CONTINUOUS_POSTING"
     case imageContinuousPosting = "IMAGE_CONTINUOUS_POSTING"
     case threadPostingUnavailable = "THREAD_POSTING_UNAVAILABLE"
+    case replyLimitReached = "REPLY_LIMIT_REACHED"
     case imageCountRestricted = "IMAGE_COUNT_RESTRICTED"
 }
 
@@ -51,6 +52,10 @@ enum TargetPageAlertClassifier {
         }
         if normalized == "このスレッドには書けません" {
             return .threadPostingUnavailable
+        }
+        if normalized == "上限1000レスに達しました" ||
+            normalized == "上限1000レスに達しました。" {
+            return .replyLimitReached
         }
         if normalized.range(of: #"^画像の投稿が多すぎます\([0-9]+枚\)[。.]$"#,
                             options: .regularExpression) != nil {
