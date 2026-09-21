@@ -3,6 +3,10 @@ import XCTest
 
 @MainActor
 final class StopAlertFeedbackControllerTests: XCTestCase {
+    func testFeedbackUsesStrongImpactAtExistingCadence() {
+        XCTAssertEqual(StopAlertFeedbackController.interval, 2)
+    }
+
     func testFeedbackStartsOnceAndStopsCleanly() {
         let controller = StopAlertFeedbackController()
 

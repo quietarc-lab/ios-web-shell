@@ -15,7 +15,10 @@ final class StopAlertFeedbackController: ObservableObject {
     private(set) var pulseCount = 0
     private var timer: Timer?
     private var audioPlayer: AVAudioPlayer?
-    private let haptic = UINotificationFeedbackGenerator()
+    // Notification feedback has a fixed, relatively subtle error pulse. Use
+    // the heaviest impact style at full intensity so a pending stop is easier
+    // to notice while keeping the existing two-second alarm cadence.
+    private let haptic = UIImpactFeedbackGenerator(style: .heavy)
 
     func startIfNeeded() {
         guard !isActive else { return }
@@ -47,7 +50,7 @@ final class StopAlertFeedbackController: ObservableObject {
         guard isActive else { return }
         pulseCount += 1
         haptic.prepare()
-        haptic.notificationOccurred(.error)
+        haptic.impactOccurred(intensity: 1.0)
         audioPlayer?.stop()
         audioPlayer?.currentTime = 0
         audioPlayer?.play()
