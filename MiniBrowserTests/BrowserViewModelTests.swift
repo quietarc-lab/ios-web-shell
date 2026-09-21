@@ -152,6 +152,7 @@ final class BrowserViewModelTests: XCTestCase {
     func testModerationStopNoticeUsesReasonSpecificMessages() {
         let isolated = IsolationStopNotice(threadID: "123", mode: "SAME_THREAD")
         XCTAssertEqual(isolated.kind, .isolated)
+        XCTAssertEqual(isolated.kind.alertTitle, "隔離検知")
         XCTAssertEqual(isolated.kind.alertMessage,
                        "隔離検知のため自動投稿を停止しました")
         XCTAssertEqual(isolated.kind.automaticStopReason, .isolatedThread)
@@ -163,6 +164,33 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(deleted.kind.alertMessage,
                        "削除検知のため自動投稿を停止しました")
         XCTAssertEqual(deleted.kind.automaticStopReason, .deletedThread)
+    }
+
+    func testModerationMatchKeepsIsolationDistinctWhenFeedRowsOverlap() {
+        let isolated = BrowserViewModel.moderationMatch(
+            targetThreadIDs: ["123", "456"],
+            snapshot: ModerationThreadSnapshot(
+                isolatedIDs: ["123"],
+                deletedIDs: ["123", "456"]
+            )
+        )
+        XCTAssertEqual(isolated?.threadID, "123")
+        XCTAssertEqual(isolated?.kind, .isolated)
+
+        let deleted = BrowserViewModel.moderationMatch(
+            targetThreadIDs: ["789"],
+            snapshot: ModerationThreadSnapshot(
+                isolatedIDs: [],
+                deletedIDs: ["789"]
+            )
+        )
+        XCTAssertEqual(deleted?.threadID, "789")
+        XCTAssertEqual(deleted?.kind, .deleted)
+
+        XCTAssertNil(BrowserViewModel.moderationMatch(
+            targetThreadIDs: ["000"],
+            snapshot: ModerationThreadSnapshot.empty
+        ))
     }
 
     func testAutomaticFailureStopNoticeUsesPersistentAlertPath() {

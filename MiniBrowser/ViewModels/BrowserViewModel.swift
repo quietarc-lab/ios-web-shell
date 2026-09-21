@@ -1962,25 +1962,16 @@ final class BrowserViewModel: ObservableObject {
                   currentIsolationMonitorContext() == context else {
                 return
             }
-            guard let matchedDeletedID = context.targetThreadIDs
-                .intersection(moderationSnapshot.deletedIDs)
-                .sorted()
-                .first else {
-                if let matchedIsolatedID = context.targetThreadIDs
-                    .intersection(moderationSnapshot.isolatedIDs)
-                    .sorted()
-                    .first {
-                    handleModerationDetected(context: context,
-                                             threadID: matchedIsolatedID,
-                                             kind: .isolated)
-                } else {
-                    isolationMonitorFailureLogged = false
-                }
+            guard let match = Self.moderationMatch(
+                targetThreadIDs: context.targetThreadIDs,
+                snapshot: moderationSnapshot
+            ) else {
+                isolationMonitorFailureLogged = false
                 return
             }
             handleModerationDetected(context: context,
-                                     threadID: matchedDeletedID,
-                                     kind: .deleted)
+                                     threadID: match.threadID,
+                                     kind: match.kind)
         } catch is CancellationError {
             return
         } catch {
@@ -2000,6 +1991,29 @@ final class BrowserViewModel: ObservableObject {
                 ]
             )
         }
+    }
+
+    /// Resolves a feed match without allowing a conflicting snapshot to turn
+    /// an isolation stop into a deletion notice. The feed normally keeps the
+    /// two sets disjoint; isolation is checked first as the more specific
+    /// moderation state when stale/duplicate rows overlap.
+    static func moderationMatch(
+        targetThreadIDs: Set<String>,
+        snapshot: ModerationThreadSnapshot
+    ) -> (threadID: String, kind: ModerationStopKind)? {
+        if let threadID = targetThreadIDs
+            .intersection(snapshot.isolatedIDs)
+            .sorted()
+            .first {
+            return (threadID, .isolated)
+        }
+        if let threadID = targetThreadIDs
+            .intersection(snapshot.deletedIDs)
+            .sorted()
+            .first {
+            return (threadID, .deleted)
+        }
+        return nil
     }
 
     private func handleModerationDetected(context: IsolationMonitorContext,
