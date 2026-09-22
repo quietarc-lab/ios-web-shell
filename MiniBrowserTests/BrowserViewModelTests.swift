@@ -221,6 +221,8 @@ final class BrowserViewModelTests: XCTestCase {
                        1_000_000_000)
         XCTAssertEqual(BrowserViewModel.continuousAPRetryDelayNanoseconds,
                        1_000_000_000)
+        XCTAssertEqual(BrowserViewModel.automaticAPCallbackTimeoutNanoseconds,
+                       20_000_000_000)
         XCTAssertEqual(AutomaticPostFlowMachine.continuousAPReconnectAttemptLimit, 3)
     }
 

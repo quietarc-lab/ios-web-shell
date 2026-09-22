@@ -175,6 +175,8 @@ Assert-Contains $viewModelFile 'OWN_RESPONSE_TIMEOUT' 'automatic own-response ti
 Assert-Contains $viewModelFile 'EVENT_SEQ' 'automatic event ordering metadata'
 Assert-Contains $viewModelFile 'ELAPSED_MS' 'automatic elapsed-time metadata'
 Assert-Contains $viewModelFile 'AP_PURPOSE' 'AP purpose logging'
+Assert-Contains $viewModelFile 'RECONNECT_CALLBACK_TIMEOUT' 'automatic AP callback timeout diagnostics'
+Assert-Contains $viewModelFile 'automaticAPCallbackTimeoutNanoseconds' 'automatic AP callback watchdog'
 Assert-Contains $viewModelFile 'COOKIE_SAMPLE_PHASE' 'Cookie sample phase logging'
 Assert-Contains $viewModelFile 'nextEligibleUserAgentIndex' 'restricted-UA rotation'
 Assert-Contains $uaRestrictionFile '7 \* 24 \* 60 \* 60' 'seven-day UA restriction duration'

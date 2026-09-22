@@ -77,6 +77,10 @@ final class BrowserViewModel: ObservableObject {
     static let sameUserAgentMultiThreadSubmitDelayNanoseconds: UInt64 = 500_000_000
     static let multiThreadSuccessWaitNanoseconds: UInt64 = 1_000_000_000
     static let continuousAPRetryDelayNanoseconds: UInt64 = 1_000_000_000
+    /// A Shortcuts x-callback URL can be accepted by iOS even when the
+    /// shortcut later fails before invoking x-error. Keep automatic posting
+    /// from waiting forever for that missing callback.
+    static let automaticAPCallbackTimeoutNanoseconds: UInt64 = 20_000_000_000
     private static let proxyErrorRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
     private static let automaticSubmitResponseTimeoutNanoseconds: UInt64 = 15_000_000_000
@@ -164,6 +168,7 @@ final class BrowserViewModel: ObservableObject {
     private var pendingCookieRefresh: PendingCookieRefresh?
     private var pendingAP: PendingAP?
     private var pendingAPCallbackReceived = false
+    private var automaticAPCallbackTimeoutTask: Task<Void, Never>?
     /// Automatic AP opens Shortcuts and therefore causes an expected scene
     /// transition. Keep that transition separate from a user leaving the app
     /// so the active posting state is not suspended during the shortcut run.
@@ -1250,6 +1255,8 @@ final class BrowserViewModel: ObservableObject {
     private func startCellularReconnect(reloadAfterCompletion: Bool,
                                         purpose: APPurpose) {
         guard !isAPRunning else { return }
+        automaticAPCallbackTimeoutTask?.cancel()
+        automaticAPCallbackTimeoutTask = nil
         isAPRunning = true
         pendingAPCallbackReceived = false
         if case .manual = purpose {
@@ -1264,9 +1271,16 @@ final class BrowserViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             let before = try? await ipService.fetchIPv4(userAgent: effectiveUserAgent)
-            self.pendingAP = PendingAP(beforeIPv4: before,
-                                       reloadAfterCompletion: reloadAfterCompletion,
-                                       purpose: purpose)
+            guard self.isAPRunning,
+                  self.pendingAP == nil,
+                  self.isCurrentAPPurpose(purpose) else {
+                return
+            }
+            let context = PendingAP(beforeIPv4: before,
+                                    reloadAfterCompletion: reloadAfterCompletion,
+                                    purpose: purpose)
+            self.pendingAP = context
+            self.scheduleAutomaticAPCallbackTimeout(for: context)
             if let generationID = Self.appPurposeGenerationID(purpose),
                self.appSceneIsActive,
                (self.sceneAPResumeRetryUsedGenerations.contains(generationID) ||
@@ -1286,6 +1300,14 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
         }
+    }
+
+    private func isCurrentAPPurpose(_ purpose: APPurpose) -> Bool {
+        guard let generationID = Self.appPurposeGenerationID(purpose) else {
+            return true
+        }
+        return automaticPostMachine.generationID == generationID &&
+            !automaticFinishedGenerations.contains(generationID)
     }
 
     func openBookmark(_ item: BookmarkItem) {
@@ -1778,6 +1800,43 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    private func scheduleAutomaticAPCallbackTimeout(for context: PendingAP) {
+        guard let generationID = Self.appPurposeGenerationID(context.purpose) else {
+            return
+        }
+        automaticAPCallbackTimeoutTask?.cancel()
+        automaticAPCallbackTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.automaticAPCallbackTimeoutNanoseconds)
+            guard let self,
+                  !Task.isCancelled,
+                  self.appSceneIsActive,
+                  self.isAPRunning,
+                  !self.pendingAPCallbackReceived,
+                  self.pendingAP == context,
+                  self.automaticPostMachine.generationID == generationID,
+                  !self.automaticFinishedGenerations.contains(generationID) else {
+                return
+            }
+            self.automaticAPCallbackTimeoutTask = nil
+            self.appendAutomaticEvent(
+                generationID: generationID,
+                phase: "AP",
+                event: "RECONNECT_CALLBACK_TIMEOUT",
+                result: "FAILED",
+                fields: [
+                    ("REASON", "SHORTCUT_CALLBACK_MISSING"),
+                    ("TIMEOUT_MS", String(Self.automaticAPCallbackTimeoutNanoseconds / 1_000_000))
+                ]
+            )
+            self.finishAPFailure(
+                status: "CALLBACK_TIMEOUT",
+                before: context.beforeIPv4,
+                reloadAfterCompletion: context.reloadAfterCompletion,
+                purpose: context.purpose
+            )
+        }
+    }
+
     private func scheduleAPResumeRetryIfNeeded(generationID: UInt64) {
         guard let pendingAP,
               Self.appPurposeGenerationID(pendingAP.purpose) == generationID,
@@ -1816,6 +1875,8 @@ final class BrowserViewModel: ObservableObject {
             let reload = current.reloadAfterCompletion
             self.pendingAP = nil
             self.pendingAPCallbackReceived = false
+            self.automaticAPCallbackTimeoutTask?.cancel()
+            self.automaticAPCallbackTimeoutTask = nil
             self.isAPRunning = false
             self.startCellularReconnect(reloadAfterCompletion: reload,
                                         purpose: purpose)
@@ -3551,6 +3612,8 @@ final class BrowserViewModel: ObservableObject {
         }
 
         pendingAPCallbackReceived = true
+        automaticAPCallbackTimeoutTask?.cancel()
+        automaticAPCallbackTimeoutTask = nil
         sceneAPResumeRetryTask?.cancel()
         sceneAPResumeRetryTask = nil
 
@@ -4150,6 +4213,8 @@ final class BrowserViewModel: ObservableObject {
         if automaticAPSceneTransition?.purpose == purpose {
             automaticAPSceneTransition = nil
         }
+        automaticAPCallbackTimeoutTask?.cancel()
+        automaticAPCallbackTimeoutTask = nil
         let result: String
         if let before, let after {
             if before == after {
@@ -4310,6 +4375,8 @@ final class BrowserViewModel: ObservableObject {
                                  before: String?,
                                  reloadAfterCompletion: Bool,
                                  purpose: APPurpose) {
+        automaticAPCallbackTimeoutTask?.cancel()
+        automaticAPCallbackTimeoutTask = nil
         if automaticAPSceneTransition?.purpose == purpose {
             automaticAPSceneTransition = nil
             automaticAPCompletionNeedsScenePause = false
@@ -4753,6 +4820,8 @@ final class BrowserViewModel: ObservableObject {
            Self.appPurposeGenerationID(pendingAP.purpose) == generationID {
             self.pendingAP = nil
             pendingAPCallbackReceived = false
+            automaticAPCallbackTimeoutTask?.cancel()
+            automaticAPCallbackTimeoutTask = nil
             isAPRunning = false
         }
         if Self.appPurposeGenerationID(automaticAPSceneTransition?.purpose ?? .manual) == generationID {
@@ -6300,6 +6369,8 @@ final class BrowserViewModel: ObservableObject {
            Self.appPurposeGenerationID(pendingAP.purpose) == generationID {
             self.pendingAP = nil
             pendingAPCallbackReceived = false
+            automaticAPCallbackTimeoutTask?.cancel()
+            automaticAPCallbackTimeoutTask = nil
             isAPRunning = false
         }
         if Self.appPurposeGenerationID(automaticAPSceneTransition?.purpose ?? .manual) == generationID {
