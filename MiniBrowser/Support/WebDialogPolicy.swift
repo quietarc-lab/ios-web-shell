@@ -65,6 +65,27 @@ enum TargetPageAlertClassifier {
     }
 }
 
+/// Classifies transient gateway responses without treating them as a site
+/// posting restriction. These statuses indicate that an intermediary could
+/// not obtain a usable response from the target server; they are safe to
+/// retry once for the same-thread flow and to skip for a multi-thread target.
+enum TargetPageProxyErrorClassifier {
+    static func isTransientHTTPStatus(_ statusCode: Int) -> Bool {
+        statusCode == 502 || statusCode == 503 || statusCode == 504
+    }
+
+    static func isProxyErrorPage(title: String?, bodyText: String?) -> Bool {
+        let normalized = [title, bodyText]
+            .compactMap { $0 }
+            .joined(separator: "\n")
+            .lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined(separator: " ")
+        return normalized.contains("proxy error") &&
+            normalized.contains("error reading from remote server")
+    }
+}
+
 enum WebDialogPolicy {
     static func shouldAutoDismissAlert(host: String?, message: String) -> Bool {
         // Site-side errors, including the target page's Cookie error, must

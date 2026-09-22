@@ -389,6 +389,27 @@ struct BrowserWebView: UIViewRepresentable {
             }
         }
 
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor navigationResponse: WKNavigationResponse,
+                     decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+            guard navigationResponse.isForMainFrame,
+                  let response = navigationResponse.response as? HTTPURLResponse,
+                  TargetPageProxyErrorClassifier.isTransientHTTPStatus(
+                      response.statusCode
+                  ),
+                  CanvasImageSessionService.isTargetPageThreadURL(response.url) else {
+                decisionHandler(.allow)
+                return
+            }
+
+            let handled = model.handleProxyNavigationFailure(
+                url: response.url,
+                statusCode: response.statusCode,
+                source: "HTTP_STATUS"
+            )
+            decisionHandler(handled ? .cancel : .allow)
+        }
+
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             startTimeout(for: webView)
             currentPageToken = nil
@@ -401,7 +422,36 @@ struct BrowserWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             cancelTimeout()
-            model.navigationFinished(url: webView.url)
+            let finishedURL = webView.url
+            guard let finishedURL,
+                  CanvasImageSessionService.isTargetPageThreadURL(finishedURL) else {
+                model.navigationFinished(url: finishedURL)
+                return
+            }
+
+            // Some gateways render their proxy error page with a successful
+            // document status. Inspect only the page shape and pass a Boolean
+            // to the model; never expose the returned text to diagnostics.
+            webView.evaluateJavaScript(
+                CompactPageModeService.proxyErrorDetectionScript
+            ) { [weak self, weak webView] result, error in
+                Task { @MainActor in
+                    guard let self, let webView,
+                          webView.url == finishedURL else { return }
+                    let proxyErrorDetected = (result as? Bool) ??
+                        (result as? NSNumber)?.boolValue ?? false
+                    if error == nil,
+                       proxyErrorDetected,
+                       self.model.handleProxyNavigationFailure(
+                           url: finishedURL,
+                           statusCode: nil,
+                           source: "PAGE_BODY"
+                       ) {
+                        return
+                    }
+                    self.model.navigationFinished(url: finishedURL)
+                }
+            }
         }
 
         func webView(_ webView: WKWebView,

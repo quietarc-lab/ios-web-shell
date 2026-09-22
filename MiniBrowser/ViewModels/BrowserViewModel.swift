@@ -77,6 +77,7 @@ final class BrowserViewModel: ObservableObject {
     static let sameUserAgentMultiThreadSubmitDelayNanoseconds: UInt64 = 500_000_000
     static let multiThreadSuccessWaitNanoseconds: UInt64 = 1_000_000_000
     static let continuousAPRetryDelayNanoseconds: UInt64 = 1_000_000_000
+    private static let proxyErrorRetryDelayNanoseconds: UInt64 = 1_000_000_000
     private static let continuousAPMinimumIntervalNanoseconds: UInt64 = 3_100_000_000
     private static let automaticSubmitResponseTimeoutNanoseconds: UInt64 = 15_000_000_000
     /// Futapo's isolation feed is polled only while the automatic session is
@@ -188,6 +189,15 @@ final class BrowserViewModel: ObservableObject {
     private var automaticSubmissionSequence: UInt64 = 0
     private var pendingUAChangeGeneration: UInt64?
     private var automaticReloadGeneration: UInt64?
+    /// A proxy error is retried at most once for one automatic generation and
+    /// one target URL. The context is generation-scoped so a UA handoff or a
+    /// next-thread transition starts with a fresh retry allowance.
+    private struct AutomaticProxyErrorRetryContext: Equatable {
+        let generationID: UInt64
+        let pageURL: URL
+    }
+    private var automaticProxyErrorRetryContext: AutomaticProxyErrorRetryContext?
+    private var automaticProxyErrorRetryTask: Task<Void, Never>?
     private var automaticPostPreparationTimer: Task<Void, Never>?
     private var automaticSubmitReadinessTask: Task<Void, Never>?
     private var automaticSubmitResponseTimer: Task<Void, Never>?
@@ -2834,6 +2844,141 @@ final class BrowserViewModel: ObservableObject {
         refreshNavigationState()
     }
 
+    /// Handles a gateway/proxy error page before it can be mistaken for a
+    /// normal TargetPage document. Multi-thread sessions discard that target
+    /// and continue; a same-thread session gets one bounded reload and then
+    /// uses the existing communication-failure stop path.
+    @discardableResult
+    func handleProxyNavigationFailure(url: URL?,
+                                      statusCode: Int?,
+                                      source: String) -> Bool {
+        guard let url, Self.isTargetThreadURL(url) else { return false }
+
+        if let session = multiThreadSession,
+           let target = session.currentTarget,
+           Self.sameTargetThreadURL(url, target.threadURL) {
+            cancelAutomaticProxyErrorRetry()
+            appendAutomaticEvent(
+                generationID: session.currentGenerationID ?? automaticPostGeneration,
+                phase: "NAVIGATION",
+                event: "PROXY_ERROR",
+                result: "SKIP_TARGET",
+                fields: [
+                    ("SOURCE", source),
+                    ("STATUS_CODE", statusCode.map(String.init) ?? "UNAVAILABLE"),
+                    ("REASON", "UPSTREAM_RESPONSE_INVALID")
+                ]
+            )
+            if let pending = pendingMultiThreadNavigation,
+               pending.sessionID == session.sessionID,
+               pending.target.id == target.id {
+                skipPendingMultiThreadTargetWithoutGeneration(
+                    sessionID: session.sessionID,
+                    target: target,
+                    reason: "PROXY_ERROR"
+                )
+                return true
+            }
+            if let generationID = automaticPostMachine.generationID,
+               automaticPostMachine.isActive,
+               automaticPostMachine.isMultiThread,
+               session.currentGenerationID == generationID {
+                skipActiveMultiThreadTarget(
+                    generationID: generationID,
+                    reason: "PROXY_ERROR"
+                )
+                return true
+            }
+            // A bootstrap or unbound destination can still be skipped without
+            // creating a page generation; the session will select the next
+            // candidate through its existing transition path.
+            skipPendingMultiThreadTargetWithoutGeneration(
+                sessionID: session.sessionID,
+                target: target,
+                reason: "PROXY_ERROR"
+            )
+            return true
+        }
+
+        guard let generationID = automaticPostMachine.generationID,
+              automaticPostMachine.isActive,
+              !automaticPostMachine.isMultiThread,
+              Self.sameTargetThreadURL(url, webView?.url ?? currentURL) else {
+            return false
+        }
+
+        let context = AutomaticProxyErrorRetryContext(
+            generationID: generationID,
+            pageURL: url
+        )
+        guard automaticProxyErrorRetryContext != context else {
+            automaticProxyErrorRetryTask?.cancel()
+            automaticProxyErrorRetryTask = nil
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "NAVIGATION",
+                event: "PROXY_ERROR_RETRY_EXHAUSTED",
+                result: "STOPPED",
+                fields: [
+                    ("SOURCE", source),
+                    ("STATUS_CODE", statusCode.map(String.init) ?? "UNAVAILABLE"),
+                    ("REASON", "SECOND_FAILURE")
+                ]
+            )
+            stopAutomaticPost(.communicationFailure, generationID: generationID)
+            return true
+        }
+
+        automaticProxyErrorRetryContext = context
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "NAVIGATION",
+            event: "PROXY_ERROR_RETRY_SCHEDULED",
+            result: "RETRYING",
+            fields: [
+                ("SOURCE", source),
+                ("STATUS_CODE", statusCode.map(String.init) ?? "UNAVAILABLE"),
+                ("DELAY_MS", String(Self.proxyErrorRetryDelayNanoseconds / 1_000_000))
+            ]
+        )
+        automaticProxyErrorRetryTask?.cancel()
+        automaticProxyErrorRetryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: Self.proxyErrorRetryDelayNanoseconds)
+            guard let self,
+                  !Task.isCancelled,
+                  self.appSceneIsActive,
+                  self.automaticPostMachine.generationID == generationID,
+                  self.automaticPostMachine.isActive,
+                  self.automaticProxyErrorRetryContext == context,
+                  Self.sameTargetThreadURL(self.webView?.url, url) else {
+                return
+            }
+            self.automaticProxyErrorRetryTask = nil
+            self.automaticReloadGeneration = generationID
+            self.appendAutomaticEvent(
+                generationID: generationID,
+                phase: "NAVIGATION",
+                event: "PROXY_ERROR_RETRY_STARTED",
+                result: "STARTED",
+                fields: [("DELAY_MS", String(Self.proxyErrorRetryDelayNanoseconds / 1_000_000))]
+            )
+            guard self.webView?.reload() != nil else {
+                self.automaticReloadGeneration = nil
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "NAVIGATION",
+                    event: "PROXY_ERROR_RETRY_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "RELOAD_NOT_STARTED")]
+                )
+                self.stopAutomaticPost(.communicationFailure,
+                                        generationID: generationID)
+                return
+            }
+        }
+        return true
+    }
+
     func navigationFinished(url: URL?) {
         isLoading = false
         if !isIdentityRefreshInProgress {
@@ -3301,6 +3446,18 @@ final class BrowserViewModel: ObservableObject {
         updateCurrentURL(url)
         refreshNavigationState()
         if !appSceneIsActive, automaticScenePauseContext != nil {
+            return
+        }
+        // WKWebView may surface a gateway response as
+        // NSURLErrorBadServerResponse instead of delivering a navigation
+        // response policy callback. Keep the same bounded proxy recovery in
+        // that case; other network failures retain their existing handling.
+        if (error as NSError).code == NSURLErrorBadServerResponse,
+           handleProxyNavigationFailure(
+               url: url,
+               statusCode: nil,
+               source: "NAVIGATION_ERROR"
+           ) {
             return
         }
         showToast("読み込み失敗", kind: .failure)
@@ -4586,6 +4743,7 @@ final class BrowserViewModel: ObservableObject {
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
         cancelAutomaticContinuousAPRetryDelay()
+        cancelAutomaticProxyErrorRetry()
         automaticReloadGeneration = nil
         if pendingCookieRefresh?.automaticGenerationID == generationID {
             pendingCookieRefresh = nil
@@ -4862,6 +5020,7 @@ final class BrowserViewModel: ObservableObject {
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = nil
         cancelAutomaticContinuousAPRetryDelay()
+        cancelAutomaticProxyErrorRetry()
         pendingMultiThreadNavigation = nil
         pendingMultiThreadAvailabilityProbe = nil
         pendingMultiThreadUnavailable = nil
@@ -6066,6 +6225,7 @@ final class BrowserViewModel: ObservableObject {
         sceneAPResumeRetryTask = nil
         sceneAPResumeRetryUsedGenerations.remove(generationID)
         defer { updateIdleTimerState() }
+        cancelAutomaticProxyErrorRetry()
         automaticPostPreparationTimer?.cancel()
         automaticPostPreparationTimer = nil
         cancelAutomaticSubmitResponseTimer()
@@ -6183,6 +6343,12 @@ final class BrowserViewModel: ObservableObject {
         updateIdleTimerState()
     }
 
+    private func cancelAutomaticProxyErrorRetry() {
+        automaticProxyErrorRetryTask?.cancel()
+        automaticProxyErrorRetryTask = nil
+        automaticProxyErrorRetryContext = nil
+    }
+
     private func updateIdleTimerState() {
         let shouldDisable = IdleTimerPolicy.shouldDisableIdleTimer(
             appIsActive: appSceneIsActive,
@@ -6220,6 +6386,7 @@ final class BrowserViewModel: ObservableObject {
     }
 
     private func beginAutomaticGenerationLogging(generationID: UInt64) {
+        cancelAutomaticProxyErrorRetry()
         automaticGenerationStartedAt[generationID] = Date()
         automaticFinishedGenerations.remove(generationID)
         // Keep the exactly-once tombstone set bounded while retaining enough

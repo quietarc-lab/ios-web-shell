@@ -939,6 +939,22 @@ enum CompactPageModeService {
     })();
     """#)
 
+    /// Read-only fallback for servers that return an HTTP 200 wrapper around
+    /// their proxy error page. The native side receives only a Boolean; the
+    /// page text is never logged or persisted.
+    static let proxyErrorDetectionScript = PageMarkerNamespace.neutralize(#"""
+    (() => {
+      "use strict";
+      const title = String(document.title || "");
+      const body = document.body ? String(document.body.innerText || "") : "";
+      const normalized = (title + "\n" + body)
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+      return normalized.includes("proxy error") &&
+        normalized.includes("error reading from remote server");
+    })();
+    """#)
+
     /// Read-only navigation guard used by multi-thread posting. A dropped or
     /// expired thread can still finish with a target-page URL while omitting
     /// the thread container and reply form. This probe deliberately reports

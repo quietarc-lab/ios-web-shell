@@ -185,4 +185,22 @@ final class WebDialogPolicyTests: XCTestCase {
             message: "画像の投稿が多すぎます(11枚)."
         ))
     }
+
+    func testProxyErrorsAreLimitedToTransientGatewayResponses() {
+        XCTAssertTrue(TargetPageProxyErrorClassifier.isTransientHTTPStatus(502))
+        XCTAssertTrue(TargetPageProxyErrorClassifier.isTransientHTTPStatus(503))
+        XCTAssertTrue(TargetPageProxyErrorClassifier.isTransientHTTPStatus(504))
+        XCTAssertFalse(TargetPageProxyErrorClassifier.isTransientHTTPStatus(500))
+        XCTAssertFalse(TargetPageProxyErrorClassifier.isTransientHTTPStatus(403))
+
+        XCTAssertTrue(TargetPageProxyErrorClassifier.isProxyErrorPage(
+            title: "Proxy Error",
+            bodyText: "The proxy server received an invalid response. " +
+                "Reason: Error reading from remote server"
+        ))
+        XCTAssertFalse(TargetPageProxyErrorClassifier.isProxyErrorPage(
+            title: "img.2chan.net のメッセージ",
+            bodyText: "連続投稿はしばらく時間を置いてからお願い致します"
+        ))
+    }
 }

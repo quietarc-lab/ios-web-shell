@@ -113,6 +113,11 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(availabilityScript.contains("eligible"))
         XCTAssertFalse(availabilityScript.contains("form.submit"))
 
+        let proxyScript = CompactPageModeService.proxyErrorDetectionScript
+        XCTAssertTrue(proxyScript.contains("proxy error"))
+        XCTAssertTrue(proxyScript.contains("error reading from remote server"))
+        XCTAssertFalse(proxyScript.contains("innerHTML"))
+
         let restoreScript = try XCTUnwrap(
             CompactPageModeService.restoreAutomaticDraftScript(comment: "保存本文")
         )
