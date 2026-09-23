@@ -96,6 +96,7 @@ protocol AutomaticCatalogProvider: AnyObject {
     func endAutomaticSortDisplay()
     func excludeThread(id: String)
     func markThreadRead(id: String)
+    func resetOpenHistory()
 }
 
 /// Keep existing test and integration providers source-compatible while the
@@ -118,6 +119,7 @@ extension AutomaticCatalogProvider {
     func endAutomaticSortDisplay() {}
     func excludeThread(id: String) {}
     func markThreadRead(id: String) {}
+    func resetOpenHistory() {}
 }
 
 /// Session state is intentionally independent from a page-level generation.

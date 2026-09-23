@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import assert from "node:assert/strict";
 
 const projectRoot = process.argv[2];
 if (!projectRoot) {
@@ -14,7 +15,9 @@ const sources = [
   ["MiniBrowser/Services/CompactPageModeService.swift", "autoSubmitScript"],
   ["MiniBrowser/Services/CanvasImageSessionService.swift", "scriptSource"],
   ["MiniBrowser/Services/CanvasImageSessionService.swift", "openExistingCanvasScript"],
-  ["MiniBrowser/Services/InputAutoZoomPreventionService.swift", "scriptSource"]
+  ["MiniBrowser/Services/InputAutoZoomPreventionService.swift", "scriptSource"],
+  ["MiniBrowser/Services/IsolationThreadMonitor.swift", "sourceThreadMonitorScript"],
+  ["MiniBrowser/Services/IsolationThreadMonitor.swift", "replacementStarterImageCaptureScript"]
 ];
 
 const generatedSources = [
@@ -88,4 +91,99 @@ for (const [relativePath, functionName] of generatedSources) {
   }
 }
 
-console.log(`Injected JavaScript syntax checks passed (${sources.length + generatedSources.length} scripts).`);
+function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
+  const monitorFile = path.join(projectRoot, "MiniBrowser/Services/IsolationThreadMonitor.swift");
+  const monitor = rawSwiftScript(monitorFile, "sourceThreadMonitorScript")
+    .replaceAll("miniBrowserHandwriting", "contentBridge")
+    .replaceAll("__miniBrowserPageToken", "__pageSessionToken")
+    .replaceAll("__miniBrowserInputAutoZoomPreventionInstalled", "__inputAutoZoomInstalled")
+    .replaceAll("minibrowser", "pagehelper");
+  const messages = [];
+  let mutationCallback = null;
+  let intervalCallback = null;
+  const container = { innerText: renderedText, parentElement: null };
+  const anchor = {
+    href,
+    innerText: href,
+    textContent: href,
+    parentElement: container
+  };
+  const previousGlobals = new Map();
+  for (const name of ["window", "document", "location", "MutationObserver", "setInterval", "clearInterval"]) {
+    previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+  }
+  globalThis.window = {
+    __pageSessionToken: "fixture-page-token",
+    webkit: { messageHandlers: { contentBridge: { postMessage: message => messages.push(message) } } }
+  };
+  globalThis.location = { href: "https://img.2chan.net/b/res/1234567890.htm" };
+  globalThis.document = {
+    querySelectorAll: selector => selector === "a[href]" ? [anchor] : [],
+    documentElement: {},
+    body: { innerText: renderedText }
+  };
+  globalThis.MutationObserver = class {
+    constructor(callback) { mutationCallback = callback; }
+    observe() {}
+    disconnect() {}
+  };
+  globalThis.setInterval = callback => { intervalCallback = callback; return 1; };
+  globalThis.clearInterval = () => {};
+
+  try {
+    new Function(monitor)();
+    if (options.updatedRenderedText !== undefined) {
+      container.innerText = options.updatedRenderedText;
+      mutationCallback?.();
+    }
+    for (let tick = 0; tick < (options.ticks ?? 0); tick += 1) intervalCallback?.();
+    return messages;
+  } finally {
+    for (const [name, descriptor] of previousGlobals) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete globalThis[name];
+    }
+  }
+}
+
+const nextURL = "https://img.2chan.net/b/res/1471234519.htm";
+assert.equal(
+  runNextLinkFixture(projectRoot, `次\n${nextURL}`, nextURL)[0]?.threadURL,
+  nextURL,
+  "a URL on the line immediately after 次 should be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `> 次\n${nextURL}`, nextURL)[0]?.threadURL,
+  nextURL,
+  "the same two-line link inside a quoted reply should be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `説明\n次のスレ\n${nextURL}`, nextURL).length,
+  0,
+  "a different line between 次 and the URL must not be treated as a next link"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `次\n\n${nextURL}`, nextURL).length,
+  0,
+  "a blank line between 次 and the URL must not be treated as immediate"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `次\n${nextURL}`, "https://img.2chan.net/c/res/1471234519.htm")
+    .length,
+  0,
+  "a URL without /b/res/ must not be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, {
+    updatedRenderedText: `次\n${nextURL}`
+  })[0]?.threadURL,
+  nextURL,
+  "a next link inserted after initial page load should be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, { ticks: 240 })[0]?.type,
+  "isolationRecoveryNoCandidate",
+  "a bounded monitor with no next link should report a terminal no-candidate result"
+);
+
+console.log(`Injected JavaScript syntax and next-link fixture checks passed (${sources.length + generatedSources.length} scripts).`);

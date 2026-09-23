@@ -124,10 +124,76 @@ struct BrowserWebView: UIViewRepresentable {
                 }
                 model.setHandwritingImageAvailable(handwritingImageStore.hasImage)
 
+            case "isolationRecoveryCandidate":
+                guard let pageToken else {
+                    model.recordAutomaticBridgeIgnored(
+                        type: type,
+                        reason: "MISSING_PAGE_TOKEN"
+                    )
+                    return
+                }
+                let candidateURL = (body["threadURL"] as? String)
+                    .flatMap { URL(string: $0) }
+                model.handleIsolationRecoveryCandidate(
+                    pageToken: pageToken,
+                    pageURL: message.frameInfo.request.url ?? attachedWebView?.url,
+                    candidateURL: candidateURL
+                )
+
+            case "isolationRecoveryNoCandidate":
+                guard let pageToken else {
+                    model.recordAutomaticBridgeIgnored(
+                        type: type,
+                        reason: "MISSING_PAGE_TOKEN"
+                    )
+                    return
+                }
+                model.handleIsolationRecoveryNoCandidate(
+                    pageToken: pageToken,
+                    pageURL: message.frameInfo.request.url ?? attachedWebView?.url
+                )
+
+            case "isolationRecoveryImage":
+                guard let pageToken,
+                      let ready = body["ready"] as? Bool else {
+                    model.recordAutomaticBridgeInvalidPayload(
+                        type: type,
+                        reason: "RECOVERY_IMAGE_PAYLOAD_INVALID"
+                    )
+                    return
+                }
+                let pageURL = message.frameInfo.request.url ?? attachedWebView?.url
+                guard model.isolationRecoveryImageIsExpected(pageToken: pageToken,
+                                                              pageURL: pageURL) else {
+                    model.recordAutomaticBridgeIgnored(
+                        type: type,
+                        reason: "RECOVERY_CONTEXT_MISMATCH"
+                    )
+                    return
+                }
+                if ready,
+                   let dataURL = body["dataURL"] as? String,
+                   handwritingImageStore.replace(withDataURL: dataURL) {
+                    model.setHandwritingImageAvailable(true)
+                    model.handleIsolationRecoveryImageCaptured(
+                        pageToken: pageToken,
+                        pageURL: pageURL,
+                        ready: true
+                    )
+                } else {
+                    model.handleIsolationRecoveryImageCaptured(
+                        pageToken: pageToken,
+                        pageURL: pageURL,
+                        ready: false
+                    )
+                }
+
             case "pageReady":
                 if let pageToken {
                     currentPageToken = pageToken
                 }
+                let pageURL = message.frameInfo.request.url ?? attachedWebView?.url
+                guard !model.isIsolationRecoveryPage(pageURL) else { return }
                 guard handwritingImageStore.hasImage else { return }
                 attachedWebView?.evaluateJavaScript(CanvasImageSessionService.openExistingCanvasScript)
 
@@ -143,6 +209,7 @@ struct BrowserWebView: UIViewRepresentable {
                     return
                 }
                 let canvasPageURL = message.frameInfo.request.url ?? attachedWebView?.url
+                guard !model.isIsolationRecoveryPage(canvasPageURL) else { return }
                 let preparationGenerationID = model.handwritingPreparationGenerationID(
                     pageToken: pageToken,
                     pageURL: canvasPageURL
@@ -426,6 +493,7 @@ struct BrowserWebView: UIViewRepresentable {
             guard let finishedURL,
                   CanvasImageSessionService.isTargetPageThreadURL(finishedURL) else {
                 model.navigationFinished(url: finishedURL)
+                evaluateIsolationRecoveryScriptIfNeeded(on: webView, url: finishedURL)
                 return
             }
 
@@ -450,6 +518,8 @@ struct BrowserWebView: UIViewRepresentable {
                         return
                     }
                     self.model.navigationFinished(url: finishedURL)
+                    self.evaluateIsolationRecoveryScriptIfNeeded(on: webView,
+                                                                 url: finishedURL)
                 }
             }
         }
@@ -616,6 +686,17 @@ struct BrowserWebView: UIViewRepresentable {
         private func cancelTimeout() {
             timeoutTimer?.invalidate()
             timeoutTimer = nil
+        }
+
+        private func evaluateIsolationRecoveryScriptIfNeeded(on webView: WKWebView,
+                                                             url: URL?) {
+            guard let script = model.isolationRecoveryScript(for: url) else { return }
+            webView.evaluateJavaScript(script) { [weak self] _, error in
+                guard let self, error != nil else { return }
+                Task { @MainActor in
+                    self.model.handleIsolationRecoveryScriptFailure()
+                }
+            }
         }
 
         private func acceptPageToken(_ token: String?) -> Bool {

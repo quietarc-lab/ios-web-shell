@@ -81,6 +81,41 @@ final class IsolationThreadMonitorTests: XCTestCase {
         )
     }
 
+    func testPostBodyReplacementChangesOnlyMatchingThreadURLs() {
+        let body = "前 https://img.2chan.net/b/res/123.htm 後 https://img.2chan.net/b/res/456.htm?x=1"
+        let replaced = IsolationThreadURLParser.replacingThreadURL(
+            inPostBody: body,
+            sourceThreadID: "123",
+            with: URL(string: "https://img.2chan.net/b/res/789.htm")!
+        )
+        XCTAssertEqual(
+            replaced,
+            "前 https://img.2chan.net/b/res/789.htm 後 https://img.2chan.net/b/res/456.htm?x=1"
+        )
+        XCTAssertNil(IsolationThreadURLParser.replacingThreadURL(
+            inPostBody: body,
+            sourceThreadID: "999",
+            with: URL(string: "https://img.2chan.net/b/res/789.htm")!
+        ))
+    }
+
+    func testIsolationRecoveryScriptsUseBoundedBridgePayloads() {
+        let monitor = IsolationRecoveryService.sourceThreadMonitorScript
+        XCTAssertTrue(monitor.contains("isolationRecoveryCandidate"))
+        XCTAssertTrue(monitor.contains("precedingLine === \"次\""))
+        XCTAssertTrue(monitor.contains("replace(/\\r\\n?/g, \"\\n\")"))
+        XCTAssertTrue(monitor.contains("isolationRecoveryNoCandidate"))
+        XCTAssertTrue(monitor.contains("MutationObserver"))
+        XCTAssertFalse(monitor.contains("innerHTML"))
+
+        let capture = IsolationRecoveryService.replacementStarterImageCaptureScript
+        XCTAssertTrue(capture.contains("isolationRecoveryImage"))
+        XCTAssertTrue(capture.contains("canvas.toDataURL"))
+        XCTAssertTrue(capture.contains("naturalWidth"))
+        XCTAssertFalse(capture.contains("form.submit"))
+        XCTAssertFalse(capture.contains("input.files"))
+    }
+
     func testThreadURLParserAcceptsHTTPAndHTTPSOnlyForBoardB() {
         XCTAssertEqual(
             IsolationThreadURLParser.threadID(

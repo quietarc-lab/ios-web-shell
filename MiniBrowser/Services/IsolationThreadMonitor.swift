@@ -53,6 +53,36 @@ enum IsolationThreadURLParser {
         })
     }
 
+    /// Replaces only exact board-B thread URL tokens for one source thread.
+    /// Surrounding prose and every other URL are retained byte-for-byte.
+    static func replacingThreadURL(inPostBody body: String,
+                                   sourceThreadID: String,
+                                   with replacementURL: URL) -> String? {
+        guard !sourceThreadID.isEmpty,
+              let replacementThreadID = threadID(from: replacementURL) else {
+            return nil
+        }
+        guard let regex = try? NSRegularExpression(pattern: bodyURLPattern) else {
+            return nil
+        }
+
+        let range = NSRange(body.startIndex..., in: body)
+        let matches = regex.matches(in: body, range: range)
+        let replaced = NSMutableString(string: body)
+        var didReplace = false
+        for match in matches.reversed() {
+            guard match.numberOfRanges > 1,
+                  let idRange = Range(match.range(at: 1), in: body),
+                  String(body[idRange]) == sourceThreadID else {
+                continue
+            }
+            let replacement = "https://img.2chan.net/b/res/\(replacementThreadID).htm"
+            replaced.replaceCharacters(in: match.range, with: replacement)
+            didReplace = true
+        }
+        return didReplace ? String(replaced) : nil
+    }
+
     /// The Futapo `img_b_isolation.txt` feed stores the thread URL before the
     /// first `<>` separator. The moderation state is field 16 (zero-based
     /// index 15): 2 means isolated and 1 means deleted. Metadata, malformed
@@ -85,6 +115,140 @@ enum IsolationThreadURLParser {
     static func threadIDs(inIsolationFeed text: String) -> Set<String> {
         moderationSnapshot(inIsolationFeed: text).isolatedIDs
     }
+}
+
+/// Scripts used only during the bounded recovery path after an isolated
+/// multi-thread target is detected. They report normalized URLs and a small
+/// starter-image data URL; page text and image bytes never enter diagnostics.
+enum IsolationRecoveryService {
+    static let sourceThreadMonitorScript = PageMarkerNamespace.neutralize(#"""
+    (() => {
+      "use strict";
+      const handler = window.webkit && window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.miniBrowserHandwriting;
+      if (!handler || window.__pageSessionIsolationRecoveryMonitorInstalled) return;
+      window.__pageSessionIsolationRecoveryMonitorInstalled = true;
+      const pageToken = typeof window.__miniBrowserPageToken === "string"
+        ? window.__miniBrowserPageToken : "";
+      const sent = new Set();
+      let pollingTicks = 0;
+      let timer = null;
+      let observer = null;
+
+      const stopMonitoring = () => {
+        if (timer !== null) clearInterval(timer);
+        if (observer) observer.disconnect();
+        timer = null;
+        observer = null;
+      };
+
+      const reportNoCandidate = () => {
+        stopMonitoring();
+        handler.postMessage({
+          type: "isolationRecoveryNoCandidate",
+          pageToken
+        });
+      };
+
+      const send = url => {
+        if (!url || sent.has(url)) return;
+        sent.add(url);
+        handler.postMessage({
+          type: "isolationRecoveryCandidate",
+          pageToken,
+          threadURL: url
+        });
+        stopMonitoring();
+      };
+
+      const hasImmediatelyPrecedingNextLine = anchor => {
+        const linkText = String(anchor.innerText || anchor.textContent || "")
+          .replace(/\s+/g, " ").trim();
+        if (!linkText) return false;
+
+        let container = anchor.parentElement;
+        for (let depth = 0; container && depth < 6; depth += 1) {
+          const renderedText = String(container.innerText || "").replace(/\r\n?/g, "\n");
+          const lines = renderedText.split("\n");
+          const linkLineIndex = lines.findIndex(line => line.includes(linkText));
+          if (linkLineIndex > 0) {
+            const precedingLine = String(lines[linkLineIndex - 1] || "")
+              .trim().replace(/^>\s*/, "");
+            if (precedingLine === "次") return true;
+          }
+          container = container.parentElement;
+        }
+        return false;
+      };
+
+      const inspect = () => {
+        const anchors = Array.from(document.querySelectorAll("a[href]"));
+        for (const anchor of anchors) {
+          let url;
+          try { url = new URL(anchor.href, location.href); } catch (_) { continue; }
+          if (url.hostname.toLowerCase() !== "img.2chan.net" ||
+              !/^\/b\/res\/\d+\.htm$/.test(url.pathname)) continue;
+          if (hasImmediatelyPrecedingNextLine(anchor)) {
+            send(url.origin + url.pathname + url.search + url.hash);
+            return;
+          }
+        }
+      };
+
+      observer = new MutationObserver(inspect);
+      observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+      timer = setInterval(() => {
+        inspect();
+        pollingTicks += 1;
+        if (pollingTicks >= 240) reportNoCandidate();
+      }, 500);
+      inspect();
+    })();
+    """#)
+
+    static let replacementStarterImageCaptureScript = PageMarkerNamespace.neutralize(#"""
+    (() => {
+      "use strict";
+      const handler = window.webkit && window.webkit.messageHandlers &&
+        window.webkit.messageHandlers.miniBrowserHandwriting;
+      if (!handler || window.__pageSessionIsolationRecoveryImageCaptureInstalled) return;
+      window.__pageSessionIsolationRecoveryImageCaptureInstalled = true;
+      const pageToken = typeof window.__miniBrowserPageToken === "string"
+        ? window.__miniBrowserPageToken : "";
+      let attempts = 0;
+      const finish = (ready, dataURL) => {
+        handler.postMessage({
+          type: "isolationRecoveryImage",
+          pageToken,
+          ready: Boolean(ready),
+          dataURL: typeof dataURL === "string" ? dataURL : ""
+        });
+      };
+      const capture = () => {
+        attempts += 1;
+        const image = document.querySelector("#minibrowser-targetpage-starter img");
+        if (!(image instanceof HTMLImageElement) ||
+            !image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) {
+          if (attempts < 100) setTimeout(capture, 100);
+          else finish(false, "");
+          return;
+        }
+        try {
+          const scale = Math.min(1, 400 / Math.max(image.naturalWidth, image.naturalHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+          const context = canvas.getContext("2d");
+          if (!context) { finish(false, ""); return; }
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          finish(true, canvas.toDataURL("image/jpeg", 0.82));
+        } catch (_) {
+          finish(false, "");
+        }
+      };
+      capture();
+    })();
+    """#)
 }
 
 /// Native, conditional-GET access to Futapo's img_b isolation feed. The
