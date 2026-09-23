@@ -101,6 +101,9 @@ final class BrowserViewModel: ObservableObject {
     /// foreground-active. The first check runs immediately; subsequent checks
     /// use this bounded interval and conditional HTTP validators.
     static let isolationMonitorIntervalNanoseconds: UInt64 = 10_000_000_000
+    /// Board-wide search is a supplementary recovery path and is deliberately
+    /// less frequent than the direct source-page monitor.
+    static let isolationRecoverySearchIntervalNanoseconds: UInt64 = 30_000_000_000
 
     private enum Keys {
         static let lastURL = "lastURL"
@@ -140,6 +143,8 @@ final class BrowserViewModel: ObservableObject {
     private let networkConnectivityGate: NetworkConnectivityGate
     private let userAgentRestrictionStore: UserAgentRestrictionStore
     private let isolationThreadMonitor: IsolationThreadMonitor
+    private let futabaThreadSearchService: FutabaThreadSearchService
+    private var latestModerationSnapshot = ModerationThreadSnapshot.empty
     private var selectedUAIndex: Int
     private var automaticTriedUAIDs: Set<Int> = []
     /// A session-only shuffled order. It is created once when an automatic
@@ -290,10 +295,15 @@ final class BrowserViewModel: ObservableObject {
         let sourceThreadID: String
         let sourceURL: URL
         let comment: String
+        let excludedThreadIDs: Set<String>
+        let moderationExcludedThreadIDs: Set<String>
         var replacementURL: URL?
         var replacementComment: String?
         var phase: IsolationRecoveryPhase
         var pollCount: Int
+        var searchAttemptCount: Int
+        var candidateIDs: Set<String>
+        var attemptedCandidateIDs: Set<String>
         var remainingSeconds: Int
         var currentPageToken: String?
     }
@@ -301,6 +311,8 @@ final class BrowserViewModel: ObservableObject {
     private var isolationRecoveryContext: IsolationRecoveryContext?
     private var isolationRecoverySequence: UInt64 = 0
     private var isolationRecoveryReloadTask: Task<Void, Never>?
+    private var isolationRecoverySearchTask: Task<Void, Never>?
+    private var isolationRecoveryCandidateSelectionTask: Task<Void, Never>?
     private var pendingRecoveryHandwritingRestoreID: UInt64?
     private var pendingRecoverySourceThreadID: String?
     private var lastIsolationRecoveryNoticeContext: (recoveryID: UInt64,
@@ -391,6 +403,7 @@ final class BrowserViewModel: ObservableObject {
     init(defaults: UserDefaults = .standard,
          ipService: IPAddressService = IPAddressService(),
          isolationThreadMonitor: IsolationThreadMonitor = IsolationThreadMonitor(),
+         futabaThreadSearchService: FutabaThreadSearchService = FutabaThreadSearchService(),
          networkConnectivityGate: NetworkConnectivityGate? = nil) {
         self.defaults = defaults
         self.logStore = DebugLogStore(defaults: defaults)
@@ -399,6 +412,7 @@ final class BrowserViewModel: ObservableObject {
         self.networkConnectivityGate = networkConnectivityGate ?? NetworkConnectivityGate()
         self.userAgentRestrictionStore = UserAgentRestrictionStore(defaults: defaults)
         self.isolationThreadMonitor = isolationThreadMonitor
+        self.futabaThreadSearchService = futabaThreadSearchService
         let catalogNeedsMigration = defaults.integer(forKey: Keys.userAgentCatalogVersion) !=
             BrowserUserAgent.catalogVersion
         let savedID = defaults.object(forKey: Keys.userAgentID) as? Int
@@ -881,6 +895,7 @@ final class BrowserViewModel: ObservableObject {
         }
         isolationRecoveryReloadTask?.cancel()
         isolationRecoveryReloadTask = nil
+        cancelIsolationRecoverySearch()
         multiThreadBootstrapTask?.cancel()
         multiThreadBootstrapTask = nil
         automaticSceneBootstrapContext = nil
@@ -1846,6 +1861,10 @@ final class BrowserViewModel: ObservableObject {
         automaticContinuousAPRetryDelayTask = nil
         isolationRecoveryReloadTask?.cancel()
         isolationRecoveryReloadTask = nil
+        isolationRecoverySearchTask?.cancel()
+        isolationRecoverySearchTask = nil
+        isolationRecoveryCandidateSelectionTask?.cancel()
+        isolationRecoveryCandidateSelectionTask = nil
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
         automaticPostStatusTask?.cancel()
@@ -1888,12 +1907,22 @@ final class BrowserViewModel: ObservableObject {
             case .waitingForSource:
                 beginIsolationRecoverySourceNavigation()
             case .monitoringSource:
+                startIsolationRecoverySearch(recoveryID: recovery.recoveryID)
                 scheduleIsolationRecoveryPoll()
             case .waitingForReplacementImage:
                 // Re-enter didFinish so the existing capture script is
                 // installed again without changing the replacement URL.
                 guard webView?.reload() != nil else {
-                    failIsolationRecovery(reason: "REPLACEMENT_RELOAD_FAILED")
+                    if let candidateID = recovery.replacementURL
+                        .flatMap({ IsolationThreadURLParser.threadID(from: $0) }) {
+                        rejectIsolationRecoveryCandidate(
+                            recoveryID: recovery.recoveryID,
+                            candidateID: candidateID,
+                            reason: "REPLACEMENT_RELOAD_FAILED"
+                        )
+                    } else {
+                        failIsolationRecovery(reason: "REPLACEMENT_RELOAD_FAILED")
+                    }
                     return
                 }
             }
@@ -2379,6 +2408,7 @@ final class BrowserViewModel: ObservableObject {
             let moderationSnapshot = try await monitor.fetchModerationSnapshot(
                 userAgent: effectiveUserAgent
             )
+            latestModerationSnapshot = moderationSnapshot
             guard isolationStopEnabled,
                   appSceneIsActive,
                   isolationMonitorContext == context,
@@ -2568,16 +2598,26 @@ final class BrowserViewModel: ObservableObject {
               let sourceURL = URL(string: "https://img.2chan.net/b/res/\(sourceThreadID).htm") else {
             return nil
         }
+        let retainedIDs = IsolationThreadURLParser.threadIDs(inPostBody: comment)
+        let excludedIDs = session.processedThreadIDs
+            .union(retainedIDs)
+            .union(automaticCatalogProvider?.automaticExcludedThreadIDs() ?? [])
         return IsolationRecoveryContext(
             recoveryID: nextIsolationRecoveryID(),
             sessionID: session.sessionID,
             sourceThreadID: sourceThreadID,
             sourceURL: sourceURL,
             comment: comment,
+            excludedThreadIDs: excludedIDs,
+            moderationExcludedThreadIDs: latestModerationSnapshot.isolatedIDs
+                .union(latestModerationSnapshot.deletedIDs),
             replacementURL: nil,
             replacementComment: nil,
             phase: .waitingForSource,
             pollCount: 0,
+            searchAttemptCount: 0,
+            candidateIDs: [],
+            attemptedCandidateIDs: [],
             remainingSeconds: Self.isolationRecoveryMaximumDurationSeconds,
             currentPageToken: nil
         )
@@ -2610,6 +2650,7 @@ final class BrowserViewModel: ObservableObject {
         appendRecoveryEvent(recovery: recovery,
                             event: "RECOVERY_STARTED",
                             result: "STARTED")
+        startIsolationRecoverySearch(recoveryID: recovery.recoveryID)
         appendAutomaticEvent(
             generationID: automaticPostGeneration,
             phase: "ISOLATION_RECOVERY",
@@ -2627,9 +2668,292 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    private func startIsolationRecoverySearch(recoveryID: UInt64) {
+        guard appSceneIsActive,
+              isolationRecoverySearchTask == nil else {
+            return
+        }
+        isolationRecoverySearchTask = Task { @MainActor [weak self] in
+            defer {
+                self?.isolationRecoverySearchTask = nil
+            }
+            while !Task.isCancelled {
+                guard let self,
+                      self.appSceneIsActive,
+                      let recovery = self.isolationRecoveryContext,
+                      recovery.recoveryID == recoveryID else {
+                    return
+                }
+                if case .waitingForReplacementImage = recovery.phase {
+                    return
+                }
+
+                var attemptContext = recovery
+                attemptContext.searchAttemptCount += 1
+                self.isolationRecoveryContext = attemptContext
+                self.appendRecoveryEvent(recovery: attemptContext,
+                                         event: "SEARCH_REQUEST_STARTED",
+                                         result: "STARTED")
+                do {
+                    let candidates = try await self.futabaThreadSearchService.search(
+                        userAgent: self.effectiveUserAgent
+                    )
+                    guard !Task.isCancelled,
+                          self.appSceneIsActive,
+                          let current = self.isolationRecoveryContext,
+                          current.recoveryID == recoveryID else {
+                        return
+                    }
+                    if case .waitingForReplacementImage = current.phase {
+                        return
+                    }
+                    self.appendRecoveryEvent(
+                        recovery: current,
+                        event: "SEARCH_RESPONSE_PARSED",
+                        result: "READY",
+                        reason: "COUNT_\(candidates.count)"
+                    )
+                    self.enqueueIsolationRecoveryCandidates(
+                        candidates.map { $0.threadID },
+                        recoveryID: recoveryID,
+                        source: "SEARCH"
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard !Task.isCancelled,
+                          self.appSceneIsActive,
+                          let current = self.isolationRecoveryContext,
+                          current.recoveryID == recoveryID else {
+                        return
+                    }
+                    if case .waitingForReplacementImage = current.phase {
+                        return
+                    }
+                    self.appendRecoveryEvent(recovery: current,
+                                             event: "SEARCH_FAILED",
+                                             result: "RETRYING",
+                                             error: error)
+                }
+
+                do {
+                    try await Task.sleep(
+                        nanoseconds: Self.isolationRecoverySearchIntervalNanoseconds
+                    )
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func cancelIsolationRecoverySearch() {
+        isolationRecoverySearchTask?.cancel()
+        isolationRecoverySearchTask = nil
+        isolationRecoveryCandidateSelectionTask?.cancel()
+        isolationRecoveryCandidateSelectionTask = nil
+    }
+
+    private func enqueueIsolationRecoveryCandidates(_ candidateIDs: [String],
+                                                    recoveryID: UInt64,
+                                                    source: String) {
+        guard var recovery = isolationRecoveryContext,
+              recovery.recoveryID == recoveryID,
+              (recovery.phase == .monitoringSource ||
+               recovery.phase == .waitingForSource) else {
+            return
+        }
+        guard let sourceNumber = UInt64(recovery.sourceThreadID) else {
+            return
+        }
+        var inserted = false
+        for candidateID in candidateIDs {
+            guard let candidateNumber = UInt64(candidateID),
+                  candidateNumber > sourceNumber,
+                  candidateID != recovery.sourceThreadID else {
+                if source == "SEARCH" {
+                    appendRecoveryEvent(recovery: recovery,
+                                        event: "SEARCH_CANDIDATE_REJECTED",
+                                        result: "IGNORED",
+                                        reason: "NOT_GREATER_THAN_SOURCE",
+                                        replacementThreadID: candidateID)
+                }
+                continue
+            }
+            guard !recovery.excludedThreadIDs.contains(candidateID),
+                  !recovery.moderationExcludedThreadIDs.contains(candidateID),
+                  !recovery.attemptedCandidateIDs.contains(candidateID),
+                  !recovery.candidateIDs.contains(candidateID) else {
+                if source == "SEARCH" {
+                    appendRecoveryEvent(recovery: recovery,
+                                        event: "SEARCH_CANDIDATE_REJECTED",
+                                        result: "IGNORED",
+                                        reason: "EXCLUDED",
+                                        replacementThreadID: candidateID)
+                }
+                continue
+            }
+            recovery.candidateIDs.insert(candidateID)
+            inserted = true
+            appendRecoveryEvent(
+                recovery: recovery,
+                event: source == "SEARCH"
+                    ? "SEARCH_CANDIDATE_FOUND"
+                    : "NEXT_THREAD_CANDIDATE_FOUND",
+                result: "QUEUED",
+                replacementThreadID: candidateID
+            )
+        }
+        isolationRecoveryContext = recovery
+        guard inserted, recovery.phase == .monitoringSource else { return }
+        scheduleIsolationRecoveryCandidateSelection(recoveryID: recoveryID)
+    }
+
+    private func scheduleIsolationRecoveryCandidateSelection(recoveryID: UInt64) {
+        isolationRecoveryCandidateSelectionTask?.cancel()
+        isolationRecoveryCandidateSelectionTask = Task { @MainActor [weak self] in
+            do {
+                // Give the direct page bridge and a native search response a
+                // short coalescing window before numeric ordering is applied.
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  let recovery = self.isolationRecoveryContext,
+                  recovery.recoveryID == recoveryID,
+                  recovery.phase == .monitoringSource else {
+                return
+            }
+            self.isolationRecoveryCandidateSelectionTask = nil
+            self.selectNextIsolationRecoveryCandidate(recoveryID: recoveryID)
+        }
+    }
+
+    private func selectNextIsolationRecoveryCandidate(recoveryID: UInt64) {
+        guard let recovery = isolationRecoveryContext,
+              recovery.recoveryID == recoveryID,
+              recovery.phase == .monitoringSource else {
+            return
+        }
+        let nextID = FutabaThreadSearchService.orderedCandidateIDs(
+            after: recovery.sourceThreadID,
+            candidates: Array(recovery.candidateIDs),
+            excludedIDs: recovery.excludedThreadIDs,
+            moderationExcludedIDs: recovery.moderationExcludedThreadIDs,
+            attemptedIDs: recovery.attemptedCandidateIDs
+        ).first
+        guard let nextID else { return }
+        attemptIsolationRecoveryCandidate(nextID, recoveryID: recoveryID)
+    }
+
+    private func attemptIsolationRecoveryCandidate(_ candidateID: String,
+                                                   recoveryID: UInt64) {
+        guard var recovery = isolationRecoveryContext,
+              recovery.recoveryID == recoveryID,
+              recovery.phase == .monitoringSource,
+              let candidateNumber = UInt64(candidateID),
+              let sourceNumber = UInt64(recovery.sourceThreadID),
+              candidateNumber > sourceNumber,
+              recovery.candidateIDs.remove(candidateID) != nil,
+              recovery.attemptedCandidateIDs.insert(candidateID).inserted else {
+            return
+        }
+        guard let replacementURL = URL(
+            string: "https://img.2chan.net/b/res/\(candidateID).htm"
+        ),
+        let replacementComment = IsolationThreadURLParser.replacingThreadURL(
+            inPostBody: recovery.comment,
+            sourceThreadID: recovery.sourceThreadID,
+            with: replacementURL
+        ),
+        let webView else {
+            isolationRecoveryContext = recovery
+            rejectIsolationRecoveryCandidate(recoveryID: recoveryID,
+                                             candidateID: candidateID,
+                                             reason: "INVALID_OR_SOURCE_URL")
+            return
+        }
+
+        recovery.replacementURL = replacementURL
+        recovery.replacementComment = replacementComment
+        recovery.phase = .waitingForReplacementImage(replacementURL: replacementURL)
+        recovery.currentPageToken = nil
+        isolationRecoveryContext = recovery
+        cancelIsolationRecoverySearch()
+        isolationRecoveryReloadTask?.cancel()
+        isolationRecoveryReloadTask = nil
+
+        let replacementCount = IsolationThreadURLParser.replacementCount(
+            inPostBody: recovery.comment,
+            sourceThreadID: recovery.sourceThreadID
+        )
+        appendRecoveryEvent(recovery: recovery,
+                            event: "NEXT_THREAD_CANDIDATE_SELECTED",
+                            result: "STARTED",
+                            replacementThreadID: candidateID)
+        appendRecoveryEvent(recovery: recovery,
+                            event: "COMMENT_URL_REPLACED",
+                            result: "READY",
+                            reason: "COUNT_\(replacementCount)",
+                            replacementThreadID: candidateID)
+        appendAutomaticEvent(
+            generationID: automaticPostGeneration,
+            phase: "ISOLATION_RECOVERY",
+            event: "SOURCE_NAVIGATION_STARTED",
+            result: "NAVIGATING",
+            fields: recoveryLogFields(recovery,
+                                      replacementThreadID: candidateID)
+        )
+        guard webView.load(URLRequest(url: replacementURL)) != nil else {
+            rejectIsolationRecoveryCandidate(recoveryID: recoveryID,
+                                             candidateID: candidateID,
+                                             reason: "REPLACEMENT_LOAD_NOT_STARTED")
+            return
+        }
+    }
+
+    private func rejectIsolationRecoveryCandidate(recoveryID: UInt64,
+                                                  candidateID: String,
+                                                  reason: String) {
+        guard var recovery = isolationRecoveryContext,
+              recovery.recoveryID == recoveryID else {
+            return
+        }
+        appendRecoveryEvent(recovery: recovery,
+                            event: "NEXT_THREAD_CANDIDATE_REJECTED",
+                            result: "RETRYING",
+                            reason: reason,
+                            replacementThreadID: candidateID)
+        recovery.phase = .monitoringSource
+        recovery.replacementURL = nil
+        recovery.replacementComment = nil
+        recovery.currentPageToken = nil
+        isolationRecoveryContext = recovery
+
+        if let nextID = FutabaThreadSearchService.orderedCandidateIDs(
+            after: recovery.sourceThreadID,
+            candidates: Array(recovery.candidateIDs),
+            excludedIDs: recovery.excludedThreadIDs,
+            moderationExcludedIDs: recovery.moderationExcludedThreadIDs,
+            attemptedIDs: recovery.attemptedCandidateIDs
+        ).first {
+            attemptIsolationRecoveryCandidate(nextID, recoveryID: recoveryID)
+        } else {
+            // Candidate validation owns the WebView while the replacement
+            // page is open. Return to the source page before the next direct
+            // poll so the source monitor script can be installed again.
+            recovery.phase = .waitingForSource
+            isolationRecoveryContext = recovery
+            beginIsolationRecoverySourceNavigation()
+        }
+    }
+
     private func failIsolationRecovery(reason: String) {
         isolationRecoveryReloadTask?.cancel()
         isolationRecoveryReloadTask = nil
+        cancelIsolationRecoverySearch()
         let recovery = isolationRecoveryContext
         let storedNoticeContext = lastIsolationRecoveryNoticeContext
         let threadID = recovery?.sourceThreadID ?? pendingRecoverySourceThreadID
@@ -2777,6 +3101,8 @@ final class BrowserViewModel: ObservableObject {
             ("SESSION_ID", String(recovery.sessionID)),
             ("SOURCE_THREAD_ID", recovery.sourceThreadID),
             ("ATTEMPT", String(recovery.pollCount)),
+            ("SEARCH_ATTEMPT", String(recovery.searchAttemptCount)),
+            ("CANDIDATE_COUNT", String(recovery.candidateIDs.count)),
             ("REMAINING_SECONDS", String(recovery.remainingSeconds))
         ]
         if let replacementThreadID {
@@ -2877,6 +3203,9 @@ final class BrowserViewModel: ObservableObject {
             updated.phase = .monitoringSource
             updated.currentPageToken = nil
             isolationRecoveryContext = updated
+            if !updated.candidateIDs.isEmpty {
+                scheduleIsolationRecoveryCandidateSelection(recoveryID: updated.recoveryID)
+            }
             return IsolationRecoveryService.sourceThreadMonitorScript
         case let .waitingForReplacementImage(replacementURL):
             guard Self.sameTargetThreadURL(pageURL, replacementURL) else {
@@ -2893,6 +3222,9 @@ final class BrowserViewModel: ObservableObject {
             var updated = recovery
             updated.currentPageToken = nil
             isolationRecoveryContext = updated
+            if !updated.candidateIDs.isEmpty {
+                scheduleIsolationRecoveryCandidateSelection(recoveryID: updated.recoveryID)
+            }
             return IsolationRecoveryService.sourceThreadMonitorScript
         }
     }
@@ -3063,7 +3395,19 @@ final class BrowserViewModel: ObservableObject {
             // delivered after the candidate has already advanced the phase.
             return
         }
-        if recovery.phase == .monitoringSource {
+        if case .waitingForReplacementImage = recovery.phase,
+           let candidateID = recovery.replacementURL
+                .flatMap({ IsolationThreadURLParser.threadID(from: $0) }) {
+            appendRecoveryEvent(recovery: recovery,
+                                event: "STARTER_IMAGE_CAPTURE_FAILED",
+                                result: "RETRYING",
+                                reason: "SCRIPT_EVALUATION_FAILED",
+                                replacementThreadID: candidateID)
+            rejectIsolationRecoveryCandidate(recoveryID: recovery.recoveryID,
+                                             candidateID: candidateID,
+                                             reason: "SCRIPT_EVALUATION_FAILED")
+        } else if recovery.phase == .monitoringSource ||
+                  recovery.phase == .waitingForSource {
             appendRecoveryEvent(recovery: recovery,
                                 event: "RECOVERY_RELOAD_FAILED",
                                 result: "RETRYING",
@@ -3105,67 +3449,20 @@ final class BrowserViewModel: ObservableObject {
                                          reason: "RECOVERY_CONTEXT_MISMATCH")
             return
         }
-
-        guard let candidateURL,
-              let candidateID = IsolationThreadURLParser.threadID(from: candidateURL),
-              candidateID != recovery.sourceThreadID,
-              let normalizedCandidateURL = URL(
-                string: "https://img.2chan.net/b/res/\(candidateID).htm"
-              ),
-              let replacementComment = IsolationThreadURLParser.replacingThreadURL(
-                inPostBody: recovery.comment,
-                sourceThreadID: recovery.sourceThreadID,
-                with: normalizedCandidateURL
-              ),
-              let webView else {
-            appendRecoveryEvent(recovery: recovery,
-                                event: "NEXT_THREAD_CANDIDATE_REJECTED",
-                                result: "STOPPED",
-                                reason: "INVALID_OR_SOURCE_URL")
-            failIsolationRecovery(reason: "CANDIDATE_REJECTED")
-            return
-        }
-
         var updated = recovery
-        updated.replacementURL = normalizedCandidateURL
-        updated.replacementComment = replacementComment
-        updated.phase = .waitingForReplacementImage(replacementURL: normalizedCandidateURL)
-        // The replacement document receives a fresh page token. Do not carry
-        // the isolated source token into the image-capture gate.
-        updated.currentPageToken = nil
+        updated.currentPageToken = pageToken
         isolationRecoveryContext = updated
-        isolationRecoveryReloadTask?.cancel()
-        isolationRecoveryReloadTask = nil
-        let replacementCount = IsolationThreadURLParser.replacementCount(
-            inPostBody: recovery.comment,
-            sourceThreadID: recovery.sourceThreadID
-        )
-        appendRecoveryEvent(recovery: updated,
-                            event: "NEXT_THREAD_CANDIDATE_FOUND",
-                            result: "ACCEPTED",
-                            replacementThreadID: candidateID)
-        appendRecoveryEvent(recovery: updated,
-                            event: "COMMENT_URL_REPLACED",
-                            result: "READY",
-                            reason: "COUNT_\(replacementCount)",
-                            replacementThreadID: candidateID)
-        appendAutomaticEvent(
-            generationID: automaticPostGeneration,
-            phase: "ISOLATION_RECOVERY",
-            event: "SOURCE_NAVIGATION_STARTED",
-            result: "NAVIGATING",
-            fields: recoveryLogFields(updated,
-                                      replacementThreadID: candidateID)
-        )
-        guard webView.load(URLRequest(url: normalizedCandidateURL)) != nil else {
+        guard let candidateURL,
+              let candidateID = IsolationThreadURLParser.threadID(from: candidateURL) else {
             appendRecoveryEvent(recovery: updated,
-                                event: "SOURCE_NAVIGATION_FAILED",
-                                result: "STOPPED",
-                                reason: "REPLACEMENT_LOAD_NOT_STARTED",
-                                replacementThreadID: candidateID)
-            failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+                                event: "NEXT_THREAD_CANDIDATE_REJECTED",
+                                result: "IGNORED",
+                                reason: "INVALID_OR_SOURCE_URL")
             return
         }
+        enqueueIsolationRecoveryCandidates([candidateID],
+                                           recoveryID: recovery.recoveryID,
+                                           source: "DIRECT")
     }
 
     func handleIsolationRecoveryImageCaptured(pageToken: String,
@@ -3176,19 +3473,26 @@ final class BrowserViewModel: ObservableObject {
                                          reason: "RECOVERY_CONTEXT_MISSING")
             return
         }
-        guard !pageToken.isEmpty,
+        guard case let .waitingForReplacementImage(replacementURL) = recovery.phase,
+              let candidateID = IsolationThreadURLParser.threadID(from: replacementURL),
               let pageURL,
-              case let .waitingForReplacementImage(replacementURL) = recovery.phase,
-              Self.sameTargetThreadURL(pageURL, replacementURL),
+              Self.sameTargetThreadURL(pageURL, replacementURL) else {
+            recordAutomaticBridgeIgnored(type: "isolationRecoveryImage",
+                                         reason: "RECOVERY_CONTEXT_MISMATCH")
+            return
+        }
+        guard !pageToken.isEmpty,
               ready,
               handwritingImageAvailable,
               let comment = recovery.replacementComment else {
-            if let recovery = isolationRecoveryContext {
-                appendRecoveryEvent(recovery: recovery,
-                                    event: "STARTER_IMAGE_CAPTURE_FAILED",
-                                    result: "STOPPED")
-            }
-            failIsolationRecovery(reason: "STARTER_IMAGE_CAPTURE_FAILED")
+            appendRecoveryEvent(recovery: recovery,
+                                event: "STARTER_IMAGE_CAPTURE_FAILED",
+                                result: "RETRYING",
+                                reason: ready ? "IMAGE_OR_COMMENT_UNAVAILABLE" : "IMAGE_NOT_READY",
+                                replacementThreadID: candidateID)
+            rejectIsolationRecoveryCandidate(recoveryID: recovery.recoveryID,
+                                             candidateID: candidateID,
+                                             reason: "STARTER_IMAGE_CAPTURE_FAILED")
             return
         }
 
@@ -4083,9 +4387,17 @@ final class BrowserViewModel: ObservableObject {
            Self.sameTargetThreadURL(url, replacementURL) {
             appendRecoveryEvent(recovery: recovery,
                                 event: "SOURCE_NAVIGATION_FAILED",
-                                result: "STOPPED",
+                                result: "RETRYING",
                                 reason: "REPLACEMENT_\(proxyReason)")
-            failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+            if let candidateID = IsolationThreadURLParser.threadID(from: replacementURL) {
+                rejectIsolationRecoveryCandidate(
+                    recoveryID: recovery.recoveryID,
+                    candidateID: candidateID,
+                    reason: "REPLACEMENT_\(proxyReason)"
+                )
+            } else {
+                failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+            }
             return true
         }
 
@@ -4717,13 +5029,21 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
             switch recovery.phase {
-            case .waitingForReplacementImage:
+            case let .waitingForReplacementImage(replacementURL):
                 appendRecoveryEvent(recovery: recovery,
                                     event: "SOURCE_NAVIGATION_FAILED",
-                                    result: "STOPPED",
+                                    result: "RETRYING",
                                     reason: "REPLACEMENT_NAVIGATION_FAILED",
                                     error: error)
-                failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+                if let candidateID = IsolationThreadURLParser.threadID(from: replacementURL) {
+                    rejectIsolationRecoveryCandidate(
+                        recoveryID: recovery.recoveryID,
+                        candidateID: candidateID,
+                        reason: "REPLACEMENT_NAVIGATION_FAILED"
+                    )
+                } else {
+                    failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+                }
             case .waitingForSource:
                 appendRecoveryEvent(recovery: recovery,
                                     event: "SOURCE_NAVIGATION_FAILED",
@@ -4798,12 +5118,20 @@ final class BrowserViewModel: ObservableObject {
                 return
             }
             switch recovery.phase {
-            case .waitingForReplacementImage:
+            case let .waitingForReplacementImage(replacementURL):
                 appendRecoveryEvent(recovery: recovery,
                                     event: "SOURCE_NAVIGATION_FAILED",
-                                    result: "STOPPED",
+                                    result: "RETRYING",
                                     reason: "REPLACEMENT_NAVIGATION_TIMEOUT")
-                failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+                if let candidateID = IsolationThreadURLParser.threadID(from: replacementURL) {
+                    rejectIsolationRecoveryCandidate(
+                        recoveryID: recovery.recoveryID,
+                        candidateID: candidateID,
+                        reason: "REPLACEMENT_NAVIGATION_TIMEOUT"
+                    )
+                } else {
+                    failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+                }
             case .waitingForSource:
                 appendRecoveryEvent(recovery: recovery,
                                     event: "SOURCE_NAVIGATION_FAILED",

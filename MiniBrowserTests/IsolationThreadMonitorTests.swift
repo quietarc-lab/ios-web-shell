@@ -120,6 +120,7 @@ final class IsolationThreadMonitorTests: XCTestCase {
         XCTAssertTrue(capture.contains("isolationRecoveryImage"))
         XCTAssertTrue(capture.contains("canvas.toDataURL"))
         XCTAssertTrue(capture.contains("naturalWidth"))
+        XCTAssertTrue(capture.contains("form instanceof HTMLFormElement"))
         XCTAssertFalse(capture.contains("form.submit"))
         XCTAssertFalse(capture.contains("input.files"))
     }

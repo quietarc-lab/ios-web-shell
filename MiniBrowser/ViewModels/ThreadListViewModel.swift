@@ -275,6 +275,11 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
         persistOpenCounts()
     }
 
+    func automaticExcludedThreadIDs() -> Set<String> {
+        Set(openCounts.keys.filter { openCounts[$0, default: 0] > 0 })
+            .union(excludedThreadIDs)
+    }
+
     private func persistOpenCounts() {
         if openCounts.count > 1_000 {
             let excess = openCounts.count - 1_000

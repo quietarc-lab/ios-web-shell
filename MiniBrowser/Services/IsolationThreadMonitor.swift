@@ -274,6 +274,12 @@ enum IsolationRecoveryService {
       };
       const capture = () => {
         attempts += 1;
+        const form = document.querySelector("#fm");
+        if (!(form instanceof HTMLFormElement)) {
+          if (attempts < 100) setTimeout(capture, 100);
+          else finish(false, "");
+          return;
+        }
         const image = document.querySelector("#minibrowser-targetpage-starter img");
         if (!(image instanceof HTMLImageElement) ||
             !image.complete || image.naturalWidth <= 0 || image.naturalHeight <= 0) {

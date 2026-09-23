@@ -96,6 +96,7 @@ protocol AutomaticCatalogProvider: AnyObject {
     func endAutomaticSortDisplay()
     func excludeThread(id: String)
     func markThreadRead(id: String)
+    func automaticExcludedThreadIDs() -> Set<String>
     func resetOpenHistory()
 }
 
@@ -119,6 +120,7 @@ extension AutomaticCatalogProvider {
     func endAutomaticSortDisplay() {}
     func excludeThread(id: String) {}
     func markThreadRead(id: String) {}
+    func automaticExcludedThreadIDs() -> Set<String> { [] }
     func resetOpenHistory() {}
 }
 
