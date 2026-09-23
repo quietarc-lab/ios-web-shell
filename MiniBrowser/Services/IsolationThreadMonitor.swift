@@ -131,6 +131,8 @@ enum IsolationRecoveryService {
       const pageToken = typeof window.__miniBrowserPageToken === "string"
         ? window.__miniBrowserPageToken : "";
       const sent = new Set();
+      const pollingIntervalMs = 1000;
+      const maxPollingTicks = 300;
       let pollingTicks = 0;
       let timer = null;
       let observer = null;
@@ -161,21 +163,48 @@ enum IsolationRecoveryService {
         stopMonitoring();
       };
 
+      const normalizedLines = value => String(value || "")
+        .replace(/\r\n?/g, "\n")
+        .split("\n")
+        .map(line => String(line || "").trim());
+
+      const isNextMarker = value => {
+        const normalized = String(value || "")
+          .trim()
+          .replace(/^>\s*/, "")
+          .trim();
+        return normalized === "次" || normalized.endsWith("次");
+      };
+
       const hasImmediatelyPrecedingNextLine = anchor => {
         const linkText = String(anchor.innerText || anchor.textContent || "")
           .replace(/\s+/g, " ").trim();
         if (!linkText) return false;
 
+        const matchesNextLink = text => {
+          const lines = normalizedLines(text);
+          const linkLineIndex = lines.findIndex(line => line.includes(linkText));
+          if (linkLineIndex < 0) return false;
+          if (linkLineIndex > 0 && isNextMarker(lines[linkLineIndex - 1])) {
+            return true;
+          }
+
+          // Some posts put the explanation and the URL on one line, e.g.
+          // 「隔離されたから次 https://img.2chan.net/b/res/...」.
+          const linkLine = lines[linkLineIndex];
+          const linkOffset = linkLine.indexOf(linkText);
+          return linkOffset > 0 &&
+            isNextMarker(linkLine.slice(0, linkOffset));
+        };
+
         let container = anchor.parentElement;
         for (let depth = 0; container && depth < 6; depth += 1) {
-          const renderedText = String(container.innerText || "").replace(/\r\n?/g, "\n");
-          const lines = renderedText.split("\n");
-          const linkLineIndex = lines.findIndex(line => line.includes(linkText));
-          if (linkLineIndex > 0) {
-            const precedingLine = String(lines[linkLineIndex - 1] || "")
-              .trim().replace(/^>\s*/, "");
-            if (precedingLine === "次") return true;
-          }
+          // innerText preserves rendered line breaks. textContent is the
+          // fallback for compacted/hidden replies whose innerText is empty.
+          const textVariants = [container.innerText, container.textContent]
+            .filter(value => typeof value === "string" && value.length > 0)
+            .filter((value, index, values) => values.indexOf(value) === index);
+          if (textVariants.some(matchesNextLink)) return true;
           container = container.parentElement;
         }
         return false;
@@ -200,8 +229,8 @@ enum IsolationRecoveryService {
       timer = setInterval(() => {
         inspect();
         pollingTicks += 1;
-        if (pollingTicks >= 240) reportNoCandidate();
-      }, 500);
+        if (pollingTicks >= maxPollingTicks) reportNoCandidate();
+      }, pollingIntervalMs);
       inspect();
     })();
     """#)

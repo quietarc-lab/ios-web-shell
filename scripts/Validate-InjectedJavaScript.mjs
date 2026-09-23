@@ -101,7 +101,11 @@ function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
   const messages = [];
   let mutationCallback = null;
   let intervalCallback = null;
-  const container = { innerText: renderedText, parentElement: null };
+  const container = {
+    innerText: renderedText,
+    textContent: options.textContent ?? renderedText,
+    parentElement: null
+  };
   const anchor = {
     href,
     innerText: href,
@@ -134,6 +138,7 @@ function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
     new Function(monitor)();
     if (options.updatedRenderedText !== undefined) {
       container.innerText = options.updatedRenderedText;
+      container.textContent = options.updatedTextContent ?? options.updatedRenderedText;
       mutationCallback?.();
     }
     for (let tick = 0; tick < (options.ticks ?? 0); tick += 1) intervalCallback?.();
@@ -156,6 +161,23 @@ assert.equal(
   runNextLinkFixture(projectRoot, `> 次\n${nextURL}`, nextURL)[0]?.threadURL,
   nextURL,
   "the same two-line link inside a quoted reply should be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `隔離されたから次\n${nextURL}`, nextURL)[0]?.threadURL,
+  nextURL,
+  "a two-line link after an explanatory next marker should be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `隔離されたから次 ${nextURL}`, nextURL)[0]?.threadURL,
+  nextURL,
+  "a same-line explanatory next marker should be detected"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, "", nextURL, {
+    textContent: `隔離されたから次\n${nextURL}`
+  })[0]?.threadURL,
+  nextURL,
+  "hidden reply text should be inspected through textContent"
 );
 assert.equal(
   runNextLinkFixture(projectRoot, `説明\n次のスレ\n${nextURL}`, nextURL).length,
@@ -182,8 +204,13 @@ assert.equal(
 );
 assert.equal(
   runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, { ticks: 240 })[0]?.type,
+  undefined,
+  "the extended monitor should still be active before its timeout"
+);
+assert.equal(
+  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, { ticks: 300 })[0]?.type,
   "isolationRecoveryNoCandidate",
-  "a bounded monitor with no next link should report a terminal no-candidate result"
+  "a five-minute monitor with no next link should report a terminal no-candidate result"
 );
 
 console.log(`Injected JavaScript syntax and next-link fixture checks passed (${sources.length + generatedSources.length} scripts).`);

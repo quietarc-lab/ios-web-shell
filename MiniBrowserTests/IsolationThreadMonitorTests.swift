@@ -102,8 +102,11 @@ final class IsolationThreadMonitorTests: XCTestCase {
     func testIsolationRecoveryScriptsUseBoundedBridgePayloads() {
         let monitor = IsolationRecoveryService.sourceThreadMonitorScript
         XCTAssertTrue(monitor.contains("isolationRecoveryCandidate"))
-        XCTAssertTrue(monitor.contains("precedingLine === \"次\""))
+        XCTAssertTrue(monitor.contains("normalized.endsWith(\"次\")"))
         XCTAssertTrue(monitor.contains("replace(/\\r\\n?/g, \"\\n\")"))
+        XCTAssertTrue(monitor.contains("textContent"))
+        XCTAssertTrue(monitor.contains("pollingIntervalMs = 1000"))
+        XCTAssertTrue(monitor.contains("maxPollingTicks = 300"))
         XCTAssertTrue(monitor.contains("isolationRecoveryNoCandidate"))
         XCTAssertTrue(monitor.contains("MutationObserver"))
         XCTAssertFalse(monitor.contains("innerHTML"))
