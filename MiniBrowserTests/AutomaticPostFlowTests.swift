@@ -770,6 +770,46 @@ final class AutomaticPostFlowTests: XCTestCase {
                                 reason: .threadPostingUnavailable))
     }
 
+    func testMultiThreadMissingThreadAlertSkipsCurrentTarget() {
+        var machine = AutomaticPostFlowMachine()
+        _ = machine.beginMultiThreadNavigation(
+            generationID: generation,
+            oldPageToken: "old-page",
+            hasComment: true,
+            hasImage: false
+        )
+        _ = machine.handle(.markReloadCompleted(generationID: generation))
+        _ = machine.handle(.markCompactReady(
+            generationID: generation,
+            pageToken: "new-page",
+            hasComment: true,
+            canSubmit: true
+        ))
+        _ = machine.handle(.submitReadinessObserved(
+            generationID: generation,
+            pageToken: "new-page",
+            ready: true,
+            stableForMilliseconds: AutomaticPostFlowMachine.readinessStableMilliseconds
+        ))
+        _ = machine.handle(.initialSubmitDelayElapsed(generationID: generation))
+
+        let result = machine.handleAlert(.threadNotFound,
+                                         generationID: generation)
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .skipCurrentThread)
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .threadUnavailable))
+    }
+
+    func testSameThreadMissingThreadAlertRemainsTerminalUnknownAlert() {
+        var machine = readyMachine(hasComment: true, hasImage: false)
+        let result = machine.handleAlert(.threadNotFound,
+                                         generationID: generation)
+        XCTAssertFalse(result.autoDismiss)
+        XCTAssertEqual(result.effect, .stopped(.unknownAlert))
+    }
+
     func testMultiThreadReplyLimitSkipsCurrentTarget() {
         var machine = AutomaticPostFlowMachine()
         _ = machine.beginMultiThreadNavigation(

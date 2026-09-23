@@ -7,6 +7,7 @@ enum TargetPageAlertCategory: String, Equatable {
     case continuousPosting = "CONTINUOUS_POSTING"
     case imageContinuousPosting = "IMAGE_CONTINUOUS_POSTING"
     case threadPostingUnavailable = "THREAD_POSTING_UNAVAILABLE"
+    case threadNotFound = "THREAD_NOT_FOUND"
     case replyLimitReached = "REPLY_LIMIT_REACHED"
     case imageCountRestricted = "IMAGE_COUNT_RESTRICTED"
 }
@@ -52,6 +53,10 @@ enum TargetPageAlertClassifier {
         }
         if normalized == "このスレッドには書けません" {
             return .threadPostingUnavailable
+        }
+        if normalized == "スレッドがありません" ||
+            normalized == "スレッドがありません。" {
+            return .threadNotFound
         }
         if normalized == "上限1000レスに達しました" ||
             normalized == "上限1000レスに達しました。" {

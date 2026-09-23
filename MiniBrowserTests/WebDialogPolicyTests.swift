@@ -95,6 +95,20 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertEqual(
             TargetPageAlertClassifier.category(
                 host: "img.2chan.net",
+                message: "スレッドがありません"
+            ),
+            .threadNotFound
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
+                message: "スレッドがありません。"
+            ),
+            .threadNotFound
+        )
+        XCTAssertEqual(
+            TargetPageAlertClassifier.category(
+                host: "img.2chan.net",
                 message: "上限1000レスに達しました"
             ),
             .replyLimitReached
@@ -155,6 +169,10 @@ final class WebDialogPolicyTests: XCTestCase {
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",
             message: "このスレッドには書けません"
+        ))
+        XCTAssertNil(TargetPageAlertClassifier.category(
+            host: "example.com",
+            message: "スレッドがありません"
         ))
         XCTAssertNil(TargetPageAlertClassifier.category(
             host: "example.com",

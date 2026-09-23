@@ -3983,6 +3983,8 @@ final class BrowserViewModel: ObservableObject {
             alert = .imageContinuousPosting
         case .threadPostingUnavailable:
             alert = .threadPostingUnavailable
+        case .threadNotFound:
+            alert = .threadNotFound
         case .replyLimitReached:
             alert = .replyLimitReached
         case .imageCountRestricted:
@@ -4048,6 +4050,8 @@ final class BrowserViewModel: ObservableObject {
                 // generation and started the next eligible-UA handoff.
                 break
             case .threadPostingUnavailable:
+                break
+            case .threadNotFound:
                 break
             case .replyLimitReached:
                 break
