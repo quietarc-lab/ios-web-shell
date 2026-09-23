@@ -157,6 +157,13 @@ assert.equal(
   nextURL,
   "a URL on the line immediately after 次 should be detected"
 );
+for (const marker of ["つぎ", "next", "NEXT", "NeXt"]) {
+  assert.equal(
+    runNextLinkFixture(projectRoot, `${marker}\n${nextURL}`, nextURL)[0]?.threadURL,
+    nextURL,
+    `${marker} should be accepted as a next marker`
+  );
+}
 assert.equal(
   runNextLinkFixture(projectRoot, `> 次\n${nextURL}`, nextURL)[0]?.threadURL,
   nextURL,

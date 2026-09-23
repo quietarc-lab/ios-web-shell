@@ -185,7 +185,9 @@ enum IsolationRecoveryService {
           .trim()
           .replace(/^>\s*/, "")
           .trim();
-        return normalized.includes("次");
+        return normalized.includes("次") ||
+          normalized.includes("つぎ") ||
+          normalized.toLowerCase().includes("next");
       };
 
       const hasImmediatelyPrecedingNextLine = anchor => {
