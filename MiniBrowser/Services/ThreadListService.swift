@@ -15,7 +15,16 @@ actor ThreadListService {
 
     init(session: URLSession? = nil,
          userAgent: String = BrowserUserAgent.all[0].value) {
-        self.session = session ?? URLSession(configuration: .ephemeral)
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.waitsForConnectivity = true
+            configuration.allowsCellularAccess = true
+            configuration.allowsExpensiveNetworkAccess = true
+            configuration.allowsConstrainedNetworkAccess = true
+            self.session = URLSession(configuration: configuration)
+        }
         self.userAgent = userAgent
     }
 

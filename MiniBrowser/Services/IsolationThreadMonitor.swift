@@ -83,6 +83,21 @@ enum IsolationThreadURLParser {
         return didReplace ? String(replaced) : nil
     }
 
+    static func replacementCount(inPostBody body: String,
+                                 sourceThreadID: String) -> Int {
+        guard !sourceThreadID.isEmpty,
+              let regex = try? NSRegularExpression(pattern: bodyURLPattern) else {
+            return 0
+        }
+        let range = NSRange(body.startIndex..., in: body)
+        return regex.matches(in: body, range: range).reduce(into: 0) { count, match in
+            guard match.numberOfRanges > 1,
+                  let idRange = Range(match.range(at: 1), in: body),
+                  String(body[idRange]) == sourceThreadID else { return }
+            count += 1
+        }
+    }
+
     /// The Futapo `img_b_isolation.txt` feed stores the thread URL before the
     /// first `<>` separator. The moderation state is field 16 (zero-based
     /// index 15): 2 means isolated and 1 means deleted. Metadata, malformed
@@ -131,21 +146,18 @@ enum IsolationRecoveryService {
       const pageToken = typeof window.__miniBrowserPageToken === "string"
         ? window.__miniBrowserPageToken : "";
       const sent = new Set();
-      const pollingIntervalMs = 1000;
-      const maxPollingTicks = 300;
-      let pollingTicks = 0;
-      let timer = null;
+      const noCandidateDelayMs = 1000;
+      let noCandidateTimer = null;
       let observer = null;
 
       const stopMonitoring = () => {
-        if (timer !== null) clearInterval(timer);
+        if (noCandidateTimer !== null) clearTimeout(noCandidateTimer);
         if (observer) observer.disconnect();
-        timer = null;
+        noCandidateTimer = null;
         observer = null;
       };
 
       const reportNoCandidate = () => {
-        stopMonitoring();
         handler.postMessage({
           type: "isolationRecoveryNoCandidate",
           pageToken
@@ -232,12 +244,11 @@ enum IsolationRecoveryService {
 
       observer = new MutationObserver(inspect);
       observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-      timer = setInterval(() => {
-        inspect();
-        pollingTicks += 1;
-        if (pollingTicks >= maxPollingTicks) reportNoCandidate();
-      }, pollingIntervalMs);
       inspect();
+      noCandidateTimer = setTimeout(() => {
+        inspect();
+        reportNoCandidate();
+      }, noCandidateDelayMs);
     })();
     """#)
 
@@ -302,7 +313,16 @@ actor IsolationThreadMonitor {
 
     init(session: URLSession? = nil,
          endpointURL: URL = IsolationThreadMonitor.defaultEndpointURL) {
-        self.session = session ?? URLSession(configuration: .ephemeral)
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.waitsForConnectivity = true
+            configuration.allowsCellularAccess = true
+            configuration.allowsExpensiveNetworkAccess = true
+            configuration.allowsConstrainedNetworkAccess = true
+            self.session = URLSession(configuration: configuration)
+        }
         self.endpointURL = endpointURL
     }
 

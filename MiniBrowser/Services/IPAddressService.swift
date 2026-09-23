@@ -27,6 +27,10 @@ struct IPAddressService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
+        configuration.waitsForConnectivity = true
+        configuration.allowsCellularAccess = true
+        configuration.allowsExpensiveNetworkAccess = true
+        configuration.allowsConstrainedNetworkAccess = true
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
 

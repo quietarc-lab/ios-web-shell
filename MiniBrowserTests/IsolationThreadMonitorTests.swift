@@ -106,10 +106,12 @@ final class IsolationThreadMonitorTests: XCTestCase {
         XCTAssertTrue(monitor.contains("linkLineIndex + 1 < lines.length"))
         XCTAssertTrue(monitor.contains("replace(/\\r\\n?/g, \"\\n\")"))
         XCTAssertTrue(monitor.contains("textContent"))
-        XCTAssertTrue(monitor.contains("pollingIntervalMs = 1000"))
-        XCTAssertTrue(monitor.contains("maxPollingTicks = 300"))
+        XCTAssertTrue(monitor.contains("noCandidateDelayMs = 1000"))
+        XCTAssertTrue(monitor.contains("setTimeout"))
         XCTAssertTrue(monitor.contains("isolationRecoveryNoCandidate"))
         XCTAssertTrue(monitor.contains("MutationObserver"))
+        XCTAssertFalse(monitor.contains("setInterval"))
+        XCTAssertFalse(monitor.contains("maxPollingTicks"))
         XCTAssertFalse(monitor.contains("innerHTML"))
 
         let capture = IsolationRecoveryService.replacementStarterImageCaptureScript
@@ -136,6 +138,18 @@ final class IsolationThreadMonitorTests: XCTestCase {
         XCTAssertNil(IsolationThreadURLParser.threadID(
             from: URL(string: "https://img.2chan.net/b/res/123.htmx")!
         ))
+    }
+
+    func testReplacementCountCountsOnlyExactSourceThreadURLs() {
+        let body = "https://img.2chan.net/b/res/123.htm https://img.2chan.net/b/res/123.htm?x=1 " +
+            "https://img.2chan.net/b/res/123.htmx https://img.2chan.net/b/res/456.htm"
+        XCTAssertEqual(
+            IsolationThreadURLParser.replacementCount(
+                inPostBody: body,
+                sourceThreadID: "123"
+            ),
+            2
+        )
     }
 
     func testIsolationFeedRequestUsesConditionalFriendlyHeaders() {

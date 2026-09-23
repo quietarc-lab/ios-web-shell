@@ -16,6 +16,8 @@ targets:
       - path: MiniBrowser
         excludes:
           - Info.plist
+    dependencies:
+      - sdk: Network.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: local.sidestore.MiniBrowser

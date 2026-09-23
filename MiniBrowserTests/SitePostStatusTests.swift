@@ -33,6 +33,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertEqual(AutomaticPostStatus.switchingAfterThreadBatch.rawValue,
                        "2スレ投稿 → 次のUAへ")
         XCTAssertEqual(AutomaticPostStatus.refreshingCatalog.rawValue, "カタログ再取得中")
+        XCTAssertEqual(AutomaticPostStatus.isolatedRecovery.rawValue, "隔離スレ復旧中")
         XCTAssertEqual(AutomaticPostStatus.acceptedPendingVerification.rawValue,
                        "受付済み・反映確認中")
         XCTAssertEqual(AutomaticPostStatus.scenePaused.rawValue, "一時停止中")
@@ -49,6 +50,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertFalse(AutomaticPostStatus.waitingForRepeat.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterThreadBatch.isFinal)
         XCTAssertFalse(AutomaticPostStatus.acceptedPendingVerification.isFinal)
+        XCTAssertFalse(AutomaticPostStatus.isolatedRecovery.isFinal)
         XCTAssertFalse(AutomaticPostStatus.scenePaused.isFinal)
     }
 

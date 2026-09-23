@@ -37,6 +37,7 @@ struct SitePostStatusView: View {
                  .switchingAfterThreadBatch,
                  .refreshingCatalog,
                  .acceptedPendingVerification,
+                 .isolatedRecovery,
                  .scenePaused:
                 return .blue
             }

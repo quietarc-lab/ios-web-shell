@@ -6,6 +6,7 @@ import WebKit
 enum ModerationStopKind: Equatable, Sendable {
     case isolated
     case deleted
+    case isolatedRecoveryFailed
     case automaticFailure(AutomaticPostStopReason)
 
     var rawValue: String {
@@ -14,6 +15,8 @@ enum ModerationStopKind: Equatable, Sendable {
             return "isolated"
         case .deleted:
             return "deleted"
+        case .isolatedRecoveryFailed:
+            return "isolatedRecoveryFailed"
         case .automaticFailure:
             return "automaticFailure"
         }
@@ -25,6 +28,8 @@ enum ModerationStopKind: Equatable, Sendable {
             return "隔離検知"
         case .deleted:
             return "削除検知"
+        case .isolatedRecoveryFailed:
+            return "隔離スレ復旧失敗"
         case .automaticFailure:
             return "自動投稿停止"
         }
@@ -36,6 +41,8 @@ enum ModerationStopKind: Equatable, Sendable {
             return "隔離検知のため自動投稿を停止しました"
         case .deleted:
             return "削除検知のため自動投稿を停止しました"
+        case .isolatedRecoveryFailed:
+            return "隔離スレの次スレ復旧に失敗したため自動投稿を停止しました"
         case let .automaticFailure(reason):
             return reason.userAlertMessage
         }
@@ -47,6 +54,8 @@ enum ModerationStopKind: Equatable, Sendable {
             return .isolatedThread
         case .deleted:
             return .deletedThread
+        case .isolatedRecoveryFailed:
+            return .communicationFailure
         case let .automaticFailure(reason):
             return reason
         }
@@ -77,6 +86,10 @@ final class BrowserViewModel: ObservableObject {
     static let sameUserAgentMultiThreadSubmitDelayNanoseconds: UInt64 = 500_000_000
     static let multiThreadSuccessWaitNanoseconds: UInt64 = 1_000_000_000
     static let continuousAPRetryDelayNanoseconds: UInt64 = 1_000_000_000
+    /// Do not start an IP check while iOS is still bringing a cellular path
+    /// up after Shortcuts returns.  This is deliberately bounded below the
+    /// automatic AP callback watchdog; a later retry remains authoritative.
+    static let automaticAPNetworkWaitNanoseconds: UInt64 = 2_000_000_000
     /// A Shortcuts x-callback URL can be accepted by iOS even when the
     /// shortcut later fails before invoking x-error. Keep automatic posting
     /// from waiting forever for that missing callback.
@@ -124,6 +137,7 @@ final class BrowserViewModel: ObservableObject {
     private let defaults: UserDefaults
     private let logStore: DebugLogStore
     private let ipService: IPAddressService
+    private let networkConnectivityGate: NetworkConnectivityGate
     private let userAgentRestrictionStore: UserAgentRestrictionStore
     private let isolationThreadMonitor: IsolationThreadMonitor
     private var selectedUAIndex: Int
@@ -266,7 +280,12 @@ final class BrowserViewModel: ObservableObject {
         case waitingForReplacementImage(replacementURL: URL)
     }
 
+    private static let isolationRecoveryPollIntervalNanoseconds: UInt64 = 10_000_000_000
+    private static let isolationRecoveryMaximumPolls = 30
+    private static let isolationRecoveryMaximumDurationSeconds = 300
+
     private struct IsolationRecoveryContext: Equatable {
+        let recoveryID: UInt64
         let sessionID: UInt64
         let sourceThreadID: String
         let sourceURL: URL
@@ -274,9 +293,19 @@ final class BrowserViewModel: ObservableObject {
         var replacementURL: URL?
         var replacementComment: String?
         var phase: IsolationRecoveryPhase
+        var pollCount: Int
+        var remainingSeconds: Int
+        var currentPageToken: String?
     }
 
     private var isolationRecoveryContext: IsolationRecoveryContext?
+    private var isolationRecoverySequence: UInt64 = 0
+    private var isolationRecoveryReloadTask: Task<Void, Never>?
+    private var pendingRecoveryHandwritingRestoreID: UInt64?
+    private var pendingRecoverySourceThreadID: String?
+    private var lastIsolationRecoveryNoticeContext: (recoveryID: UInt64,
+                                                      sessionID: UInt64,
+                                                      sourceThreadID: String)?
 
     private struct AutomaticPostDraft {
         let hasComment: Bool
@@ -339,6 +368,7 @@ final class BrowserViewModel: ObservableObject {
         let targetID: String?
         let targetURL: URL?
         let wasVerificationPending: Bool
+        let wasIsolationRecovery: Bool
     }
 
     /// The first multi-thread catalog request can be the only active work
@@ -357,11 +387,13 @@ final class BrowserViewModel: ObservableObject {
 
     init(defaults: UserDefaults = .standard,
          ipService: IPAddressService = IPAddressService(),
-         isolationThreadMonitor: IsolationThreadMonitor = IsolationThreadMonitor()) {
+         isolationThreadMonitor: IsolationThreadMonitor = IsolationThreadMonitor(),
+         networkConnectivityGate: NetworkConnectivityGate? = nil) {
         self.defaults = defaults
         self.logStore = DebugLogStore(defaults: defaults)
         self.bookmarkStore = BookmarkStore(defaults: defaults)
         self.ipService = ipService
+        self.networkConnectivityGate = networkConnectivityGate ?? NetworkConnectivityGate()
         self.userAgentRestrictionStore = UserAgentRestrictionStore(defaults: defaults)
         self.isolationThreadMonitor = isolationThreadMonitor
         let catalogNeedsMigration = defaults.integer(forKey: Keys.userAgentCatalogVersion) !=
@@ -565,6 +597,17 @@ final class BrowserViewModel: ObservableObject {
                                            hasImage: Bool,
                                            retainedPostThreadIDs: Set<String>) {
         guard let provider = automaticCatalogProvider else {
+            if pendingRecoveryHandwritingRestoreID != nil {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "CATALOG",
+                    event: "CATALOG_REFRESH_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "PROVIDER_UNAVAILABLE")]
+                )
+                failIsolationRecovery(reason: "CATALOG_REFRESH_FAILED")
+                return
+            }
             isUAChanging = false
             pendingUAChangeGeneration = nil
             multiThreadEnabled = false
@@ -573,6 +616,12 @@ final class BrowserViewModel: ObservableObject {
                                        mode: "MULTI_THREAD")
             updateIdleTimerState()
             return
+        }
+        // Recovery restarts create a generation before the first catalog
+        // request. Ordinary starts already have this context, but keeping
+        // the guard here makes every catalog diagnostic generation-scoped.
+        if automaticGenerationStartedAt[generationID] == nil {
+            beginAutomaticGenerationLogging(generationID: generationID)
         }
         multiThreadBootstrapTask?.cancel()
         automaticSceneBootstrapContext = AutomaticSceneBootstrapContext(
@@ -587,6 +636,17 @@ final class BrowserViewModel: ObservableObject {
         provider.beginAutomaticSortDisplay(.momentum)
         multiThreadBootstrapTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            self.appendAutomaticEvent(
+                generationID: generationID,
+                phase: "CATALOG",
+                event: "CATALOG_REFRESH_STARTED",
+                result: "STARTED",
+                fields: [
+                    ("SORT", "MOMENTUM"),
+                    ("BATCH_SIZE", String(MultiThreadPostPhase.momentum.batchSize)),
+                    ("EXCLUDED_COUNT", String(retainedPostThreadIDs.count))
+                ]
+            )
             do {
                 let momentum = try await provider.refreshPostSnapshot(
                     sort: .momentum,
@@ -599,6 +659,17 @@ final class BrowserViewModel: ObservableObject {
                 var snapshot = momentum
                 var phase: MultiThreadPostPhase = .momentum
                 if snapshot.targets.isEmpty {
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "CATALOG",
+                        event: "CATALOG_REFRESH_STARTED",
+                        result: "STARTED",
+                        fields: [
+                            ("SORT", MultiThreadPostPhase.catalog.sort.rawValue),
+                            ("BATCH_SIZE", String(MultiThreadPostPhase.catalog.batchSize)),
+                            ("EXCLUDED_COUNT", String(retainedPostThreadIDs.count))
+                        ]
+                    )
                     snapshot = try await provider.refreshPostSnapshot(
                         sort: .list,
                         excludingIDs: retainedPostThreadIDs,
@@ -606,7 +677,23 @@ final class BrowserViewModel: ObservableObject {
                     )
                     phase = .catalog
                 }
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "CATALOG",
+                    event: "CATALOG_REFRESH_COMPLETED",
+                    result: snapshot.targets.isEmpty ? "EMPTY" : "SUCCESS",
+                    fields: [
+                        ("SORT", phase.sort.rawValue),
+                        ("FETCHED_COUNT", String(snapshot.targets.count)),
+                        ("NEW_TARGET_COUNT", String(snapshot.targets.count)),
+                        ("BATCH_SIZE", String(phase.batchSize))
+                    ]
+                )
                 guard !snapshot.targets.isEmpty else {
+                    if self.pendingRecoveryHandwritingRestoreID != nil {
+                        self.failIsolationRecovery(reason: "CATALOG_EMPTY")
+                        return
+                    }
                     self.automaticSceneBootstrapContext = nil
                     self.multiThreadBootstrapTask = nil
                     self.isUAChanging = false
@@ -654,6 +741,10 @@ final class BrowserViewModel: ObservableObject {
             } catch {
                 guard self.multiThreadEnabled,
                       self.pendingUAChangeGeneration == generationID else { return }
+                if self.pendingRecoveryHandwritingRestoreID != nil {
+                    self.failIsolationRecovery(reason: "CATALOG_REFRESH_FAILED")
+                    return
+                }
                 self.automaticSceneBootstrapContext = nil
                 self.multiThreadBootstrapTask = nil
                 self.isUAChanging = false
@@ -669,6 +760,13 @@ final class BrowserViewModel: ObservableObject {
                 self.appendAutomaticEvent(
                     generationID: generationID,
                     phase: "CATALOG",
+                    event: "CATALOG_REFRESH_FAILED",
+                    result: "STOPPED",
+                    fields: [("REASON", "REQUEST_FAILED")]
+                )
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "CATALOG",
                     event: "CATALOG_BATCH_FETCH_FAILED",
                     result: "STOPPED",
                     fields: [("REASON", "REQUEST_FAILED")]
@@ -679,7 +777,15 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func toggleMultiThread() {
+        if isolationRecoveryContext != nil || pendingRecoveryHandwritingRestoreID != nil {
+            cancelIsolationRecoveryForUserStop()
+            multiThreadEnabled = false
+            setAutomaticPostStatusWithoutGeneration(.stopped)
+            updateIdleTimerState()
+            return
+        }
         if multiThreadEnabled {
+            cancelIsolationRecoveryForUserStop()
             multiThreadEnabled = false
             multiThreadBootstrapTask?.cancel()
             multiThreadBootstrapTask = nil
@@ -737,6 +843,37 @@ final class BrowserViewModel: ObservableObject {
             cancelAutomaticRepeatSession()
         }
         multiThreadEnabled = true
+    }
+
+    private func cancelIsolationRecoveryForUserStop() {
+        guard isolationRecoveryContext != nil ||
+              pendingRecoveryHandwritingRestoreID != nil else {
+            return
+        }
+        if let recovery = isolationRecoveryContext {
+            appendRecoveryEvent(recovery: recovery,
+                                event: "RECOVERY_FAILED",
+                                result: "CANCELLED",
+                                reason: "USER_STOPPED")
+        }
+        if multiThreadSession != nil || automaticPostMachine.isActive {
+            finishMultiThreadSession(
+                generationID: automaticPostMachine.generationID,
+                result: "STOPPED_USER_STOPPED",
+                stopReason: .repeatDisabled
+            )
+        }
+        isolationRecoveryReloadTask?.cancel()
+        isolationRecoveryReloadTask = nil
+        multiThreadBootstrapTask?.cancel()
+        multiThreadBootstrapTask = nil
+        automaticSceneBootstrapContext = nil
+        pendingUAChangeGeneration = nil
+        isUAChanging = false
+        isolationRecoveryContext = nil
+        pendingRecoveryHandwritingRestoreID = nil
+        pendingRecoverySourceThreadID = nil
+        lastIsolationRecoveryNoticeContext = nil
     }
 
     private func beginMultiThreadSession(snapshot: CatalogPostSnapshot,
@@ -1063,7 +1200,15 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func acknowledgeIsolationStop() {
+        if let notice = isolationStopNotice {
+            if notice.kind == .isolatedRecoveryFailed {
+                appendRecoveryNoticeEvent(event: "NOTICE_ACKNOWLEDGED",
+                                           result: "ACKNOWLEDGED",
+                                           notice: notice)
+            }
+        }
         isolationStopNotice = nil
+        lastIsolationRecoveryNoticeContext = nil
     }
 
     func refreshCookies() {
@@ -1284,6 +1429,42 @@ final class BrowserViewModel: ObservableObject {
         startCellularReconnect(reloadAfterCompletion: false, purpose: .manual)
     }
 
+    /// Wait for the local network path before making the small IPv4 request
+    /// that brackets an AP reconnect.  NWPathMonitor is only a local
+    /// readiness signal; URLSession still decides whether the remote request
+    /// succeeds.  The bounded wait prevents a transient cellular transition
+    /// from immediately provoking iOS's system-level "use Wi-Fi" alert.
+    private func waitForAutomaticNetworkPath(event: String,
+                                              purpose: APPurpose?) async -> Bool {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let ready = await networkConnectivityGate.waitUntilSatisfied(
+            timeoutNanoseconds: Self.automaticAPNetworkWaitNanoseconds
+        )
+        let elapsed = DispatchTime.now().uptimeNanoseconds - started
+        let fields = [
+            ("PATH_STATE", networkConnectivityGate.pathState.rawValue),
+            ("INTERFACE", networkConnectivityGate.interface.rawValue),
+            ("WAIT_MS", String(elapsed / 1_000_000)),
+            ("REASON", ready ? "PATH_SATISFIED" : "PATH_UNAVAILABLE")
+        ]
+        if let generationID = purpose.flatMap({ Self.appPurposeGenerationID($0) }) {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "NETWORK",
+                event: event,
+                result: ready ? "READY" : "DEFERRED",
+                fields: fields
+            )
+        } else {
+            logStore.append(action: "Network Connectivity", fields: [
+                ("PHASE", "NETWORK"),
+                ("EVENT", event),
+                ("EVENT_RESULT", ready ? "READY" : "DEFERRED")
+            ] + fields)
+        }
+        return ready
+    }
+
     private func startCellularReconnect(reloadAfterCompletion: Bool,
                                         purpose: APPurpose) {
         guard !isAPRunning else { return }
@@ -1302,7 +1483,14 @@ final class BrowserViewModel: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
-            let before = try? await ipService.fetchIPv4(userAgent: effectiveUserAgent)
+            guard self.isAPRunning else { return }
+            let pathReady = await self.waitForAutomaticNetworkPath(
+                event: "NETWORK_PRECHECK",
+                purpose: purpose
+            )
+            let before = pathReady
+                ? try? await self.ipService.fetchIPv4(userAgent: self.effectiveUserAgent)
+                : nil
             guard self.isAPRunning,
                   self.pendingAP == nil,
                   self.isCurrentAPPurpose(purpose) else {
@@ -1516,11 +1704,13 @@ final class BrowserViewModel: ObservableObject {
         guard automaticScenePauseContext == nil else { return }
         let generationID = automaticPostMachine.generationID ??
             automaticSceneBootstrapContext?.generationID
+        let isRecoveryActive = isolationRecoveryContext != nil
         let hasAutomaticWork = automaticPostMachine.isActive ||
             multiThreadSession != nil ||
             automaticPostRepeatSession != nil ||
             automaticPostVerificationTask != nil ||
             automaticSceneBootstrapContext != nil ||
+            isRecoveryActive ||
             (pendingAP.flatMap { Self.appPurposeGenerationID($0.purpose) } != nil)
         guard hasAutomaticWork else { return }
 
@@ -1532,9 +1722,23 @@ final class BrowserViewModel: ObservableObject {
             pageURL: pageURL,
             targetID: target?.id,
             targetURL: target?.threadURL,
-            wasVerificationPending: automaticPostVerificationTask != nil
+            wasVerificationPending: automaticPostVerificationTask != nil,
+            wasIsolationRecovery: isRecoveryActive
         )
-        if let generationID {
+        if isRecoveryActive {
+            let recovery = isolationRecoveryContext
+            appendAutomaticEvent(
+                generationID: automaticPostGeneration,
+                phase: "SCENE",
+                event: "SCENE_DEACTIVATED",
+                result: "PAUSED",
+                fields: [
+                    ("RECOVERY_ID", recovery.map { String($0.recoveryID) } ?? "UNAVAILABLE"),
+                    ("SOURCE_THREAD_ID", recovery?.sourceThreadID ?? "UNAVAILABLE")
+                ]
+            )
+            setAutomaticPostStatusWithoutGeneration(.scenePaused)
+        } else if let generationID {
             _ = automaticPostMachine.suspendForScene(generationID: generationID)
             appendAutomaticEvent(
                 generationID: generationID,
@@ -1565,6 +1769,8 @@ final class BrowserViewModel: ObservableObject {
         multiThreadTransitionTask = nil
         automaticContinuousAPRetryDelayTask?.cancel()
         automaticContinuousAPRetryDelayTask = nil
+        isolationRecoveryReloadTask?.cancel()
+        isolationRecoveryReloadTask = nil
         automaticPostVerificationTask?.cancel()
         automaticPostVerificationTask = nil
         automaticPostStatusTask?.cancel()
@@ -1579,6 +1785,45 @@ final class BrowserViewModel: ObservableObject {
 
     private func resumeAutomaticPostAfterSceneActivation() {
         guard let context = automaticScenePauseContext else { return }
+        if context.wasIsolationRecovery {
+            guard let recovery = isolationRecoveryContext,
+                  let resumedURL = webView?.url ?? self.currentURL else {
+                stopAfterSceneResumeFailure(context: context,
+                                             reason: "RECOVERY_CONTEXT_MISSING")
+                return
+            }
+            let expectedURL: URL
+            switch recovery.phase {
+            case .waitingForSource, .monitoringSource:
+                expectedURL = recovery.sourceURL
+            case let .waitingForReplacementImage(replacementURL):
+                expectedURL = replacementURL
+            }
+            guard Self.sameTargetThreadURL(resumedURL, expectedURL) else {
+                failIsolationRecovery(reason: "URL_OR_TARGET_MISMATCH")
+                automaticScenePauseContext = nil
+                return
+            }
+            automaticScenePauseContext = nil
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_COMPLETED",
+                                result: "SCENE_RESUMED")
+            setIsolationRecoveryStatus()
+            switch recovery.phase {
+            case .waitingForSource:
+                beginIsolationRecoverySourceNavigation()
+            case .monitoringSource:
+                scheduleIsolationRecoveryPoll()
+            case .waitingForReplacementImage:
+                // Re-enter didFinish so the existing capture script is
+                // installed again without changing the replacement URL.
+                guard webView?.reload() != nil else {
+                    failIsolationRecovery(reason: "REPLACEMENT_RELOAD_FAILED")
+                    return
+                }
+            }
+            return
+        }
         guard sceneResumeContextIsValid(context) else {
             stopAfterSceneResumeFailure(context: context, reason: "URL_OR_TARGET_MISMATCH")
             return
@@ -2127,6 +2372,26 @@ final class BrowserViewModel: ObservableObject {
               currentIsolationMonitorContext() == context else {
             return
         }
+        // A replacement page is already being handed back to a fresh
+        // multi-thread generation. Do not replace that recovery context with a
+        // second moderation match before the restored handwriting callback has
+        // completed; the new session will resume normal monitoring afterward.
+        if pendingRecoveryHandwritingRestoreID != nil {
+            appendAutomaticEvent(
+                generationID: automaticPostMachine.generationID ?? automaticPostGeneration,
+                phase: "ISOLATION",
+                event: kind == .isolated
+                    ? "ISOLATED_THREAD_DETECTED"
+                    : "DELETED_THREAD_DETECTED",
+                result: "IGNORED",
+                fields: [
+                    ("MATCHED_THREAD_ID", threadID),
+                    ("MODERATION_KIND", kind.rawValue),
+                    ("REASON", "RECOVERY_RESTORE_PENDING")
+                ]
+            )
+            return
+        }
         let recovery = kind == .isolated
             ? makeIsolationRecoveryContext(context: context, sourceThreadID: threadID)
             : nil
@@ -2135,9 +2400,20 @@ final class BrowserViewModel: ObservableObject {
         }
 
         let mode = context.mode == .multiThread ? "MULTI_THREAD" : "SAME_THREAD"
-        isolationStopNotice = IsolationStopNotice(threadID: threadID,
-                                                   mode: mode,
-                                                   kind: kind)
+        // A multi-thread isolation match that is present in the retained body
+        // enters delayed next-thread recovery. Do not present the modal alert
+        // or start the alarm while recovery is still possible; the failure
+        // path presents a dedicated notice after the five-minute window.
+        if recovery == nil || mode != "MULTI_THREAD" {
+            isolationStopNotice = IsolationStopNotice(threadID: threadID,
+                                                       mode: mode,
+                                                       kind: kind)
+        } else {
+            appendRecoveryNoticeEvent(event: "NOTICE_DEFERRED",
+                                       result: "RECOVERY_IN_PROGRESS",
+                                       sourceThreadID: threadID)
+            setIsolationRecoveryStatus()
+        }
         let stopReason = kind.automaticStopReason
         let event = kind == .isolated
             ? "ISOLATED_THREAD_DETECTED"
@@ -2149,10 +2425,11 @@ final class BrowserViewModel: ObservableObject {
                 event: event,
                 result: "STOPPED",
                 fields: [
-                    ("THREAD_ID", threadID),
+                    ("MATCHED_THREAD_ID", threadID),
                     ("MODE", mode),
                     ("MODERATION_KIND", kind.rawValue),
-                    ("STOP_REASON", Self.automaticStopResult(for: stopReason))
+                    ("STOP_REASON", Self.automaticStopResult(for: stopReason)),
+                    ("RECOVERY", recovery == nil ? "NO" : "YES")
                 ]
             )
         }
@@ -2170,6 +2447,7 @@ final class BrowserViewModel: ObservableObject {
                 )
             }
             if recovery != nil {
+                setIsolationRecoveryStatus()
                 beginIsolationRecoverySourceNavigation()
             }
             return
@@ -2202,14 +2480,26 @@ final class BrowserViewModel: ObservableObject {
             return nil
         }
         return IsolationRecoveryContext(
+            recoveryID: nextIsolationRecoveryID(),
             sessionID: session.sessionID,
             sourceThreadID: sourceThreadID,
             sourceURL: sourceURL,
             comment: comment,
             replacementURL: nil,
             replacementComment: nil,
-            phase: .waitingForSource
+            phase: .waitingForSource,
+            pollCount: 0,
+            remainingSeconds: Self.isolationRecoveryMaximumDurationSeconds,
+            currentPageToken: nil
         )
+    }
+
+    private func nextIsolationRecoveryID() -> UInt64 {
+        isolationRecoverySequence &+= 1
+        if isolationRecoverySequence == 0 {
+            isolationRecoverySequence = 1
+        }
+        return isolationRecoverySequence
     }
 
     private func beginIsolationRecoverySourceNavigation() {
@@ -2217,25 +2507,43 @@ final class BrowserViewModel: ObservableObject {
               recovery.phase == .waitingForSource else {
             return
         }
+        isolationRecoveryReloadTask?.cancel()
+        isolationRecoveryReloadTask = nil
         guard let webView else {
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_FAILED",
+                                result: "STOPPED",
+                                reason: "WEB_VIEW_UNAVAILABLE")
             failIsolationRecovery(reason: "WEB_VIEW_UNAVAILABLE")
             return
         }
+        setIsolationRecoveryStatus()
+        appendRecoveryEvent(recovery: recovery,
+                            event: "RECOVERY_STARTED",
+                            result: "STARTED")
         appendAutomaticEvent(
             generationID: automaticPostGeneration,
             phase: "ISOLATION_RECOVERY",
             event: "SOURCE_NAVIGATION_STARTED",
             result: "STARTED",
-            fields: [("THREAD_ID", recovery.sourceThreadID)]
+            fields: recoveryLogFields(recovery)
         )
         guard webView.load(URLRequest(url: recovery.sourceURL)) != nil else {
-            failIsolationRecovery(reason: "SOURCE_NAVIGATION_FAILED")
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_FAILED",
+                                result: "RETRYING",
+                                reason: "LOAD_NOT_STARTED")
+            scheduleIsolationRecoveryPoll()
             return
         }
     }
 
     private func failIsolationRecovery(reason: String) {
-        let threadID = isolationRecoveryContext?.sourceThreadID
+        isolationRecoveryReloadTask?.cancel()
+        isolationRecoveryReloadTask = nil
+        let recovery = isolationRecoveryContext
+        let storedNoticeContext = lastIsolationRecoveryNoticeContext
+        let threadID = recovery?.sourceThreadID ?? pendingRecoverySourceThreadID
         appendAutomaticEvent(
             generationID: automaticPostGeneration,
             phase: "ISOLATION_RECOVERY",
@@ -2243,11 +2551,174 @@ final class BrowserViewModel: ObservableObject {
             result: "STOPPED",
             fields: [
                 ("REASON", reason),
-                ("THREAD_ID", threadID ?? "UNAVAILABLE")
+                ("SOURCE_THREAD_ID", threadID ?? "UNAVAILABLE"),
+                ("RECOVERY_ID", recovery.map { String($0.recoveryID) } ??
+                    storedNoticeContext.map { String($0.recoveryID) } ?? "UNAVAILABLE"),
+                ("SESSION_ID", recovery.map { String($0.sessionID) } ??
+                    storedNoticeContext.map { String($0.sessionID) } ?? "UNAVAILABLE")
             ]
         )
+
+        // A recovery can fail after the replacement page has already started
+        // a fresh multi-thread generation (for example, while restoring the
+        // handwriting field). Reuse the normal terminal cleanup so no submit,
+        // AP, verification, or navigation task survives the dedicated notice.
+        if multiThreadSession != nil || automaticPostMachine.isActive {
+            finishMultiThreadSession(
+                generationID: automaticPostMachine.generationID,
+                result: "STOPPED_ISOLATION_RECOVERY_FAILED",
+                stopReason: .communicationFailure
+            )
+        }
         isolationRecoveryContext = nil
+        pendingRecoveryHandwritingRestoreID = nil
+        pendingRecoverySourceThreadID = nil
+        multiThreadBootstrapTask?.cancel()
+        multiThreadBootstrapTask = nil
+        multiThreadTransitionTask?.cancel()
+        multiThreadTransitionTask = nil
+        pendingMultiThreadNavigation = nil
+        pendingMultiThreadAvailabilityProbe = nil
+        pendingMultiThreadUnavailable = nil
+        automaticSceneBootstrapContext = nil
+        automaticScenePauseContext = nil
+        deferredSceneAutomaticEffect = nil
+        pendingUAChangeGeneration = nil
+        automaticReloadGeneration = nil
+        isUAChanging = false
+        isIdentityRefreshInProgress = false
+        automaticPostPreparationTimer?.cancel()
+        automaticPostPreparationTimer = nil
+        automaticSubmitReadinessTask?.cancel()
+        automaticSubmitReadinessTask = nil
+        cancelAutomaticSubmitResponseTimer()
+        automaticPostVerificationTask?.cancel()
+        automaticPostVerificationTask = nil
+        automaticPostStatusTask?.cancel()
+        automaticPostStatusTask = nil
+        automaticSubmitReadinessStableSince = nil
+        automaticSubmitReadinessDeadline = nil
+        automaticSubmitReadinessLastReason = nil
+        automaticSubmitReadinessFalseLogged = false
+        automaticSubmitReadinessReason = nil
+        automaticContinuousAPCompletedUptimeNanoseconds = nil
+        automaticPostRepeatDelayTask?.cancel()
+        automaticPostRepeatDelayTask = nil
+        cancelAutomaticContinuousAPRetryDelay()
+        cancelAutomaticProxyErrorRetry()
+        pendingHandwritingReady = nil
+        pendingHandwritingRestore = nil
+        automaticDraftRestorePendingGeneration = nil
+        pendingCookieRefresh = nil
+        isCookieRefreshing = false
+        pendingAP = nil
+        pendingAPCallbackReceived = false
+        automaticAPCallbackTimeoutTask?.cancel()
+        automaticAPCallbackTimeoutTask = nil
+        automaticAPSceneTransition = nil
+        automaticAPCompletionNeedsScenePause = false
+        isAPRunning = false
+        sceneAPResumeRetryTask?.cancel()
+        sceneAPResumeRetryTask = nil
+        multiThreadEnabled = false
+        multiThreadSession = nil
+        multiThreadSessionActive = false
+        automaticCatalogProvider?.endAutomaticSortDisplay()
+        clearAutomaticPostDraft()
+        setAutomaticPostStatusWithoutGeneration(.stopped)
+        if let recovery {
+            lastIsolationRecoveryNoticeContext = (
+                recovery.recoveryID,
+                recovery.sessionID,
+                recovery.sourceThreadID
+            )
+            let notice = IsolationStopNotice(
+                threadID: recovery.sourceThreadID,
+                mode: "MULTI_THREAD",
+                kind: .isolatedRecoveryFailed
+            )
+            isolationStopNotice = notice
+            appendRecoveryNoticeEvent(event: "NOTICE_PRESENTED",
+                                       result: "RECOVERY_FAILED",
+                                       notice: notice,
+                                       recovery: recovery)
+        } else if let threadID {
+            let notice = IsolationStopNotice(
+                threadID: threadID,
+                mode: "MULTI_THREAD",
+                kind: .isolatedRecoveryFailed
+            )
+            isolationStopNotice = notice
+            appendRecoveryNoticeEvent(event: "NOTICE_PRESENTED",
+                                       result: "RECOVERY_FAILED",
+                                       notice: notice,
+                                       sourceThreadID: threadID)
+        }
         updateIdleTimerState()
+    }
+
+    private func appendRecoveryNoticeEvent(event: String,
+                                           result: String,
+                                           notice: IsolationStopNotice? = nil,
+                                           sourceThreadID: String? = nil,
+                                           recovery: IsolationRecoveryContext? = nil) {
+        let recovery = recovery ?? isolationRecoveryContext
+        let stored = lastIsolationRecoveryNoticeContext
+        let threadID = sourceThreadID ?? recovery?.sourceThreadID ??
+            notice?.threadID ?? stored?.sourceThreadID
+        appendAutomaticEvent(
+            generationID: automaticPostGeneration,
+            phase: "ISOLATION_RECOVERY",
+            event: event,
+            result: result,
+            fields: [
+                ("RECOVERY_ID", recovery.map { String($0.recoveryID) } ??
+                    stored.map { String($0.recoveryID) } ?? "UNAVAILABLE"),
+                ("SESSION_ID", recovery.map { String($0.sessionID) } ??
+                    stored.map { String($0.sessionID) } ?? "UNAVAILABLE"),
+                ("SOURCE_THREAD_ID", threadID ?? "UNAVAILABLE")
+            ]
+        )
+    }
+
+    private func recoveryLogFields(_ recovery: IsolationRecoveryContext,
+                                   replacementThreadID: String? = nil) -> [(String, String)] {
+        var fields: [(String, String)] = [
+            ("RECOVERY_ID", String(recovery.recoveryID)),
+            ("SESSION_ID", String(recovery.sessionID)),
+            ("SOURCE_THREAD_ID", recovery.sourceThreadID),
+            ("ATTEMPT", String(recovery.pollCount)),
+            ("REMAINING_SECONDS", String(recovery.remainingSeconds))
+        ]
+        if let replacementThreadID {
+            fields.append(("REPLACEMENT_THREAD_ID", replacementThreadID))
+        }
+        return fields
+    }
+
+    private func appendRecoveryEvent(recovery: IsolationRecoveryContext,
+                                     event: String,
+                                     result: String,
+                                     reason: String? = nil,
+                                     error: Error? = nil,
+                                     replacementThreadID: String? = nil) {
+        var fields = recoveryLogFields(recovery,
+                                       replacementThreadID: replacementThreadID)
+        if let reason {
+            fields.append(("REASON", reason))
+        }
+        if let error {
+            let nsError = error as NSError
+            fields.append(("ERROR_DOMAIN", nsError.domain))
+            fields.append(("ERROR_CODE", String(nsError.code)))
+        }
+        appendAutomaticEvent(
+            generationID: automaticPostGeneration,
+            phase: "ISOLATION_RECOVERY",
+            event: event,
+            result: result,
+            fields: fields
+        )
     }
 
     private func handleIsolationDetected(context: IsolationMonitorContext,
@@ -2263,6 +2734,40 @@ final class BrowserViewModel: ObservableObject {
 
     func setHandwritingImageAvailable(_ available: Bool) {
         handwritingImageAvailable = available
+    }
+
+    /// Recovery owns the WebView while it polls the isolated source page. Any
+    /// page-authored dialog during that bounded window would block navigation
+    /// or the next reload, so the coordinator completes it without presenting
+    /// a second modal surface.
+    var isIsolationRecoveryActive: Bool {
+        isolationRecoveryContext != nil ||
+            pendingRecoveryHandwritingRestoreID != nil ||
+            isolationStopNotice?.kind == .isolatedRecoveryFailed
+    }
+
+    func recordIsolationRecoveryDialogIgnored(type: String) {
+        if let recovery = isolationRecoveryContext {
+            appendRecoveryEvent(recovery: recovery,
+                                event: "RECOVERY_POLL_ATTEMPTED",
+                                result: "DIALOG_IGNORED",
+                                reason: type)
+            return
+        }
+        guard let stored = lastIsolationRecoveryNoticeContext else { return }
+        appendAutomaticEvent(
+            generationID: automaticPostGeneration,
+            phase: "ISOLATION_RECOVERY",
+            event: "RECOVERY_POLL_ATTEMPTED",
+            result: "DIALOG_IGNORED",
+            fields: [
+                ("RECOVERY_ID", String(stored.recoveryID)),
+                ("SESSION_ID", String(stored.sessionID)),
+                ("SOURCE_THREAD_ID", stored.sourceThreadID),
+                ("ATTEMPT", "RESTORE"),
+                ("REASON", type)
+            ]
+        )
     }
 
     /// Returns a recovery-only script for the exact page currently expected
@@ -2281,16 +2786,157 @@ final class BrowserViewModel: ObservableObject {
             }
             var updated = recovery
             updated.phase = .monitoringSource
+            updated.currentPageToken = nil
             isolationRecoveryContext = updated
             return IsolationRecoveryService.sourceThreadMonitorScript
         case let .waitingForReplacementImage(replacementURL):
             guard Self.sameTargetThreadURL(pageURL, replacementURL) else {
                 return nil
             }
+            var updated = recovery
+            updated.currentPageToken = nil
+            isolationRecoveryContext = updated
             return IsolationRecoveryService.replacementStarterImageCaptureScript
         case .monitoringSource:
-            return nil
+            guard Self.sameTargetThreadURL(pageURL, recovery.sourceURL) else {
+                return nil
+            }
+            var updated = recovery
+            updated.currentPageToken = nil
+            isolationRecoveryContext = updated
+            return IsolationRecoveryService.sourceThreadMonitorScript
         }
+    }
+
+    /// Called by the WebView coordinator after the recovery script has been
+    /// evaluated successfully. The reload timer is native so a page-level
+    /// script cannot accidentally consume the five-minute recovery budget.
+    func isolationRecoveryPageDidFinish(pageURL: URL?) {
+        guard let pageURL,
+              let recovery = isolationRecoveryContext else { return }
+        switch recovery.phase {
+        case .monitoringSource:
+            guard Self.sameTargetThreadURL(pageURL, recovery.sourceURL) else {
+                failIsolationRecovery(reason: "NAVIGATION_CHANGED")
+                return
+            }
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_COMPLETED",
+                                result: "READY")
+            scheduleIsolationRecoveryPoll()
+        case let .waitingForReplacementImage(replacementURL):
+            guard Self.sameTargetThreadURL(pageURL, replacementURL) else {
+                // The source-page script completion can arrive after a
+                // candidate message has already started replacement
+                // navigation. That callback belongs to the old page and must
+                // not turn a valid recovery into a false failure.
+                if Self.sameTargetThreadURL(pageURL, recovery.sourceURL) {
+                    return
+                }
+                failIsolationRecovery(reason: "NAVIGATION_CHANGED")
+                return
+            }
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_COMPLETED",
+                                result: "REPLACEMENT_PAGE_READY")
+        case .waitingForSource:
+            break
+        }
+    }
+
+    private func scheduleIsolationRecoveryPoll() {
+        guard appSceneIsActive,
+              let recovery = isolationRecoveryContext else {
+            return
+        }
+        let retrySourceNavigation: Bool
+        switch recovery.phase {
+        case .waitingForSource:
+            retrySourceNavigation = true
+        case .monitoringSource:
+            retrySourceNavigation = false
+        case .waitingForReplacementImage:
+            return
+        }
+        isolationRecoveryReloadTask?.cancel()
+        guard recovery.pollCount < Self.isolationRecoveryMaximumPolls else {
+            failIsolationRecovery(reason: "TIME_LIMIT_EXCEEDED")
+            return
+        }
+        let recoveryID = recovery.recoveryID
+        isolationRecoveryReloadTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: Self.isolationRecoveryPollIntervalNanoseconds
+                )
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.appSceneIsActive,
+                  var current = self.isolationRecoveryContext,
+                  current.recoveryID == recoveryID else {
+                return
+            }
+            switch current.phase {
+            case .waitingForSource, .monitoringSource:
+                break
+            case .waitingForReplacementImage:
+                return
+            }
+            self.isolationRecoveryReloadTask = nil
+            current.pollCount += 1
+            current.remainingSeconds = max(
+                0,
+                Self.isolationRecoveryMaximumDurationSeconds -
+                    current.pollCount * Int(Self.isolationRecoveryPollIntervalNanoseconds / 1_000_000_000)
+            )
+            current.currentPageToken = nil
+            self.isolationRecoveryContext = current
+            self.appendRecoveryEvent(recovery: current,
+                                     event: "RECOVERY_POLL_ATTEMPTED",
+                                     result: retrySourceNavigation
+                                         ? "SOURCE_NAVIGATION_RETRY"
+                                         : "RELOAD")
+            guard current.pollCount <= Self.isolationRecoveryMaximumPolls else {
+                self.failIsolationRecovery(reason: "TIME_LIMIT_EXCEEDED")
+                return
+            }
+            if retrySourceNavigation {
+                self.beginIsolationRecoverySourceNavigation()
+                return
+            }
+            guard let webView = self.webView,
+                  webView.reload() != nil else {
+                self.appendRecoveryEvent(recovery: current,
+                                         event: "RECOVERY_RELOAD_FAILED",
+                                         result: "RETRYING",
+                                         reason: "RELOAD_NOT_STARTED")
+                self.scheduleIsolationRecoveryPoll()
+                return
+            }
+        }
+    }
+
+    private func handleIsolationRecoveryTransientNavigationFailure(
+        url: URL?,
+        error: Error?,
+        reason: String
+    ) -> Bool {
+        guard let recovery = isolationRecoveryContext,
+              recovery.phase == .monitoringSource || recovery.phase == .waitingForSource,
+              let url = url ?? webView?.url,
+              Self.sameTargetThreadURL(url, recovery.sourceURL) else {
+            return false
+        }
+        appendRecoveryEvent(recovery: recovery,
+                            event: "RECOVERY_RELOAD_FAILED",
+                            result: "RETRYING",
+                            reason: reason,
+                            error: error)
+        scheduleIsolationRecoveryPoll()
+        return true
     }
 
     func isIsolationRecoveryPage(_ pageURL: URL?) -> Bool {
@@ -2315,12 +2961,28 @@ final class BrowserViewModel: ObservableObject {
               Self.sameTargetThreadURL(pageURL, replacementURL) else {
             return false
         }
-        return true
+        return recovery.currentPageToken == nil ||
+            recovery.currentPageToken == pageToken
     }
 
-    func handleIsolationRecoveryScriptFailure() {
-        guard isolationRecoveryContext != nil else { return }
-        failIsolationRecovery(reason: "SCRIPT_EVALUATION_FAILED")
+    func handleIsolationRecoveryScriptFailure(pageURL: URL? = nil) {
+        guard let recovery = isolationRecoveryContext else { return }
+        if case .waitingForReplacementImage = recovery.phase,
+           let pageURL,
+           Self.sameTargetThreadURL(pageURL, recovery.sourceURL) {
+            // A completion callback from the source-page monitor may be
+            // delivered after the candidate has already advanced the phase.
+            return
+        }
+        if recovery.phase == .monitoringSource {
+            appendRecoveryEvent(recovery: recovery,
+                                event: "RECOVERY_RELOAD_FAILED",
+                                result: "RETRYING",
+                                reason: "SCRIPT_EVALUATION_FAILED")
+            scheduleIsolationRecoveryPoll()
+        } else {
+            failIsolationRecovery(reason: "SCRIPT_EVALUATION_FAILED")
+        }
     }
 
     func handleIsolationRecoveryNoCandidate(pageToken: String,
@@ -2334,7 +2996,12 @@ final class BrowserViewModel: ObservableObject {
                                          reason: "RECOVERY_CONTEXT_MISMATCH")
             return
         }
-        failIsolationRecovery(reason: "NEXT_LINK_NOT_FOUND")
+        var updated = recovery
+        updated.currentPageToken = pageToken
+        isolationRecoveryContext = updated
+        appendRecoveryEvent(recovery: updated,
+                            event: "RECOVERY_POLL_ATTEMPTED",
+                            result: "NO_CANDIDATE")
     }
 
     func handleIsolationRecoveryCandidate(pageToken: String,
@@ -2362,9 +3029,10 @@ final class BrowserViewModel: ObservableObject {
                 with: normalizedCandidateURL
               ),
               let webView else {
-            // The injected monitor stops after its first candidate message.
-            // Treat a malformed/rejected candidate as terminal instead of
-            // leaving the recovery context in monitoringSource forever.
+            appendRecoveryEvent(recovery: recovery,
+                                event: "NEXT_THREAD_CANDIDATE_REJECTED",
+                                result: "STOPPED",
+                                reason: "INVALID_OR_SOURCE_URL")
             failIsolationRecovery(reason: "CANDIDATE_REJECTED")
             return
         }
@@ -2373,18 +3041,39 @@ final class BrowserViewModel: ObservableObject {
         updated.replacementURL = normalizedCandidateURL
         updated.replacementComment = replacementComment
         updated.phase = .waitingForReplacementImage(replacementURL: normalizedCandidateURL)
+        // The replacement document receives a fresh page token. Do not carry
+        // the isolated source token into the image-capture gate.
+        updated.currentPageToken = nil
         isolationRecoveryContext = updated
+        isolationRecoveryReloadTask?.cancel()
+        isolationRecoveryReloadTask = nil
+        let replacementCount = IsolationThreadURLParser.replacementCount(
+            inPostBody: recovery.comment,
+            sourceThreadID: recovery.sourceThreadID
+        )
+        appendRecoveryEvent(recovery: updated,
+                            event: "NEXT_THREAD_CANDIDATE_FOUND",
+                            result: "ACCEPTED",
+                            replacementThreadID: candidateID)
+        appendRecoveryEvent(recovery: updated,
+                            event: "COMMENT_URL_REPLACED",
+                            result: "READY",
+                            reason: "COUNT_\(replacementCount)",
+                            replacementThreadID: candidateID)
         appendAutomaticEvent(
             generationID: automaticPostGeneration,
             phase: "ISOLATION_RECOVERY",
-            event: "REPLACEMENT_THREAD_FOUND",
+            event: "SOURCE_NAVIGATION_STARTED",
             result: "NAVIGATING",
-            fields: [
-                ("SOURCE_THREAD_ID", recovery.sourceThreadID),
-                ("REPLACEMENT_THREAD_ID", candidateID)
-            ]
+            fields: recoveryLogFields(updated,
+                                      replacementThreadID: candidateID)
         )
         guard webView.load(URLRequest(url: normalizedCandidateURL)) != nil else {
+            appendRecoveryEvent(recovery: updated,
+                                event: "SOURCE_NAVIGATION_FAILED",
+                                result: "STOPPED",
+                                reason: "REPLACEMENT_LOAD_NOT_STARTED",
+                                replacementThreadID: candidateID)
             failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
             return
         }
@@ -2393,32 +3082,60 @@ final class BrowserViewModel: ObservableObject {
     func handleIsolationRecoveryImageCaptured(pageToken: String,
                                               pageURL: URL?,
                                               ready: Bool) {
+        guard let recovery = isolationRecoveryContext else {
+            recordAutomaticBridgeIgnored(type: "isolationRecoveryImage",
+                                         reason: "RECOVERY_CONTEXT_MISSING")
+            return
+        }
         guard !pageToken.isEmpty,
               let pageURL,
-              let recovery = isolationRecoveryContext,
               case let .waitingForReplacementImage(replacementURL) = recovery.phase,
               Self.sameTargetThreadURL(pageURL, replacementURL),
               ready,
               handwritingImageAvailable,
               let comment = recovery.replacementComment else {
+            if let recovery = isolationRecoveryContext {
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "STARTER_IMAGE_CAPTURE_FAILED",
+                                    result: "STOPPED")
+            }
             failIsolationRecovery(reason: "STARTER_IMAGE_CAPTURE_FAILED")
             return
         }
 
+        pendingRecoveryHandwritingRestoreID = recovery.recoveryID
+        pendingRecoverySourceThreadID = recovery.sourceThreadID
+        lastIsolationRecoveryNoticeContext = (
+            recovery.recoveryID,
+            recovery.sessionID,
+            recovery.sourceThreadID
+        )
         automaticCatalogProvider?.resetOpenHistory()
+        appendRecoveryEvent(recovery: recovery,
+                            event: "STARTER_IMAGE_CAPTURED",
+                            result: "READY",
+                            replacementThreadID: IsolationThreadURLParser.threadID(from: replacementURL))
+        appendRecoveryEvent(recovery: recovery,
+                            event: "HANDWRITING_RESTORE_STARTED",
+                            result: "STARTED",
+                            replacementThreadID: IsolationThreadURLParser.threadID(from: replacementURL))
+        appendRecoveryEvent(recovery: recovery,
+                            event: "OPEN_HISTORY_RESET",
+                            result: "READY",
+                            replacementThreadID: IsolationThreadURLParser.threadID(from: replacementURL))
         appendAutomaticEvent(
             generationID: automaticPostGeneration,
             phase: "ISOLATION_RECOVERY",
-            event: "REPLACEMENT_IMAGE_CAPTURED",
+            event: "RECOVERY_SESSION_RESTARTED",
             result: "RESTARTING",
-            fields: [
-                ("SOURCE_THREAD_ID", recovery.sourceThreadID),
-                ("REPLACEMENT_THREAD_ID",
-                 IsolationThreadURLParser.threadID(from: replacementURL) ?? "UNAVAILABLE")
-            ]
+            fields: recoveryLogFields(
+                recovery,
+                replacementThreadID: IsolationThreadURLParser.threadID(from: replacementURL)
+            )
         )
         isolationRecoveryContext = nil
         multiThreadEnabled = true
+        setAutomaticPostStatusWithoutGeneration(.refreshingCatalog)
         automaticPostGeneration &+= 1
         let generationID = automaticPostGeneration
         pendingUAChangeGeneration = generationID
@@ -2905,6 +3622,25 @@ final class BrowserViewModel: ObservableObject {
             result: ready ? "ACCEPTED" : "FAILED",
             fields: handwritingFields
         )
+        if let recoveryID = pendingRecoveryHandwritingRestoreID {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "ISOLATION_RECOVERY",
+                event: ready ? "HANDWRITING_RESTORE_READY" : "HANDWRITING_RESTORE_FAILED",
+                result: ready ? "READY" : "STOPPED",
+                fields: [
+                    ("RECOVERY_ID", String(recoveryID)),
+                    ("SESSION_ID", multiThreadSession.map { String($0.sessionID) } ?? "UNAVAILABLE")
+                ]
+            )
+            if !ready {
+                failIsolationRecovery(reason: "HANDWRITING_RESTORE_FAILED")
+                return
+            }
+            pendingRecoveryHandwritingRestoreID = nil
+            pendingRecoverySourceThreadID = nil
+            lastIsolationRecoveryNoticeContext = nil
+        }
         handleAutomaticPostEffect(effect, generationID: generationID)
     }
 
@@ -3174,6 +3910,11 @@ final class BrowserViewModel: ObservableObject {
     }
 
     func navigationCommitted(url: URL?) {
+        guard validateRecoveryBootstrapURL(url) else {
+            updateCurrentURL(url)
+            refreshNavigationState()
+            return
+        }
         if let recovery = isolationRecoveryContext {
             let expectedURL: URL
             switch recovery.phase {
@@ -3183,6 +3924,12 @@ final class BrowserViewModel: ObservableObject {
                 expectedURL = replacementURL
             }
             guard let url, Self.sameTargetThreadURL(url, expectedURL) else {
+                appendRecoveryEvent(
+                    recovery: recovery,
+                    event: "SOURCE_NAVIGATION_FAILED",
+                    result: "STOPPED",
+                    reason: "NAVIGATION_CHANGED"
+                )
                 failIsolationRecovery(reason: "NAVIGATION_CHANGED")
                 updateCurrentURL(url)
                 refreshNavigationState()
@@ -3191,6 +3938,23 @@ final class BrowserViewModel: ObservableObject {
         }
         updateCurrentURL(url)
         refreshNavigationState()
+    }
+
+    /// While the replacement page is being handed back to the ordinary
+    /// multi-thread bootstrap, a user redirect invalidates the recovery
+    /// context. Once the bootstrap creates a session, regular multi-thread
+    /// navigation owns the URL again and this check no longer applies.
+    private func validateRecoveryBootstrapURL(_ url: URL?) -> Bool {
+        guard isolationRecoveryContext == nil,
+              pendingRecoveryHandwritingRestoreID != nil,
+              let expectedURL = automaticSceneBootstrapContext?.pageURL else {
+            return true
+        }
+        guard let url, Self.sameTargetThreadURL(url, expectedURL) else {
+            failIsolationRecovery(reason: "URL_OR_TARGET_MISMATCH")
+            return false
+        }
+        return true
     }
 
     /// Handles a gateway/proxy error page before it can be mistaken for a
@@ -3202,6 +3966,39 @@ final class BrowserViewModel: ObservableObject {
                                       statusCode: Int?,
                                       source: String) -> Bool {
         guard let url, Self.isTargetThreadURL(url) else { return false }
+        let proxyReason = statusCode.map { "PROXY_\($0)" } ?? "PROXY_UNKNOWN"
+
+        if let recovery = isolationRecoveryContext,
+           Self.sameTargetThreadURL(url, recovery.sourceURL) {
+            if recovery.phase == .monitoringSource || recovery.phase == .waitingForSource {
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "RETRYING",
+                                    reason: proxyReason)
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "RECOVERY_RELOAD_FAILED",
+                                    result: "RETRYING",
+                                    reason: proxyReason)
+                scheduleIsolationRecoveryPoll()
+                return true
+            }
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_FAILED",
+                                result: "STOPPED",
+                                reason: proxyReason)
+            failIsolationRecovery(reason: "SOURCE_NAVIGATION_FAILED")
+            return true
+        }
+        if let recovery = isolationRecoveryContext,
+           case let .waitingForReplacementImage(replacementURL) = recovery.phase,
+           Self.sameTargetThreadURL(url, replacementURL) {
+            appendRecoveryEvent(recovery: recovery,
+                                event: "SOURCE_NAVIGATION_FAILED",
+                                result: "STOPPED",
+                                reason: "REPLACEMENT_\(proxyReason)")
+            failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+            return true
+        }
 
         if let session = multiThreadSession,
            let target = session.currentTarget,
@@ -3336,6 +4133,13 @@ final class BrowserViewModel: ObservableObject {
         updateCurrentURL(url)
         refreshNavigationState()
         if !appSceneIsActive, automaticScenePauseContext != nil {
+            return
+        }
+        guard validateRecoveryBootstrapURL(url) else { return }
+        // Recovery owns the source/replacement document. Do not run the
+        // ordinary posting bookmarklets while that document is being polled;
+        // BrowserWebView installs the recovery-only script separately.
+        if isolationRecoveryContext != nil {
             return
         }
         runAutomaticBookmarklets(for: url)
@@ -3809,8 +4613,43 @@ final class BrowserViewModel: ObservableObject {
            ) {
             return
         }
-        if isolationRecoveryContext != nil {
-            failIsolationRecovery(reason: "NAVIGATION_FAILED")
+        if let recovery = isolationRecoveryContext {
+            if recovery.phase == .monitoringSource,
+               handleIsolationRecoveryTransientNavigationFailure(
+                   url: url,
+                   error: error,
+                   reason: "NAVIGATION_FAILED"
+                ) {
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "RETRYING",
+                                    reason: "NAVIGATION_FAILED",
+                                    error: error)
+                return
+            }
+            switch recovery.phase {
+            case .waitingForReplacementImage:
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "STOPPED",
+                                    reason: "REPLACEMENT_NAVIGATION_FAILED",
+                                    error: error)
+                failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+            case .waitingForSource:
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "RETRYING",
+                                    reason: "NAVIGATION_FAILED",
+                                    error: error)
+                scheduleIsolationRecoveryPoll()
+            case .monitoringSource:
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "STOPPED",
+                                    reason: "NAVIGATION_FAILED",
+                                    error: error)
+                failIsolationRecovery(reason: "NAVIGATION_FAILED")
+            }
             return
         }
         showToast("読み込み失敗", kind: .failure)
@@ -3856,8 +4695,39 @@ final class BrowserViewModel: ObservableObject {
         if !appSceneIsActive, automaticScenePauseContext != nil {
             return
         }
-        if isolationRecoveryContext != nil {
-            failIsolationRecovery(reason: "NAVIGATION_TIMEOUT")
+        if let recovery = isolationRecoveryContext {
+            if recovery.phase == .monitoringSource,
+               handleIsolationRecoveryTransientNavigationFailure(
+                   url: url,
+                   error: nil,
+                   reason: "NAVIGATION_TIMEOUT"
+                ) {
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "RETRYING",
+                                    reason: "NAVIGATION_TIMEOUT")
+                return
+            }
+            switch recovery.phase {
+            case .waitingForReplacementImage:
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "STOPPED",
+                                    reason: "REPLACEMENT_NAVIGATION_TIMEOUT")
+                failIsolationRecovery(reason: "REPLACEMENT_NAVIGATION_FAILED")
+            case .waitingForSource:
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "RETRYING",
+                                    reason: "NAVIGATION_TIMEOUT")
+                scheduleIsolationRecoveryPoll()
+            case .monitoringSource:
+                appendRecoveryEvent(recovery: recovery,
+                                    event: "SOURCE_NAVIGATION_FAILED",
+                                    result: "STOPPED",
+                                    reason: "NAVIGATION_TIMEOUT")
+                failIsolationRecovery(reason: "NAVIGATION_TIMEOUT")
+            }
             return
         }
         showToast("読み込みタイムアウト", kind: .failure)
@@ -3915,7 +4785,9 @@ final class BrowserViewModel: ObservableObject {
 
         Task { [weak self] in
             guard let self else { return }
-            let after = await self.fetchIPv4AfterRecovery()
+            let generationID = Self.appPurposeGenerationID(context.purpose)
+            let after = await self.fetchIPv4AfterRecovery(generationID: generationID,
+                                                          purpose: context.purpose)
             guard self.pendingAP == context else { return }
             self.completeAP(before: context.beforeIPv4,
                             after: after,
@@ -4479,10 +5351,26 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
-    private func fetchIPv4AfterRecovery() async -> String? {
+    private func fetchIPv4AfterRecovery(generationID: UInt64?,
+                                        purpose: APPurpose) async -> String? {
         let delays: [UInt64] = [1_500_000_000, 2_000_000_000, 3_000_000_000, 4_000_000_000]
-        for delay in delays {
+        for (index, delay) in delays.enumerated() {
             try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled else { return nil }
+            let pathReady = await waitForAutomaticNetworkPath(
+                event: "NETWORK_POST_AP_GATE",
+                purpose: purpose
+            )
+            if let generationID {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "NETWORK",
+                    event: "NETWORK_POST_AP_ATTEMPT",
+                    result: pathReady ? "REQUESTING" : "DEFERRED",
+                    fields: [("ATTEMPT", String(index + 1))]
+                )
+            }
+            guard pathReady else { continue }
             if let value = try? await ipService.fetchIPv4(userAgent: effectiveUserAgent) {
                 return value
             }
@@ -4767,6 +5655,12 @@ final class BrowserViewModel: ObservableObject {
         automaticPostStatus = status
     }
 
+    private func setIsolationRecoveryStatus() {
+        automaticPostStatusTask?.cancel()
+        automaticPostStatusTask = nil
+        automaticPostStatus = .isolatedRecovery
+    }
+
     private func scheduleNextMultiThread(generationID: UInt64,
                                          afterSkippedThread: Bool = false) {
         let canContinueAfterSkip: Bool
@@ -4891,6 +5785,19 @@ final class BrowserViewModel: ObservableObject {
                 ("BATCH_SIZE", String(phase.batchSize))
             ]
         )
+        appendAutomaticEvent(
+            generationID: logGenerationID,
+            phase: "CATALOG",
+            event: "CATALOG_REFRESH_STARTED",
+            result: "STARTED",
+            fields: [
+                ("SORT", phase.sort.rawValue),
+                ("BATCH_NUMBER", String(session.phaseBatchNumber + 1)),
+                ("PHASE_PROCESSED_COUNT", String(session.phaseProcessedCount)),
+                ("PHASE_LIMIT", String(phase.phaseLimit)),
+                ("BATCH_SIZE", String(phase.batchSize))
+            ]
+        )
         let processed = session.processedThreadIDs.union(session.retainedPostThreadIDs)
         multiThreadTransitionTask?.cancel()
         multiThreadTransitionTask = Task { @MainActor [weak self] in
@@ -4914,6 +5821,20 @@ final class BrowserViewModel: ObservableObject {
                     generationID: logGenerationID,
                     phase: "CATALOG",
                     event: "CATALOG_BATCH_FETCH_COMPLETED",
+                    result: fetchedCount > 0 ? "SUCCESS" : "EMPTY",
+                    fields: [
+                        ("SORT", phase.sort.rawValue),
+                        ("BATCH_NUMBER", String(current.phaseBatchNumber)),
+                        ("FETCHED_COUNT", String(fetchedCount)),
+                        ("NEW_TARGET_COUNT", String(fetchedCount)),
+                        ("PHASE_PROCESSED_COUNT", String(current.phaseProcessedCount)),
+                        ("PHASE_LIMIT", String(phase.phaseLimit))
+                    ]
+                )
+                self.appendAutomaticEvent(
+                    generationID: logGenerationID,
+                    phase: "CATALOG",
+                    event: "CATALOG_REFRESH_COMPLETED",
                     result: fetchedCount > 0 ? "SUCCESS" : "EMPTY",
                     fields: [
                         ("SORT", phase.sort.rawValue),
@@ -5012,10 +5933,23 @@ final class BrowserViewModel: ObservableObject {
                 self.appendAutomaticEvent(
                     generationID: logGenerationID,
                     phase: "CATALOG",
+                    event: "CATALOG_REFRESH_FAILED",
+                    result: "STOPPED",
+                    fields: [
+                        ("SORT", phase.sort.rawValue),
+                        ("BATCH_NUMBER", String(session.phaseBatchNumber + 1)),
+                        ("REASON", "REQUEST_FAILED")
+                    ]
+                )
+                self.appendAutomaticEvent(
+                    generationID: logGenerationID,
+                    phase: "CATALOG",
                     event: "CATALOG_BATCH_FETCH_FAILED",
                     result: "STOPPED",
-                    fields: [("SORT", phase.sort.rawValue),
-                             ("REASON", "REQUEST_FAILED")]
+                    fields: [
+                        ("SORT", phase.sort.rawValue),
+                        ("REASON", "REQUEST_FAILED")
+                    ]
                 )
                 self.finishMultiThreadSession(
                     generationID: generationID,
@@ -5341,6 +6275,14 @@ final class BrowserViewModel: ObservableObject {
     private func presentAutomaticStopNotice(reason: AutomaticPostStopReason,
                                             threadID: String? = nil,
                                             mode: String? = nil) {
+        // An isolated multi-thread match enters delayed recovery. The
+        // ordinary stop effect still terminates the posting state machine, but
+        // presenting its generic alert here would interrupt the source-page
+        // monitor and start the alarm before recovery has had a chance.
+        if isolationRecoveryContext != nil ||
+           pendingRecoveryHandwritingRestoreID != nil {
+            return
+        }
         guard reason.requiresUserAlert,
               isolationStopNotice == nil else {
             return
@@ -5360,6 +6302,17 @@ final class BrowserViewModel: ObservableObject {
     private func finishMultiThreadSession(generationID: UInt64?,
                                           result: String,
                                           stopReason: AutomaticPostStopReason? = nil) {
+        // A recovery restart is not considered successful until the captured
+        // starter image has restored the handwriting field. If the fresh
+        // session terminates before that callback, route it through the
+        // dedicated recovery-failure notice instead of leaving the pending
+        // recovery marker to suppress future alerts.
+        if pendingRecoveryHandwritingRestoreID != nil,
+           result != "STOPPED_ISOLATION_RECOVERY_FAILED",
+           result != "STOPPED_USER_STOPPED" {
+            failIsolationRecovery(reason: "RECOVERY_SESSION_TERMINATED")
+            return
+        }
         let activeGenerationID = generationID ?? automaticPostMachine.generationID
         let hadSession = multiThreadSession != nil
         let finalLogContext = multiThreadSession.map {
@@ -6998,6 +7951,9 @@ final class BrowserViewModel: ObservableObject {
         case "ownPostVisible": return "OWN_POST_VISIBLE"
         case "ownPostObservation": return "OWN_POST_OBSERVATION"
         case "threadUnavailable": return "THREAD_UNAVAILABLE"
+        case "isolationRecoveryCandidate": return "ISOLATION_RECOVERY_CANDIDATE"
+        case "isolationRecoveryNoCandidate": return "ISOLATION_RECOVERY_NO_CANDIDATE"
+        case "isolationRecoveryImage": return "ISOLATION_RECOVERY_IMAGE"
         default: return "OTHER_BRIDGE_EVENT"
         }
     }

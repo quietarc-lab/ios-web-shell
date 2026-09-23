@@ -164,6 +164,15 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(deleted.kind.alertMessage,
                        "削除検知のため自動投稿を停止しました")
         XCTAssertEqual(deleted.kind.automaticStopReason, .deletedThread)
+
+        let recovery = IsolationStopNotice(
+            threadID: "789",
+            mode: "MULTI_THREAD",
+            kind: .isolatedRecoveryFailed
+        )
+        XCTAssertEqual(recovery.kind.alertTitle, "隔離スレ復旧失敗")
+        XCTAssertEqual(recovery.kind.alertMessage,
+                       "隔離スレの次スレ復旧に失敗したため自動投稿を停止しました")
     }
 
     func testModerationMatchKeepsIsolationDistinctWhenFeedRowsOverlap() {

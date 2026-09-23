@@ -561,6 +561,11 @@ struct BrowserWebView: UIViewRepresentable {
                 didComplete = true
                 completionHandler()
             }
+            if model.isIsolationRecoveryActive {
+                model.recordIsolationRecoveryDialogIgnored(type: "ALERT")
+                completeOnce()
+                return
+            }
             let host = frame.request.url?.host ?? webView.url?.host
             if let category = TargetPageAlertClassifier.category(host: host, message: message),
                let host {
@@ -601,6 +606,11 @@ struct BrowserWebView: UIViewRepresentable {
                 didComplete = true
                 completionHandler(value)
             }
+            if model.isIsolationRecoveryActive {
+                model.recordIsolationRecoveryDialogIgnored(type: "CONFIRM")
+                completeOnce(false)
+                return
+            }
             let alert = UIAlertController(title: dialogTitle(for: frame, webView: webView),
                                           message: message,
                                           preferredStyle: .alert)
@@ -625,6 +635,11 @@ struct BrowserWebView: UIViewRepresentable {
                 guard !didComplete else { return }
                 didComplete = true
                 completionHandler(value)
+            }
+            if model.isIsolationRecoveryActive {
+                model.recordIsolationRecoveryDialogIgnored(type: "PROMPT")
+                completeOnce(nil)
+                return
             }
             let alert = UIAlertController(title: dialogTitle(for: frame, webView: webView),
                                           message: prompt,
@@ -692,9 +707,13 @@ struct BrowserWebView: UIViewRepresentable {
                                                              url: URL?) {
             guard let script = model.isolationRecoveryScript(for: url) else { return }
             webView.evaluateJavaScript(script) { [weak self] _, error in
-                guard let self, error != nil else { return }
+                guard let self else { return }
                 Task { @MainActor in
-                    self.model.handleIsolationRecoveryScriptFailure()
+                    if error != nil {
+                        self.model.handleIsolationRecoveryScriptFailure(pageURL: url)
+                    } else {
+                        self.model.isolationRecoveryPageDidFinish(pageURL: url)
+                    }
                 }
             }
         }

@@ -100,7 +100,7 @@ function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
     .replaceAll("minibrowser", "pagehelper");
   const messages = [];
   let mutationCallback = null;
-  let intervalCallback = null;
+  let timeoutCallback = null;
   const container = {
     innerText: renderedText,
     textContent: options.textContent ?? renderedText,
@@ -113,7 +113,7 @@ function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
     parentElement: container
   };
   const previousGlobals = new Map();
-  for (const name of ["window", "document", "location", "MutationObserver", "setInterval", "clearInterval"]) {
+  for (const name of ["window", "document", "location", "MutationObserver", "setTimeout", "clearTimeout"]) {
     previousGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
   }
   globalThis.window = {
@@ -131,8 +131,8 @@ function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
     observe() {}
     disconnect() {}
   };
-  globalThis.setInterval = callback => { intervalCallback = callback; return 1; };
-  globalThis.clearInterval = () => {};
+  globalThis.setTimeout = callback => { timeoutCallback = callback; return 1; };
+  globalThis.clearTimeout = () => {};
 
   try {
     new Function(monitor)();
@@ -141,7 +141,7 @@ function runNextLinkFixture(projectRoot, renderedText, href, options = {}) {
       container.textContent = options.updatedTextContent ?? options.updatedRenderedText;
       mutationCallback?.();
     }
-    for (let tick = 0; tick < (options.ticks ?? 0); tick += 1) intervalCallback?.();
+    if (options.fireTimeout) timeoutCallback?.();
     return messages;
   } finally {
     for (const [name, descriptor] of previousGlobals) {
@@ -208,14 +208,14 @@ assert.equal(
   "a next link inserted after initial page load should be detected"
 );
 assert.equal(
-  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, { ticks: 240 })[0]?.type,
+  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL)[0]?.type,
   undefined,
-  "the extended monitor should still be active before its timeout"
+  "a page without a next marker should not emit a candidate"
 );
 assert.equal(
-  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, { ticks: 300 })[0]?.type,
+  runNextLinkFixture(projectRoot, `本文\n${nextURL}`, nextURL, { fireTimeout: true })[0]?.type,
   "isolationRecoveryNoCandidate",
-  "a five-minute monitor with no next link should report a terminal no-candidate result"
+  "a loaded page without a next link should report a diagnostic no-candidate result"
 );
 
 console.log(`Injected JavaScript syntax and next-link fixture checks passed (${sources.length + generatedSources.length} scripts).`);
