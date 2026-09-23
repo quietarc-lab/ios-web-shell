@@ -173,7 +173,7 @@ enum IsolationRecoveryService {
           .trim()
           .replace(/^>\s*/, "")
           .trim();
-        return normalized === "次" || normalized.endsWith("次");
+        return normalized.includes("次");
       };
 
       const hasImmediatelyPrecedingNextLine = anchor => {
@@ -188,13 +188,19 @@ enum IsolationRecoveryService {
           if (linkLineIndex > 0 && isNextMarker(lines[linkLineIndex - 1])) {
             return true;
           }
+          if (linkLineIndex + 1 < lines.length &&
+              isNextMarker(lines[linkLineIndex + 1])) {
+            return true;
+          }
 
           // Some posts put the explanation and the URL on one line, e.g.
-          // 「隔離されたから次 https://img.2chan.net/b/res/...」.
+          // 「隔離されたから次 https://img.2chan.net/b/res/...」 or put
+          // the marker after the URL on that same line.
           const linkLine = lines[linkLineIndex];
           const linkOffset = linkLine.indexOf(linkText);
-          return linkOffset > 0 &&
-            isNextMarker(linkLine.slice(0, linkOffset));
+          if (linkOffset < 0) return false;
+          return isNextMarker(linkLine.slice(0, linkOffset)) ||
+            isNextMarker(linkLine.slice(linkOffset + linkText.length));
         };
 
         let container = anchor.parentElement;

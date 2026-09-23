@@ -173,6 +173,11 @@ assert.equal(
   "a same-line explanatory next marker should be detected"
 );
 assert.equal(
+  runNextLinkFixture(projectRoot, `${nextURL}\n隔離されたから次`, nextURL)[0]?.threadURL,
+  nextURL,
+  "a URL immediately before an explanatory next marker should be detected"
+);
+assert.equal(
   runNextLinkFixture(projectRoot, "", nextURL, {
     textContent: `隔離されたから次\n${nextURL}`
   })[0]?.threadURL,
@@ -181,13 +186,13 @@ assert.equal(
 );
 assert.equal(
   runNextLinkFixture(projectRoot, `説明\n次のスレ\n${nextURL}`, nextURL).length,
-  0,
-  "a different line between 次 and the URL must not be treated as a next link"
+  1,
+  "any line containing 次 immediately before the URL should be detected"
 );
 assert.equal(
-  runNextLinkFixture(projectRoot, `次\n\n${nextURL}`, nextURL).length,
+  runNextLinkFixture(projectRoot, `次\n説明\n${nextURL}`, nextURL).length,
   0,
-  "a blank line between 次 and the URL must not be treated as immediate"
+  "a non-adjacent URL must not be treated as a next link"
 );
 assert.equal(
   runNextLinkFixture(projectRoot, `次\n${nextURL}`, "https://img.2chan.net/c/res/1471234519.htm")
