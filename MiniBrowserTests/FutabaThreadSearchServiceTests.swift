@@ -14,7 +14,7 @@ final class FutabaThreadSearchServiceTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "UA test")
         XCTAssertEqual(
             String(data: try XCTUnwrap(request.httpBody), encoding: .utf8),
-            "mode=search&keyword=%92%E8%8C%5E+%81%E5+%81%E5"
+            "mode=search&keyword=%92%E8%8C%5E+%81E+%81E"
         )
     }
 
