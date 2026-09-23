@@ -235,6 +235,21 @@ final class BrowserViewModelTests: XCTestCase {
         XCTAssertEqual(AutomaticPostFlowMachine.continuousAPReconnectAttemptLimit, 3)
     }
 
+    func testAutomaticAPDiagnosticSanitizesShortcutCallbackValues() {
+        XCTAssertEqual(AutomaticAPDiagnostic.callbackStatus("success"), "SUCCESS")
+        XCTAssertEqual(AutomaticAPDiagnostic.callbackStatus("CANCELED"), "CANCEL")
+        XCTAssertEqual(AutomaticAPDiagnostic.callbackStatus("error"), "ERROR")
+        XCTAssertEqual(AutomaticAPDiagnostic.callbackStatus("unexpected-payload"), "OTHER")
+        XCTAssertEqual(AutomaticAPDiagnostic.callbackStatus(nil), "SUCCESS_DEFAULT")
+
+        XCTAssertEqual(AutomaticAPDiagnostic.errorCode("-1009"), "-1009")
+        XCTAssertEqual(AutomaticAPDiagnostic.errorCode(" 42 "), "42")
+        XCTAssertEqual(AutomaticAPDiagnostic.errorCode("not-a-code"), "UNAVAILABLE")
+        XCTAssertEqual(AutomaticAPDiagnostic.errorCode("1000000"), "UNAVAILABLE")
+        XCTAssertEqual(AutomaticAPDiagnostic.errorMessagePresent("failure"), "YES")
+        XCTAssertEqual(AutomaticAPDiagnostic.errorMessagePresent("  "), "NO")
+    }
+
     func testMultiThreadToggleStartsOffIsNotPersistedAndIsExclusive() {
         let suiteName = "BrowserViewModelTests.multiThreadToggle.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!

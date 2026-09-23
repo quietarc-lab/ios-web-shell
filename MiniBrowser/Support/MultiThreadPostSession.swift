@@ -144,6 +144,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
     var phaseBatchNumber: Int
     var emptyPhases: Set<MultiThreadPostPhase>
     var stopRequested: Bool
+    var stopRequestSource: String?
     var currentGenerationID: UInt64?
     var currentTargetID: String?
     /// Number of targets whose site completion marker was accepted since the
@@ -172,6 +173,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
         self.phaseBatchNumber = 1
         self.emptyPhases = []
         self.stopRequested = false
+        self.stopRequestSource = nil
         self.currentGenerationID = nil
         self.currentTargetID = snapshot.targets.first?.id
         self.postsSinceUserAgentChange = 0

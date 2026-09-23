@@ -321,6 +321,7 @@ final class BrowserViewModel: ObservableObject {
         let comment: String?
         let hasImage: Bool
         var stopRequested: Bool
+        var stopRequestSource: String?
     }
 
     private struct AutomaticLogContext {
@@ -333,6 +334,8 @@ final class BrowserViewModel: ObservableObject {
         let sessionID: UInt64
         let targetIndex: Int
         let threadID: String?
+        let stopRequested: Bool
+        let stopRequestSource: String?
     }
 
     private struct PendingCookieRefresh {
@@ -799,7 +802,20 @@ final class BrowserViewModel: ObservableObject {
             }
             guard var session = multiThreadSession else { return }
             session.stopRequested = true
+            session.stopRequestSource = "USER_TOGGLE"
             multiThreadSession = session
+            if let generationID = automaticPostMachine.generationID {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "FLOW",
+                    event: "MULTI_THREAD_STOP_REQUESTED",
+                    result: "REQUESTED",
+                    fields: [
+                        ("SOURCE", "USER_TOGGLE"),
+                        ("STATE", String(describing: automaticPostMachine.state))
+                    ]
+                )
+            }
             // A click already dispatched to the site is allowed to finish,
             // but OFF must revoke every unsent readiness/retry/transition
             // effect. Otherwise a delayed bridge callback could authorize a
@@ -1172,7 +1188,19 @@ final class BrowserViewModel: ObservableObject {
         sameThreadRepeatEnabled.toggle()
         guard var session = automaticPostRepeatSession else { return }
         session.stopRequested = !sameThreadRepeatEnabled
+        session.stopRequestSource = sameThreadRepeatEnabled ? nil : "USER_TOGGLE"
         automaticPostRepeatSession = session
+
+        if !sameThreadRepeatEnabled,
+           let generationID = automaticPostMachine.generationID {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "REPEAT",
+                event: "REPEAT_STOP_REQUESTED",
+                result: "REQUESTED",
+                fields: [("SOURCE", "USER_TOGGLE")]
+            )
+        }
 
         guard !sameThreadRepeatEnabled,
               case .succeeded = automaticPostMachine.state,
@@ -1330,7 +1358,8 @@ final class BrowserViewModel: ObservableObject {
                     pageToken: nil,
                     comment: comment?.isEmpty == false ? comment : nil,
                     hasImage: hasImage,
-                    stopRequested: false
+                    stopRequested: false,
+                    stopRequestSource: nil
                 )
             }
         } else {
@@ -1511,8 +1540,39 @@ final class BrowserViewModel: ObservableObject {
                 self.scheduleAPResumeRetryIfNeeded(generationID: generationID)
             }
 
-            guard let shortcutURL = Self.cellularReconnectURL(),
-                  await Self.openExternalURL(shortcutURL) else {
+            guard let shortcutURL = Self.cellularReconnectURL() else {
+                if let generationID = Self.appPurposeGenerationID(purpose) {
+                    self.appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "AP",
+                        event: "AP_SHORTCUT_OPEN_RESULT",
+                        result: "REJECTED",
+                        fields: [
+                            ("PURPOSE", Self.appPurposeLabel(purpose)),
+                            ("REASON", "SHORTCUT_URL_INVALID")
+                        ]
+                    )
+                }
+                self.finishAPFailure(status: "SHORTCUT_URL_INVALID",
+                                     before: before,
+                                     reloadAfterCompletion: reloadAfterCompletion,
+                                     purpose: purpose)
+                return
+            }
+            let opened = await Self.openExternalURL(shortcutURL)
+            if let generationID = Self.appPurposeGenerationID(purpose) {
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "AP",
+                    event: "AP_SHORTCUT_OPEN_RESULT",
+                    result: opened ? "OPENED" : "REJECTED",
+                    fields: [
+                        ("PURPOSE", Self.appPurposeLabel(purpose)),
+                        ("SCENE_ACTIVE", self.appSceneIsActive ? "YES" : "NO")
+                    ]
+                )
+            }
+            guard opened else {
                 self.finishAPFailure(status: "SHORTCUT_OPEN_FAILED",
                                      before: before,
                                      reloadAfterCompletion: reloadAfterCompletion,
@@ -1668,7 +1728,14 @@ final class BrowserViewModel: ObservableObject {
                     generationID: generationID,
                     phase: "SCENE",
                     event: "SCENE_ACTIVATED",
-                    result: "AP_EXPECTED"
+                    result: "AP_EXPECTED",
+                    fields: [
+                        ("AP_PURPOSE", Self.appPurposeLabel(context.purpose)),
+                        ("AP_RUNNING", isAPRunning ? "YES" : "NO"),
+                        ("PENDING_AP", pendingAP == nil ? "NO" : "YES"),
+                        ("AP_CALLBACK_RECEIVED", pendingAPCallbackReceived ? "YES" : "NO"),
+                        ("SCENE_BECAME_INACTIVE", context.sceneBecameInactive ? "YES" : "NO")
+                    ]
                 )
                 scheduleAPResumeRetryIfNeeded(generationID: generationID)
             } else {
@@ -1695,7 +1762,11 @@ final class BrowserViewModel: ObservableObject {
             result: "AP_EXPECTED",
             fields: [
                 ("STATE", String(describing: automaticPostMachine.state)),
-                ("ATTEMPT", String(automaticPostMachine.lastAttempt))
+                ("ATTEMPT", String(automaticPostMachine.lastAttempt)),
+                ("AP_PURPOSE", Self.appPurposeLabel(context.purpose)),
+                ("AP_RUNNING", isAPRunning ? "YES" : "NO"),
+                ("PENDING_AP", pendingAP == nil ? "NO" : "YES"),
+                ("AP_CALLBACK_RECEIVED", pendingAPCallbackReceived ? "YES" : "NO")
             ]
         )
     }
@@ -1747,7 +1818,11 @@ final class BrowserViewModel: ObservableObject {
                 result: "PAUSED",
                 fields: [
                     ("STATE", String(describing: automaticPostMachine.state)),
-                    ("ATTEMPT", String(automaticPostMachine.lastAttempt))
+                    ("ATTEMPT", String(automaticPostMachine.lastAttempt)),
+                    ("AP_CONTEXT_PRESENT", automaticAPSceneTransition == nil ? "NO" : "YES"),
+                    ("AP_RUNNING", isAPRunning ? "YES" : "NO"),
+                    ("PENDING_AP", pendingAP == nil ? "NO" : "YES"),
+                    ("AP_CALLBACK_RECEIVED", pendingAPCallbackReceived ? "YES" : "NO")
                 ]
             )
             setAutomaticPostStatus(.scenePaused, generationID: generationID)
@@ -2323,11 +2398,25 @@ final class BrowserViewModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain,
+               nsError.code == NSURLErrorCancelled {
+                if let generationID = automaticPostMachine.generationID,
+                   automaticPostMachine.isActive {
+                    appendAutomaticEvent(
+                        generationID: generationID,
+                        phase: "ISOLATION",
+                        event: "MONITOR_CANCELLED",
+                        result: "IGNORED",
+                        fields: [("REASON", "TASK_CANCELLED")]
+                    )
+                }
+                return
+            }
             guard !isolationMonitorFailureLogged else { return }
             isolationMonitorFailureLogged = true
             guard let generationID = automaticPostMachine.generationID,
                   automaticPostMachine.isActive else { return }
-            let nsError = error as NSError
             appendAutomaticEvent(
                 generationID: generationID,
                 phase: "ISOLATION",
@@ -4763,14 +4852,55 @@ final class BrowserViewModel: ObservableObject {
 
     func handleCallbackURL(_ url: URL) {
         guard url.scheme?.lowercased() == "minibrowser",
-              url.host?.lowercased() == "return",
-              isAPRunning,
-              let context = pendingAP else { return }
+              url.host?.lowercased() == "return" else { return }
 
-        let status = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-            .queryItems?.first(where: { $0.name == "status" })?.value ?? "success"
-        guard status == "success" else {
-            finishAPFailure(status: "CALLBACK_\(status.uppercased())",
+        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func queryValue(_ name: String) -> String? {
+            queryItems.first(where: { $0.name.lowercased() == name.lowercased() })?.value
+        }
+        let rawStatus = queryValue("status")
+        let diagnosticStatus = AutomaticAPDiagnostic.callbackStatus(rawStatus)
+        let callbackErrorCode = AutomaticAPDiagnostic.errorCode(queryValue("errorCode"))
+        let callbackErrorMessage = AutomaticAPDiagnostic.errorMessagePresent(queryValue("errorMessage"))
+
+        guard isAPRunning, let context = pendingAP else {
+            if let generationID = automaticPostMachine.generationID {
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "AP",
+                    event: "AP_CALLBACK_IGNORED",
+                    result: "IGNORED",
+                    fields: [
+                        ("CALLBACK_STATUS", diagnosticStatus),
+                        ("REASON", isAPRunning ? "PENDING_CONTEXT_MISSING" : "AP_NOT_RUNNING"),
+                        ("ERROR_CODE", callbackErrorCode),
+                        ("ERROR_MESSAGE_PRESENT", callbackErrorMessage)
+                    ]
+                )
+            }
+            return
+        }
+
+        if let generationID = Self.appPurposeGenerationID(context.purpose) {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "AP",
+                event: "AP_CALLBACK_RECEIVED",
+                result: diagnosticStatus == "SUCCESS" || diagnosticStatus == "SUCCESS_DEFAULT"
+                    ? "ACCEPTED"
+                    : "REJECTED",
+                fields: [
+                    ("CALLBACK_STATUS", diagnosticStatus),
+                    ("ERROR_CODE", callbackErrorCode),
+                    ("ERROR_MESSAGE_PRESENT", callbackErrorMessage),
+                    ("PURPOSE", Self.appPurposeLabel(context.purpose)),
+                    ("SCENE_ACTIVE", appSceneIsActive ? "YES" : "NO")
+                ]
+            )
+        }
+
+        guard diagnosticStatus == "SUCCESS" || diagnosticStatus == "SUCCESS_DEFAULT" else {
+            finishAPFailure(status: "CALLBACK_\(diagnosticStatus)",
                             before: context.beforeIPv4,
                             reloadAfterCompletion: context.reloadAfterCompletion,
                             purpose: context.purpose)
@@ -5398,6 +5528,22 @@ final class BrowserViewModel: ObservableObject {
         let shouldPauseAfterCompletion = automaticAPSceneTransition?.purpose == purpose &&
             automaticAPSceneTransition?.sceneBecameInactive == true &&
             !appSceneIsActive
+        if let generationID = Self.appPurposeGenerationID(purpose) {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "AP",
+                event: "AP_COMPLETION_SCENE_DECISION",
+                result: shouldPauseAfterCompletion ? "PAUSE_REQUIRED" : "CONTINUE",
+                fields: [
+                    ("PURPOSE", Self.appPurposeLabel(purpose)),
+                    ("SCENE_ACTIVE", appSceneIsActive ? "YES" : "NO"),
+                    ("SCENE_BECAME_INACTIVE",
+                     automaticAPSceneTransition?.sceneBecameInactive == true ? "YES" : "NO"),
+                    ("PENDING_AP", pendingAP == nil ? "NO" : "YES"),
+                    ("CALLBACK_RECEIVED", pendingAPCallbackReceived ? "YES" : "NO")
+                ]
+            )
+        }
         if automaticAPSceneTransition?.purpose == purpose {
             automaticAPSceneTransition = nil
         }
@@ -6097,6 +6243,13 @@ final class BrowserViewModel: ObservableObject {
         )
 
         guard !session.stopRequested else {
+            if let generationID = session.currentGenerationID {
+                appendStopRequestEnforced(
+                    generationID: generationID,
+                    source: session.stopRequestSource,
+                    location: "SKIP_PENDING_TARGET"
+                )
+            }
             finishMultiThreadSession(generationID: session.currentGenerationID,
                                      result: "STOPPED_MULTI_THREAD_DISABLED")
             return
@@ -6253,6 +6406,11 @@ final class BrowserViewModel: ObservableObject {
         )
         guard !session.stopRequested else {
             multiThreadSession = session
+            appendStopRequestEnforced(
+                generationID: generationID,
+                source: session.stopRequestSource,
+                location: "SKIP_ACTIVE_TARGET"
+            )
             scheduleNextMultiThread(generationID: generationID,
                                     afterSkippedThread: true)
             return
@@ -6319,7 +6477,9 @@ final class BrowserViewModel: ObservableObject {
             MultiThreadLogContext(
                 sessionID: $0.sessionID,
                 targetIndex: $0.currentIndex + 1,
-                threadID: $0.currentTargetID
+                threadID: $0.currentTargetID,
+                stopRequested: $0.stopRequested,
+                stopRequestSource: $0.stopRequestSource
             )
         }
         if let reason = stopReason ?? Self.automaticStopReason(for: result) {
@@ -6402,6 +6562,11 @@ final class BrowserViewModel: ObservableObject {
         }
         if multiThreadSession?.stopRequested == true,
            automaticPostMachine.isActive {
+            appendStopRequestEnforced(
+                generationID: generationID,
+                source: multiThreadSession?.stopRequestSource,
+                location: "AUTOMATIC_EFFECT_GATE"
+            )
             let stopEffect = automaticPostMachine.stop(.repeatDisabled)
             handleAutomaticPostEffect(stopEffect, generationID: generationID)
             return
@@ -7273,6 +7438,11 @@ final class BrowserViewModel: ObservableObject {
 
     private func submitAutomatically(attempt: Int, generationID: UInt64) {
         if multiThreadSession?.stopRequested == true {
+            appendStopRequestEnforced(
+                generationID: generationID,
+                source: multiThreadSession?.stopRequestSource,
+                location: "SUBMIT_GATE"
+            )
             stopAutomaticPost(.repeatDisabled, generationID: generationID)
             return
         }
@@ -7597,6 +7767,10 @@ final class BrowserViewModel: ObservableObject {
             if let multiThreadContext {
                 metadata.append(("SESSION_ID", String(multiThreadContext.sessionID)))
                 metadata.append(("TARGET_INDEX", String(multiThreadContext.targetIndex)))
+                metadata.append(("STOP_REQUESTED",
+                                 multiThreadContext.stopRequested ? "YES" : "NO"))
+                metadata.append(("STOP_REQUEST_SOURCE",
+                                 multiThreadContext.stopRequestSource ?? "UNAVAILABLE"))
                 if let threadID = multiThreadContext.threadID {
                     metadata.append(("THREAD_ID", threadID))
                 }
@@ -7766,6 +7940,8 @@ final class BrowserViewModel: ObservableObject {
             fields.append(("TARGET_INDEX", String(session.currentIndex + 1)))
             fields.append(("POSTS_SINCE_UA_CHANGE",
                            String(session.postsSinceUserAgentChange)))
+            fields.append(("STOP_REQUESTED", session.stopRequested ? "YES" : "NO"))
+            fields.append(("STOP_REQUEST_SOURCE", session.stopRequestSource ?? "UNAVAILABLE"))
             if let targetID = session.currentTargetID {
                 fields.append(("THREAD_ID", targetID))
             }
@@ -7787,6 +7963,21 @@ final class BrowserViewModel: ObservableObject {
                                               result: result)
         allFields.append(contentsOf: fields)
         logStore.append(action: "Automatic Post Event", fields: allFields)
+    }
+
+    private func appendStopRequestEnforced(generationID: UInt64,
+                                           source: String?,
+                                           location: String) {
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "FLOW",
+            event: "STOP_REQUEST_ENFORCED",
+            result: "STOPPED",
+            fields: [
+                ("SOURCE", source ?? "UNAVAILABLE"),
+                ("LOCATION", location)
+            ]
+        )
     }
 
     func recordAutomaticBridgeIgnored(type: String, reason: String) {
@@ -8153,6 +8344,19 @@ final class BrowserViewModel: ObservableObject {
              let .automaticIPRetry(generationID),
              let .automaticContinuousRetry(generationID):
             return generationID
+        }
+    }
+
+    private static func appPurposeLabel(_ purpose: APPurpose) -> String {
+        switch purpose {
+        case .manual:
+            return "MANUAL"
+        case .identityRefresh:
+            return "UA_REFRESH"
+        case .automaticIPRetry:
+            return "AUTOMATIC_IP_RETRY"
+        case .automaticContinuousRetry:
+            return "AUTOMATIC_CONTINUOUS_RETRY"
         }
     }
 
