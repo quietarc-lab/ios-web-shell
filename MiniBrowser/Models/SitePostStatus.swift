@@ -15,6 +15,7 @@ enum AutomaticPostStatus: String, Equatable {
     case finalSendAfterIPChange = "IP変更後に最終送信"
     case switchingAfterAccessRestriction = "アクセス規制 → 次のUAへ"
     case switchingAfterContinuousLimit = "連続制限 → 次のUAへ"
+    case switchingAfterImageLimit = "画像投稿制限 → 次のUAへ"
     case reconnectingAfterContinuousLimit = "連続制限 → AP再接続中"
     case finalSendAfterContinuousLimit = "AP後に最終送信"
     case waitingForRepeat = "同スレ次回待機"
@@ -36,6 +37,7 @@ enum AutomaticPostStatus: String, Equatable {
         case .preparingUA, .checkingCookie, .preparingNextThread, .sending, .cookieRetry,
              .reconnectingAfterIPLimit, .finalSendAfterIPChange,
              .switchingAfterAccessRestriction, .switchingAfterContinuousLimit,
+             .switchingAfterImageLimit,
              .reconnectingAfterContinuousLimit,
              .finalSendAfterContinuousLimit, .waitingForRepeat,
              .waitingForNextThread, .navigatingToNextThread,

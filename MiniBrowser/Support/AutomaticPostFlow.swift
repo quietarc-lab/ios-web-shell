@@ -159,6 +159,10 @@ enum AutomaticPostFlowEffect: Equatable {
     /// continuous-posting restriction. The coordinator decides whether this
     /// is the first UA handoff for the target or a per-target skip.
     case handoffAfterContinuousLimit
+    /// Multi-thread-only terminal recovery for a repeated image-posting
+    /// restriction. The coordinator performs one UA handoff, then skips the
+    /// target if the restriction is reported again.
+    case handoffAfterImageLimit
     case skipCurrentThread
     case succeeded
     case stopped(AutomaticPostStopReason)
@@ -784,6 +788,12 @@ struct AutomaticPostFlowMachine {
             guard !ipRetryUsed,
                   !continuousRetryUsed,
                   attempt < Self.regularAttemptLimit else {
+                if isMultiThread {
+                    state = .stopped(generationID: generationID,
+                                     reason: .knownAlertAfterLimit)
+                    awaitingSubmitResponseRetry = false
+                    return (true, .handoffAfterImageLimit)
+                }
                 return (true, stop(.knownAlertAfterLimit))
             }
             ipRetryUsed = true

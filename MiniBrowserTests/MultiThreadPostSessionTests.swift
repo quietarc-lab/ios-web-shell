@@ -163,6 +163,29 @@ final class MultiThreadPostSessionTests: XCTestCase {
         XCTAssertFalse(session.continuousRestrictionHandoffUsed)
     }
 
+    func testImageRestrictionHandoffIsPerTargetAndForcesNextUAOnSkip() {
+        let targets = (1...2).map { id in
+            CatalogPostTarget(
+                id: String(id),
+                threadURL: URL(string: "https://img.2chan.net/b/res/\(id).htm")!
+            )
+        }
+        var session = MultiThreadPostSession(
+            sessionID: 6,
+            snapshot: CatalogPostSnapshot(sort: .momentum, targets: targets),
+            comment: "draft",
+            hasImage: true
+        )
+
+        session.imageRestrictionHandoffUsed = true
+        session.forceUserAgentRotation()
+        XCTAssertTrue(session.shouldRotateUserAgent)
+        session.markCurrentProcessed()
+        XCTAssertEqual(session.advanceToNextUnprocessed()?.id, "2")
+        XCTAssertFalse(session.imageRestrictionHandoffUsed)
+        XCTAssertTrue(session.shouldRotateUserAgent)
+    }
+
     func testPhaseBatchSizingAndAlternation() {
         XCTAssertEqual(MultiThreadPostPhase.momentum.batchSize, 20)
         XCTAssertEqual(MultiThreadPostPhase.momentum.phaseLimit, 60)

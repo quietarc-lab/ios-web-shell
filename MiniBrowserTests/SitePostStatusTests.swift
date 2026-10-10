@@ -23,6 +23,8 @@ final class SitePostStatusTests: XCTestCase {
                        "アクセス規制 → 次のUAへ")
         XCTAssertEqual(AutomaticPostStatus.switchingAfterContinuousLimit.rawValue,
                        "連続制限 → 次のUAへ")
+        XCTAssertEqual(AutomaticPostStatus.switchingAfterImageLimit.rawValue,
+                       "画像投稿制限 → 次のUAへ")
         XCTAssertEqual(AutomaticPostStatus.reconnectingAfterContinuousLimit.rawValue,
                        "連続制限 → AP再接続中")
         XCTAssertEqual(AutomaticPostStatus.finalSendAfterContinuousLimit.rawValue,
@@ -47,6 +49,7 @@ final class SitePostStatusTests: XCTestCase {
         XCTAssertFalse(AutomaticPostStatus.sending.isFinal)
         XCTAssertFalse(AutomaticPostStatus.preparingNextThread.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterAccessRestriction.isFinal)
+        XCTAssertFalse(AutomaticPostStatus.switchingAfterImageLimit.isFinal)
         XCTAssertFalse(AutomaticPostStatus.waitingForRepeat.isFinal)
         XCTAssertFalse(AutomaticPostStatus.switchingAfterThreadBatch.isFinal)
         XCTAssertFalse(AutomaticPostStatus.acceptedPendingVerification.isFinal)

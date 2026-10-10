@@ -288,6 +288,27 @@ final class AutomaticPostFlowTests: XCTestCase {
                        .stopped(.knownAlertAfterLimit))
     }
 
+    func testMultiThreadRepeatedIPAlertRequestsImageRestrictionHandoff() {
+        var machine = readyMachine(hasComment: true,
+                                    hasImage: false,
+                                    multiThread: true)
+        XCTAssertEqual(machine.handleAlert(.imagePostingRestricted,
+                                           generationID: generation).effect,
+                       .startIPReconnect)
+        XCTAssertEqual(machine.handle(.ipReconnectCompleted(generationID: generation,
+                                                             success: true)),
+                       .startSubmitReadiness(attempt: 2, reason: .ipRetry))
+        XCTAssertEqual(submitAfterReadiness(&machine), .submit(attempt: 2))
+
+        let result = machine.handleAlert(.imagePostingRestricted,
+                                         generationID: generation)
+        XCTAssertTrue(result.autoDismiss)
+        XCTAssertEqual(result.effect, .handoffAfterImageLimit)
+        XCTAssertEqual(machine.state,
+                       .stopped(generationID: generation,
+                                reason: .knownAlertAfterLimit))
+    }
+
     func testCookieThenIPUsesTheThirdAttempt() {
         var machine = readyMachine(hasComment: true, hasImage: false)
         _ = machine.handleAlert(.cookieRetryRequired, generationID: generation)
@@ -979,12 +1000,14 @@ final class AutomaticPostFlowTests: XCTestCase {
     }
 
     private func readyMachine(hasComment: Bool,
-                              hasImage: Bool) -> AutomaticPostFlowMachine {
+                              hasImage: Bool,
+                              multiThread: Bool = false) -> AutomaticPostFlowMachine {
         var machine = AutomaticPostFlowMachine()
         _ = machine.begin(generationID: generation,
                           oldPageToken: nil,
                           hasComment: hasComment,
-                          hasImage: hasImage)
+                          hasImage: hasImage,
+                          multiThread: multiThread)
         _ = machine.handle(.markAPCompleted(generationID: generation))
         _ = machine.handle(.markReloadCompleted(generationID: generation))
         _ = machine.handle(.markCookieObserved(generationID: generation))

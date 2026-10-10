@@ -31,6 +31,7 @@ struct SitePostStatusView: View {
             case .preparingUA, .checkingCookie, .preparingNextThread, .sending, .cookieRetry,
                  .reconnectingAfterIPLimit, .finalSendAfterIPChange,
                  .switchingAfterAccessRestriction, .switchingAfterContinuousLimit,
+                 .switchingAfterImageLimit,
                  .reconnectingAfterContinuousLimit,
                  .finalSendAfterContinuousLimit, .waitingForRepeat,
                  .waitingForNextThread, .navigatingToNextThread,

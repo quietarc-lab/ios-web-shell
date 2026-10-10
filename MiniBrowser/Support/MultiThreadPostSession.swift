@@ -157,6 +157,10 @@ struct MultiThreadPostSession: Equatable, Sendable {
     /// under the next UA generation, only the target is skipped and the
     /// session continues with the remaining snapshot.
     var continuousRestrictionHandoffUsed: Bool
+    /// An image-posting restriction is allowed one UA handoff for the current
+    /// target. This flag is retained across page generations and reset when
+    /// the session advances to another target.
+    var imageRestrictionHandoffUsed: Bool
 
     init(sessionID: UInt64,
          snapshot: CatalogPostSnapshot,
@@ -180,6 +184,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
         self.currentTargetID = snapshot.targets.first?.id
         self.postsSinceUserAgentChange = 0
         self.continuousRestrictionHandoffUsed = false
+        self.imageRestrictionHandoffUsed = false
     }
 
     var currentTarget: CatalogPostTarget? {
@@ -207,6 +212,13 @@ struct MultiThreadPostSession: Equatable, Sendable {
         postsSinceUserAgentChange = 0
     }
 
+    /// Forces the next target transition through the normal UA rotation path.
+    /// A target skipped for a repeated image restriction must not immediately
+    /// reuse the UA that just produced the restriction.
+    mutating func forceUserAgentRotation() {
+        postsSinceUserAgentChange = Self.userAgentPostBatchLimit
+    }
+
     mutating func markCurrentProcessed() {
         guard let target = currentTarget else { return }
         guard processedThreadIDs.insert(target.id).inserted else { return }
@@ -229,6 +241,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
                 currentIndex = index
                 currentTargetID = target.id
                 continuousRestrictionHandoffUsed = false
+                imageRestrictionHandoffUsed = false
                 return target
             }
             index += 1
@@ -245,6 +258,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
         currentIndex = 0
         currentTargetID = snapshot.targets.first?.id
         continuousRestrictionHandoffUsed = false
+        imageRestrictionHandoffUsed = false
         phaseBatchNumber += 1
     }
 
@@ -256,6 +270,7 @@ struct MultiThreadPostSession: Equatable, Sendable {
         currentTargetID = nil
         snapshot = CatalogPostSnapshot(sort: phase.sort, targets: [])
         continuousRestrictionHandoffUsed = false
+        imageRestrictionHandoffUsed = false
     }
 
     mutating func appendUnprocessedTargets(from refreshed: CatalogPostSnapshot) {

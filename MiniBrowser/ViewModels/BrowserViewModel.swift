@@ -1006,7 +1006,10 @@ final class BrowserViewModel: ObservableObject {
         return automaticSubmissionSequence
     }
 
-    private func startNextAutomaticFlow(previousGenerationID: UInt64) {
+    private func startNextAutomaticFlow(
+        previousGenerationID: UInt64,
+        handoffStatus: AutomaticPostStatus = .switchingAfterAccessRestriction
+    ) {
         guard automaticPostMachine.generationID == previousGenerationID,
               let draft = automaticPostDraft ?? multiThreadSession.map({
                   AutomaticPostDraft(hasComment: $0.comment?.isEmpty == false,
@@ -1049,7 +1052,7 @@ final class BrowserViewModel: ObservableObject {
             return
         }
 
-        setAutomaticPostStatus(.switchingAfterAccessRestriction,
+        setAutomaticPostStatus(handoffStatus,
                                generationID: previousGenerationID)
         let oldPageToken = automaticPostMachine.pageToken ?? latestCompactReady?.pageToken
         let continueSameThreadRepeat = sameThreadRepeatEnabled &&
@@ -7031,6 +7034,73 @@ final class BrowserViewModel: ObservableObject {
                 skipCurrentMultiThreadThread(
                     generationID: generationID,
                     reason: "CONTINUOUS_POSTING_AFTER_UA_HANDOFF",
+                    excludeFromCatalog: false
+                )
+            }
+        case .handoffAfterImageLimit:
+            guard var session = multiThreadSession,
+                  session.currentGenerationID == generationID else {
+                let stopEffect = automaticPostMachine.stop(.knownAlertAfterLimit)
+                handleAutomaticPostEffect(stopEffect, generationID: generationID)
+                return
+            }
+            if !session.imageRestrictionHandoffUsed {
+                // Keep the session, draft, and target list intact while
+                // reusing the same automatic UA handoff path as access
+                // restrictions. The flag lives on the target so the next
+                // generation cannot grant a second retry accidentally.
+                session.imageRestrictionHandoffUsed = true
+                multiThreadSession = session
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "FLOW",
+                    event: "IMAGE_RESTRICTION_UA_HANDOFF",
+                    result: "NEXT_UA_REQUESTED",
+                    fields: [
+                        ("TARGET_INDEX", String(session.currentIndex)),
+                        ("REASON", "IMAGE_POSTING_RESTRICTED_AFTER_IP_RETRY")
+                    ]
+                )
+                let previousGeneration = automaticPostGeneration
+                setAutomaticPostStatus(.switchingAfterImageLimit,
+                                       generationID: generationID)
+                startNextAutomaticFlow(
+                    previousGenerationID: generationID,
+                    handoffStatus: .switchingAfterImageLimit
+                )
+                if automaticPostGeneration != previousGeneration {
+                    showToast("画像投稿制限を検知。次のUAで再開中",
+                              kind: .warning)
+                }
+            } else {
+                // The same target has already used its one bounded retry.
+                // Mark the restricting UA as tried and force the normal
+                // two-post rotation gate before continuing with the next
+                // target. No modal, sound, or vibration is produced here.
+                automaticTriedUAIDs.insert(currentUserAgent.id)
+                session.forceUserAgentRotation()
+                multiThreadSession = session
+                invalidateAutomaticGenerationForThreadSkip(
+                    generationID: generationID,
+                    markFinished: false
+                )
+                appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "FLOW",
+                    event: "IMAGE_RESTRICTION_TARGET_SKIPPED",
+                    result: "CONTINUE",
+                    fields: [
+                        ("TARGET_INDEX", String(session.currentIndex)),
+                        ("REASON", "IMAGE_POSTING_RESTRICTED_AFTER_UA_HANDOFF")
+                    ]
+                )
+                showToast("制限が続いたため対象スレをスキップ",
+                          kind: .warning)
+                setAutomaticPostStatus(.waitingForNextThread,
+                                       generationID: generationID)
+                skipCurrentMultiThreadThread(
+                    generationID: generationID,
+                    reason: "IMAGE_POSTING_RESTRICTED_AFTER_UA_HANDOFF",
                     excludeFromCatalog: false
                 )
             }
