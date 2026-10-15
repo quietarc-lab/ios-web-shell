@@ -112,6 +112,11 @@ final class ThreadListViewModel: ObservableObject, AutomaticCatalogProvider {
         userAgent = value
     }
 
+    func fetchStarterBody(for url: URL) async throws -> String? {
+        await service.updateUserAgent(userAgent)
+        return try await service.starterBody(for: url)
+    }
+
     func currentPostSnapshot(limit: Int = 60) -> CatalogPostSnapshot {
         currentPostSnapshot(sort: selectedSort, limit: limit)
     }

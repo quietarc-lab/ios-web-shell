@@ -921,7 +921,8 @@ enum CompactPageModeService {
       "use strict";
       if (location.hostname !== "img.2chan.net" ||
           !/^\/[^/]+\/res\/\d+\.htm$/.test(location.pathname)) {
-        return { eligible: false, hasComment: false, comment: "", canSubmit: false };
+        return { eligible: false, hasComment: false, comment: "", canSubmit: false,
+          draftEnabled: false };
       }
       const form = Array.from(document.forms).find(candidate =>
         candidate.querySelector('textarea[name="com"]')
@@ -930,11 +931,16 @@ enum CompactPageModeService {
       const submitButton = form && Array.from(form.querySelectorAll(
         'input[type="submit"], button[type="submit"]'
       )).find(button => /返信|送信/.test(button.value || button.textContent || ""));
+      let draftEnabled = false;
+      try {
+        draftEnabled = localStorage.getItem("MiniBrowser.TargetPageDraftEnabled") === "true";
+      } catch (_) {}
       return {
         eligible: true,
         hasComment: Boolean(textarea && String(textarea.value || "").trim()),
         comment: String(textarea && textarea.value || ""),
-        canSubmit: Boolean(submitButton)
+        canSubmit: Boolean(submitButton),
+        draftEnabled: draftEnabled
       };
     })();
     """#)
@@ -979,8 +985,21 @@ enum CompactPageModeService {
     })();
     """#)
 
-    static func restoreAutomaticDraftScript(comment: String) -> String? {
+    static func restoreAutomaticDraftScript(comment: String,
+                                             expectedCurrentComment: String? = nil) -> String? {
         guard let literal = javaScriptStringLiteral(comment) else { return nil }
+        let expectedGuard: String
+        if let expectedCurrentComment {
+            guard let expectedLiteral = javaScriptStringLiteral(expectedCurrentComment) else {
+                return nil
+            }
+            expectedGuard = "try { if (localStorage.getItem(\"MiniBrowser.TargetPageDraftEnabled\") !== \"true\") return false; } catch (_) { return false; } if (String(textarea.value || \"\") !== \(expectedLiteral)) return false;"
+        } else {
+            expectedGuard = ""
+        }
+        let rollbackValue = expectedCurrentComment == nil
+            ? "textarea.value = previousValue;"
+            : "textarea.value = previousValue; try { if (localStorage.getItem(\"MiniBrowser.TargetPageDraftEnabled\") === \"true\") localStorage.setItem(\"MiniBrowser.TargetPageDraftText\", previousValue); } catch (_) {}"
         return PageMarkerNamespace.neutralize(#"""
         (() => {
           "use strict";
@@ -993,10 +1012,20 @@ enum CompactPageModeService {
           );
           const textarea = form && form.querySelector('textarea[name="com"]');
           if (!textarea || !textarea.isConnected) return false;
-          textarea.value = \#(literal);
-          textarea.dispatchEvent(new Event("input", { bubbles: true }));
-          textarea.dispatchEvent(new Event("change", { bubbles: true }));
-          if (textarea.value !== \#(literal)) return false;
+          \#(expectedGuard)
+          const previousValue = String(textarea.value || "");
+          try {
+            textarea.value = \#(literal);
+            textarea.dispatchEvent(new Event("input", { bubbles: true }));
+            textarea.dispatchEvent(new Event("change", { bubbles: true }));
+          } catch (_) {
+            \#(rollbackValue)
+            return false;
+          }
+          if (textarea.value !== \#(literal)) {
+            \#(rollbackValue)
+            return false;
+          }
           const handler = window.webkit && window.webkit.messageHandlers &&
             window.webkit.messageHandlers.miniBrowserHandwriting;
           const submitButton = form && Array.from(form.querySelectorAll(

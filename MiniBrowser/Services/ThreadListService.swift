@@ -5,6 +5,7 @@ enum ThreadListError: Error {
     case decodingFailed
     case listParseFailed
     case openerParseFailed
+    case starterParseFailed
 }
 
 actor ThreadListService {
@@ -80,6 +81,29 @@ actor ThreadListService {
         return text
     }
 
+    /// Fetches only the bounded beginning of a thread page and extracts its
+    /// first response body. Unlike openerText, an empty body is a successful
+    /// result represented by nil, and line breaks from <br> are preserved.
+    func starterBody(for url: URL) async throws -> String? {
+        guard IsolationThreadURLParser.threadID(from: url) != nil else {
+            throw ThreadListError.invalidResponse
+        }
+        let request = Self.makeOpenerRequest(for: Self.httpsThreadURL(url),
+                                             userAgent: userAgent)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse,
+              http.statusCode == 200 || http.statusCode == 206 else {
+            throw ThreadListError.invalidResponse
+        }
+        guard let html = Self.decodeShiftJIS(data) else {
+            throw ThreadListError.decodingFailed
+        }
+        guard let body = Self.parseStarterBodyHTML(html) else {
+            throw ThreadListError.starterParseFailed
+        }
+        return body.isEmpty ? nil : body
+    }
+
     func thumbnailData(for item: ThreadListItem,
                        referer: URL) async throws -> Data {
         if let cached = thumbnailCache[item.thumbnailURL] {
@@ -146,6 +170,15 @@ actor ThreadListService {
                          forHTTPHeaderField: "Accept")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         return request
+    }
+
+    private nonisolated static func httpsThreadURL(_ url: URL) -> URL {
+        guard url.scheme?.lowercased() == "http",
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url
+        }
+        components.scheme = "https"
+        return components.url ?? url
     }
 
     nonisolated static func decodeShiftJIS(_ data: Data) -> String? {
@@ -241,6 +274,38 @@ actor ThreadListService {
                                          options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? "本文なし" : text
+    }
+
+    nonisolated static func parseStarterBodyHTML(_ html: String) -> String? {
+        guard let threadStart = html.range(
+            of: #"<div\b[^>]*\bclass\s*=\s*['\"][^'\"]*\bthre\b[^'\"]*['\"][^>]*>"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) else { return nil }
+
+        let threadHTML = String(html[threadStart.lowerBound...])
+        guard let body = firstCapture(in: threadHTML,
+                                      pattern: #"<blockquote\b[^>]*>(.*?)</blockquote>"#,
+                                      index: 1) else {
+            return nil
+        }
+
+        var text = body.replacingOccurrences(of: #"<br\s*/?>"#,
+                                             with: "\n",
+                                             options: [.regularExpression, .caseInsensitive])
+        text = text.replacingOccurrences(of: #"<[^>]+>"#,
+                                         with: "",
+                                         options: .regularExpression)
+        text = decodeHTMLEntities(text)
+        let lines = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var trimmedLines = lines
+        while trimmedLines.first == "" { trimmedLines.removeFirst() }
+        while trimmedLines.last == "" { trimmedLines.removeLast() }
+        let result = trimmedLines.joined(separator: "\n")
+        return result.isEmpty ? "" : result
     }
 
     private nonisolated static func firstCapture(in source: String,

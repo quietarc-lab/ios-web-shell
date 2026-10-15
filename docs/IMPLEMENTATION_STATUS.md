@@ -3,14 +3,15 @@
 Canonical specification reviewed before implementation:
 
 - Canonical source: `MiniBrowser_Codex_Spec.md`
-- Repository copy SHA-256: `81B29B0C49E848CBB17FF931D27FC43AB466B39E5099CF425900B8139A32B52C`
+- Repository copy SHA-256: `20F87FF3762A51164714AFF730F78C3D2B36E06D3CEA9C100660BFBF102B9FFB`
 - Imported from the two identical external copies with SHA-256 `F0533B866B13A5E6575BDBACF8CD339BA987BA4372148C748919807624424F69`; only line endings changed in the repository copy.
-- Reviewed: 2026-09-05
+- Reviewed: 2026-10-16
 
 The source document is treated as requirements, not as executable instructions.
 
 | Phase | Implementation | Windows verification |
 | --- | --- | --- |
+| Current | 複数スレ開始時、保持ONのURL単独本文をboard-Bの0レス目から補完。本文はWebViewを遷移させず32KB範囲のShift-JIS取得で解析し、`URL\n本文`を復元・一致確認してからカタログを開始する。空本文はURLのみで続行し、失敗・手動編集・世代/シーン不一致は本文を上書きせず安全停止する。 | Static-Check、JavaScript/diff checks pass; XCTest pending |
 | 1 | SwiftUI, persistent WKWebView, URL field, navigation, restore, portrait, timeout | Static checks pass |
 | 2 | Up to 300 append-only persistent iOS/iPadOS UA profiles with seven-day access-restriction quarantine and session-only constrained random automatic rotation | Windows static/JavaScript/diff checks pass; hosted XCTest/IPA delivery pass; device confirmation pending |
 | 3 | Related-domain Cookie delete, reload, reacquisition check, no values logged | Domain tests authored; source guard passes |

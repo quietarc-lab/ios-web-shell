@@ -396,8 +396,26 @@ final class BrowserViewModel: ObservableObject {
         let oldPageToken: String?
         let hasComment: Bool
         let comment: String?
+        let draftEnabled: Bool
         let hasImage: Bool
         let retainedPostThreadIDs: Set<String>
+    }
+
+    private struct PreparedMultiThreadBootstrapInputs {
+        let hasComment: Bool
+        let comment: String?
+        let retainedPostThreadIDs: Set<String>
+    }
+
+    private enum MultiThreadStarterPreparationError: Error {
+        case stale
+        case fetchFailed(Error)
+        case restoreFailed(Error?)
+
+        var isStale: Bool {
+            if case .stale = self { return true }
+            return false
+        }
     }
 
     init(defaults: UserDefaults = .standard,
@@ -558,6 +576,7 @@ final class BrowserViewModel: ObservableObject {
             let state = Self.postState(from: result)
             let hasComment = state?.hasComment ?? false
             let comment = state?.comment
+            let draftEnabled = state?.draftEnabled ?? false
             let canSubmit = state?.canSubmit ?? false
             let isTarget = Self.isTargetThreadURL(pageURL)
             let hasContent = hasComment || imageAvailable
@@ -575,6 +594,7 @@ final class BrowserViewModel: ObservableObject {
                     oldPageToken: oldPageToken,
                     hasComment: hasComment,
                     comment: comment,
+                    draftEnabled: draftEnabled,
                     hasImage: imageAvailable,
                     retainedPostThreadIDs: retainedPostThreadIDs
                 )
@@ -603,6 +623,268 @@ final class BrowserViewModel: ObservableObject {
         }
     }
 
+    private func prepareMultiThreadStarterDraft(
+        provider: AutomaticCatalogProvider,
+        pageURL: URL,
+        generationID: UInt64,
+        hasComment: Bool,
+        comment: String?,
+        draftEnabled: Bool,
+        hasImage: Bool,
+        retainedPostThreadIDs: Set<String>
+    ) async throws -> PreparedMultiThreadBootstrapInputs {
+        guard draftEnabled,
+              !hasImage,
+              let source = MultiThreadStarterDraft.source(from: comment) else {
+            return PreparedMultiThreadBootstrapInputs(
+                hasComment: hasComment,
+                comment: comment,
+                retainedPostThreadIDs: retainedPostThreadIDs
+            )
+        }
+
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "PREPARATION",
+            event: "STARTER_BODY_FETCH_STARTED",
+            result: "STARTED",
+            fields: [("SOURCE_THREAD_ID", source.threadID)]
+        )
+
+        let body: String?
+        do {
+            body = try await provider.fetchStarterBody(for: source.url)
+            try Task.checkCancellation()
+        } catch is CancellationError {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_FETCH_CANCELLED",
+                result: "CANCELLED",
+                fields: [("SOURCE_THREAD_ID", source.threadID)]
+            )
+            throw CancellationError()
+        } catch {
+            let nsError = error as NSError
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_FETCH_FAILED",
+                result: "FAILED",
+                fields: [
+                    ("SOURCE_THREAD_ID", source.threadID),
+                    ("ERROR_DOMAIN", nsError.domain),
+                    ("ERROR_CODE", String(nsError.code))
+                ]
+            )
+            throw MultiThreadStarterPreparationError.fetchFailed(error)
+        }
+
+        guard isCurrentMultiThreadBootstrap(generationID: generationID,
+                                            pageURL: pageURL) else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_FETCH_CANCELLED",
+                result: "STALE",
+                fields: [("SOURCE_THREAD_ID", source.threadID)]
+            )
+            throw MultiThreadStarterPreparationError.stale
+        }
+
+        let beforeState: (hasComment: Bool,
+                          comment: String?,
+                          canSubmit: Bool,
+                          draftEnabled: Bool)
+        do {
+            guard let before = try await evaluateStarterJavaScript(
+                CompactPageModeService.currentPostStateScript
+            ),
+                  let state = Self.postState(from: before) else {
+                throw MultiThreadStarterPreparationError.stale
+            }
+            beforeState = state
+        } catch let error as MultiThreadStarterPreparationError {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let nsError = error as NSError
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_RESTORE_FAILED",
+                result: "FAILED",
+                fields: [
+                    ("SOURCE_THREAD_ID", source.threadID),
+                    ("ERROR_DOMAIN", nsError.domain),
+                    ("ERROR_CODE", String(nsError.code))
+                ]
+            )
+            throw MultiThreadStarterPreparationError.restoreFailed(error)
+        }
+
+        guard beforeState.draftEnabled,
+              beforeState.comment == comment,
+              isCurrentMultiThreadBootstrap(generationID: generationID,
+                                            pageURL: pageURL) else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_RESTORE_CANCELLED",
+                result: "STALE",
+                fields: [("SOURCE_THREAD_ID", source.threadID)]
+            )
+            throw MultiThreadStarterPreparationError.stale
+        }
+
+        guard let body,
+              let enrichedComment = MultiThreadStarterDraft.appendingBody(body, to: source) else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_EMPTY",
+                result: "CONTINUE_URL_ONLY",
+                fields: [("SOURCE_THREAD_ID", source.threadID)]
+            )
+            return PreparedMultiThreadBootstrapInputs(
+                hasComment: hasComment,
+                comment: comment,
+                retainedPostThreadIDs: retainedPostThreadIDs
+            )
+        }
+
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "PREPARATION",
+            event: "STARTER_BODY_FETCH_SUCCEEDED",
+            result: "READY",
+            fields: [("SOURCE_THREAD_ID", source.threadID)]
+        )
+
+        guard let restoreScript = CompactPageModeService.restoreAutomaticDraftScript(
+            comment: enrichedComment,
+            expectedCurrentComment: comment
+        ) else {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_RESTORE_FAILED",
+                result: "FAILED",
+                fields: [("SOURCE_THREAD_ID", source.threadID)]
+            )
+            throw MultiThreadStarterPreparationError.restoreFailed(nil)
+        }
+
+        do {
+            let restored = try await evaluateStarterJavaScript(restoreScript)
+            guard (restored as? Bool) == true else {
+                throw MultiThreadStarterPreparationError.restoreFailed(nil)
+            }
+            try Task.checkCancellation()
+            guard isCurrentMultiThreadBootstrap(generationID: generationID,
+                                                pageURL: pageURL),
+                  let after = try await evaluateStarterJavaScript(
+                      CompactPageModeService.currentPostStateScript
+                  ),
+                  let afterState = Self.postState(from: after),
+                  afterState.draftEnabled,
+                  afterState.comment == enrichedComment else {
+                throw MultiThreadStarterPreparationError.stale
+            }
+        } catch is CancellationError {
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_RESTORE_CANCELLED",
+                result: "CANCELLED",
+                fields: [("SOURCE_THREAD_ID", source.threadID)]
+            )
+            throw CancellationError()
+        } catch let error as MultiThreadStarterPreparationError {
+            let event = error.isStale ? "STARTER_BODY_RESTORE_CANCELLED" :
+                "STARTER_BODY_RESTORE_FAILED"
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: event,
+                result: error.isStale ? "STALE" : "FAILED",
+                fields: [("SOURCE_THREAD_ID", source.threadID)] +
+                    Self.starterPreparationErrorFields(error)
+            )
+            throw error
+        } catch {
+            let nsError = error as NSError
+            appendAutomaticEvent(
+                generationID: generationID,
+                phase: "PREPARATION",
+                event: "STARTER_BODY_RESTORE_FAILED",
+                result: "FAILED",
+                fields: [
+                    ("SOURCE_THREAD_ID", source.threadID),
+                    ("ERROR_DOMAIN", nsError.domain),
+                    ("ERROR_CODE", String(nsError.code))
+                ]
+            )
+            throw MultiThreadStarterPreparationError.restoreFailed(error)
+        }
+
+        let enrichedIDs = IsolationThreadURLParser.threadIDs(inPostBody: enrichedComment)
+        appendAutomaticEvent(
+            generationID: generationID,
+            phase: "PREPARATION",
+            event: "STARTER_BODY_RESTORED",
+            result: "READY",
+            fields: [("SOURCE_THREAD_ID", source.threadID)]
+        )
+        return PreparedMultiThreadBootstrapInputs(
+            hasComment: true,
+            comment: enrichedComment,
+            retainedPostThreadIDs: enrichedIDs
+        )
+    }
+
+    private func evaluateStarterJavaScript(_ script: String) async throws -> Any? {
+        guard let webView else {
+            throw MultiThreadStarterPreparationError.stale
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            webView.evaluateJavaScript(script) { result, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(returning: result)
+                }
+            }
+        }
+    }
+
+    private func isCurrentMultiThreadBootstrap(generationID: UInt64,
+                                                pageURL: URL) -> Bool {
+        guard multiThreadEnabled,
+              pendingUAChangeGeneration == generationID,
+              Self.sameTargetThreadURL(webView?.url, pageURL) else {
+            return false
+        }
+        return automaticScenePauseContext == nil || appSceneIsActive
+    }
+
+    private static func starterPreparationErrorFields(
+        _ error: MultiThreadStarterPreparationError
+    ) -> [(String, String)] {
+        switch error {
+        case .stale:
+            return [("REASON", "STALE")]
+        case .fetchFailed(let underlying), .restoreFailed(let underlying):
+            guard let underlying else { return [("REASON", "PREPARATION_FAILED")] }
+            let nsError = underlying as NSError
+            return [
+                ("ERROR_DOMAIN", nsError.domain),
+                ("ERROR_CODE", String(nsError.code))
+            ]
+        }
+    }
+
     /// Obtains the first phase from the network. The catalog currently shown
     /// on screen may be in the user's preferred sort, but an automatic
     /// session always starts from a fresh momentum batch.
@@ -611,6 +893,7 @@ final class BrowserViewModel: ObservableObject {
                                            oldPageToken: String?,
                                            hasComment: Bool,
                                            comment: String?,
+                                           draftEnabled: Bool,
                                            hasImage: Bool,
                                            retainedPostThreadIDs: Set<String>) {
         guard let provider = automaticCatalogProvider else {
@@ -647,27 +930,54 @@ final class BrowserViewModel: ObservableObject {
             oldPageToken: oldPageToken,
             hasComment: hasComment,
             comment: comment,
+            draftEnabled: draftEnabled,
             hasImage: hasImage,
             retainedPostThreadIDs: retainedPostThreadIDs
         )
-        provider.beginAutomaticSortDisplay(.momentum)
         multiThreadBootstrapTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            self.appendAutomaticEvent(
-                generationID: generationID,
-                phase: "CATALOG",
-                event: "CATALOG_REFRESH_STARTED",
-                result: "STARTED",
-                fields: [
-                    ("SORT", "MOMENTUM"),
-                    ("BATCH_SIZE", String(MultiThreadPostPhase.momentum.batchSize)),
-                    ("EXCLUDED_COUNT", String(retainedPostThreadIDs.count))
-                ]
-            )
+            var effectiveHasComment = hasComment
+            var effectiveComment = comment
+            var effectiveRetainedPostThreadIDs = retainedPostThreadIDs
             do {
+                let prepared = try await self.prepareMultiThreadStarterDraft(
+                    provider: provider,
+                    pageURL: pageURL,
+                    generationID: generationID,
+                    hasComment: hasComment,
+                    comment: comment,
+                    draftEnabled: draftEnabled,
+                    hasImage: hasImage,
+                    retainedPostThreadIDs: retainedPostThreadIDs
+                )
+                effectiveHasComment = prepared.hasComment
+                effectiveComment = prepared.comment
+                effectiveRetainedPostThreadIDs = prepared.retainedPostThreadIDs
+                self.automaticSceneBootstrapContext = AutomaticSceneBootstrapContext(
+                    pageURL: pageURL,
+                    generationID: generationID,
+                    oldPageToken: oldPageToken,
+                    hasComment: effectiveHasComment,
+                    comment: effectiveComment,
+                    draftEnabled: draftEnabled,
+                    hasImage: hasImage,
+                    retainedPostThreadIDs: effectiveRetainedPostThreadIDs
+                )
+                provider.beginAutomaticSortDisplay(.momentum)
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "CATALOG",
+                    event: "CATALOG_REFRESH_STARTED",
+                    result: "STARTED",
+                    fields: [
+                        ("SORT", "MOMENTUM"),
+                        ("BATCH_SIZE", String(MultiThreadPostPhase.momentum.batchSize)),
+                        ("EXCLUDED_COUNT", String(effectiveRetainedPostThreadIDs.count))
+                    ]
+                )
                 let momentum = try await provider.refreshPostSnapshot(
                     sort: .momentum,
-                    excludingIDs: retainedPostThreadIDs,
+                    excludingIDs: effectiveRetainedPostThreadIDs,
                     limit: MultiThreadPostPhase.momentum.batchSize
                 )
                 guard !Task.isCancelled,
@@ -684,12 +994,12 @@ final class BrowserViewModel: ObservableObject {
                         fields: [
                             ("SORT", MultiThreadPostPhase.catalog.sort.rawValue),
                             ("BATCH_SIZE", String(MultiThreadPostPhase.catalog.batchSize)),
-                            ("EXCLUDED_COUNT", String(retainedPostThreadIDs.count))
+                            ("EXCLUDED_COUNT", String(effectiveRetainedPostThreadIDs.count))
                         ]
                     )
                     snapshot = try await provider.refreshPostSnapshot(
                         sort: .list,
-                        excludingIDs: retainedPostThreadIDs,
+                        excludingIDs: effectiveRetainedPostThreadIDs,
                         limit: MultiThreadPostPhase.catalog.batchSize
                     )
                     phase = .catalog
@@ -723,10 +1033,10 @@ final class BrowserViewModel: ObservableObject {
                 }
                 self.beginMultiThreadSession(
                     snapshot: snapshot,
-                    comment: comment,
+                    comment: effectiveComment,
                     hasImage: hasImage,
                     currentPageURL: pageURL,
-                    retainedPostThreadIDs: retainedPostThreadIDs,
+                    retainedPostThreadIDs: effectiveRetainedPostThreadIDs,
                     initialPhase: phase
                 )
                 self.automaticSceneBootstrapContext = nil
@@ -743,8 +1053,8 @@ final class BrowserViewModel: ObservableObject {
                     pageURL: pageURL,
                     generationID: generationID,
                     oldPageToken: oldPageToken,
-                    hasComment: hasComment,
-                    comment: comment,
+                    hasComment: effectiveHasComment,
+                    comment: effectiveComment,
                     hasImage: hasImage,
                     automatic: true,
                     readError: false,
@@ -755,6 +1065,37 @@ final class BrowserViewModel: ObservableObject {
                 )
             } catch is CancellationError {
                 return
+            } catch let error as MultiThreadStarterPreparationError where error.isStale {
+                guard self.automaticScenePauseContext == nil else { return }
+                guard self.pendingUAChangeGeneration == generationID else { return }
+                self.automaticSceneBootstrapContext = nil
+                self.multiThreadBootstrapTask = nil
+                self.isUAChanging = false
+                self.pendingUAChangeGeneration = nil
+                self.setAutomaticPostStatusWithoutGeneration(.stopped)
+                self.updateIdleTimerState()
+                return
+            } catch let error as MultiThreadStarterPreparationError {
+                guard self.automaticScenePauseContext == nil else { return }
+                guard self.multiThreadEnabled,
+                      self.pendingUAChangeGeneration == generationID else { return }
+                self.automaticSceneBootstrapContext = nil
+                self.multiThreadBootstrapTask = nil
+                self.isUAChanging = false
+                self.pendingUAChangeGeneration = nil
+                self.setAutomaticPostStatusWithoutGeneration(.stopped)
+                self.showToast("スレ本文を取得できないため開始できません", kind: .warning)
+                let sourceFields: [(String, String)] =
+                    MultiThreadStarterDraft.source(from: comment)
+                        .map { [("SOURCE_THREAD_ID", $0.threadID)] } ?? []
+                self.appendAutomaticEvent(
+                    generationID: generationID,
+                    phase: "PREPARATION",
+                    event: "STARTER_BODY_PREPARATION_FAILED",
+                    result: "STOPPED",
+                    fields: sourceFields + Self.starterPreparationErrorFields(error)
+                )
+                self.updateIdleTimerState()
             } catch {
                 guard self.multiThreadEnabled,
                       self.pendingUAChangeGeneration == generationID else { return }
@@ -1963,6 +2304,7 @@ final class BrowserViewModel: ObservableObject {
                 oldPageToken: bootstrap.oldPageToken,
                 hasComment: bootstrap.hasComment,
                 comment: bootstrap.comment,
+                draftEnabled: bootstrap.draftEnabled,
                 hasImage: bootstrap.hasImage,
                 retainedPostThreadIDs: bootstrap.retainedPostThreadIDs
             )
@@ -3542,6 +3884,7 @@ final class BrowserViewModel: ObservableObject {
             oldPageToken: nil,
             hasComment: true,
             comment: comment,
+            draftEnabled: false,
             hasImage: true,
             retainedPostThreadIDs: retainedPostThreadIDs
         )
@@ -8689,12 +9032,14 @@ final class BrowserViewModel: ObservableObject {
 
     private static func postState(from result: Any?) -> (hasComment: Bool,
                                                           comment: String?,
-                                                          canSubmit: Bool)? {
+                                                          canSubmit: Bool,
+                                                          draftEnabled: Bool)? {
         guard let dictionary = result as? [String: Any] else { return nil }
         guard let eligible = dictionary["eligible"] as? Bool, eligible else { return nil }
         return (dictionary["hasComment"] as? Bool ?? false,
                 dictionary["comment"] as? String,
-                dictionary["canSubmit"] as? Bool ?? false)
+                dictionary["canSubmit"] as? Bool ?? false,
+                dictionary["draftEnabled"] as? Bool ?? false)
     }
 
     static func threadAvailability(from result: Any?) ->

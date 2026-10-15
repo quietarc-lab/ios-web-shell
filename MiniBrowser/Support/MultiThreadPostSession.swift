@@ -98,6 +98,7 @@ protocol AutomaticCatalogProvider: AnyObject {
     func markThreadRead(id: String)
     func automaticExcludedThreadIDs() -> Set<String>
     func resetOpenHistory()
+    func fetchStarterBody(for url: URL) async throws -> String?
 }
 
 /// Keep existing test and integration providers source-compatible while the
@@ -122,6 +123,13 @@ extension AutomaticCatalogProvider {
     func markThreadRead(id: String) {}
     func automaticExcludedThreadIDs() -> Set<String> { [] }
     func resetOpenHistory() {}
+    func fetchStarterBody(for url: URL) async throws -> String? {
+        throw AutomaticCatalogProviderError.starterBodyUnavailable
+    }
+}
+
+enum AutomaticCatalogProviderError: Error {
+    case starterBodyUnavailable
 }
 
 /// Session state is intentionally independent from a page-level generation.

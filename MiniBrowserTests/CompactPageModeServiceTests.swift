@@ -105,6 +105,8 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(stateScript.contains("hasComment"))
         XCTAssertTrue(stateScript.contains("comment:"))
         XCTAssertTrue(stateScript.contains("canSubmit"))
+        XCTAssertTrue(stateScript.contains("draftEnabled"))
+        XCTAssertTrue(stateScript.contains("MiniBrowser.TargetPageDraftEnabled"))
 
         let availabilityScript = CompactPageModeService.threadAvailabilityScript
         XCTAssertTrue(availabilityScript.contains("hasThread"))
@@ -128,6 +130,16 @@ final class CompactPageModeServiceTests: XCTestCase {
         XCTAssertTrue(restoreScript.contains("comment: String(textarea.value || \"\")"))
         XCTAssertFalse(restoreScript.contains("form.submit"))
         XCTAssertFalse(restoreScript.contains("localStorage"))
+
+        let guardedRestore = try XCTUnwrap(
+            CompactPageModeService.restoreAutomaticDraftScript(
+                comment: "新本文",
+                expectedCurrentComment: "元URL"
+            )
+        )
+        XCTAssertTrue(guardedRestore.contains("元URL"))
+        XCTAssertTrue(guardedRestore.contains("!=="))
+        XCTAssertTrue(guardedRestore.contains("TargetPageDraftEnabled"))
 
         let repeatImageScript = CompactPageModeService.repeatCanvasUpdateScript(generationID: 7)
         XCTAssertTrue(repeatImageScript.contains("generationID"))

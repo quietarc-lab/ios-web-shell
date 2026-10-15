@@ -111,6 +111,24 @@ final class ThreadListServiceTests: XCTestCase {
         XCTAssertNil(ThreadListService.parseOpenerHTML(html))
     }
 
+    func testStarterParserPreservesBreaksAndDecodesEntities() {
+        let html = """
+        <html><div class="thre"><blockquote>一行目<br>二行目<br />&amp;&#12316;</blockquote>
+        <table><blockquote>別レス</blockquote></table></div></html>
+        """
+        XCTAssertEqual(ThreadListService.parseStarterBodyHTML(html), "一行目\n二行目\n&〜")
+    }
+
+    func testStarterParserTreatsEmptyBodyAsSuccessfulEmptyResult() {
+        let html = #"<div class="thre"><blockquote> <br> </blockquote></div>"#
+        XCTAssertEqual(ThreadListService.parseStarterBodyHTML(html), "")
+    }
+
+    func testStarterParserRejectsIncompleteHTML() {
+        let html = #"<div class="thre"><blockquote>途中"#
+        XCTAssertNil(ThreadListService.parseStarterBodyHTML(html))
+    }
+
     func testOpenerRequestUsesBoundedRange() {
         let url = URL(string: "https://img.2chan.net/b/res/123.htm")!
         let request = ThreadListService.makeOpenerRequest(for: url)
