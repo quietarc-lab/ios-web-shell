@@ -875,7 +875,13 @@ final class BrowserViewModel: ObservableObject {
         switch error {
         case .stale:
             return [("REASON", "STALE")]
-        case .fetchFailed(let underlying), .restoreFailed(let underlying):
+        case .fetchFailed(let underlying):
+            let nsError = underlying as NSError
+            return [
+                ("ERROR_DOMAIN", nsError.domain),
+                ("ERROR_CODE", String(nsError.code))
+            ]
+        case .restoreFailed(let underlying):
             guard let underlying else { return [("REASON", "PREPARATION_FAILED")] }
             let nsError = underlying as NSError
             return [
